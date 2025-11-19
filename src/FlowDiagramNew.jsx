@@ -9,6 +9,7 @@ const FlowDiagramNew = () => {
   const [activeNode, setActiveNode] = useState(null);
   const [showAllGraph, setShowAllGraph] = useState(false);
   const [currentPath, setCurrentPath] = useState([]);
+  const [hoveredNode, setHoveredNode] = useState(null);
   const containerRef = useRef(null);
 
   // Build adjacency maps
@@ -116,23 +117,34 @@ const FlowDiagramNew = () => {
     return children.some(childId => expandedNodes.has(childId));
   };
 
+  // Check if any node in a layer has expanded children
+  const layerHasExpandedChildren = (layerNodes) => {
+    return layerNodes.some(nodeId => hasExpandedDescendants(nodeId));
+  };
+
   // Handle node click - toggle expansion
   const handleNodeClick = (nodeId) => {
-    const newExpanded = new Set(expandedNodes);
-    
     if (hasExpandedDescendants(nodeId)) {
       // Collapse: remove all descendants
+      const newExpanded = new Set(expandedNodes);
       const descendants = getAllDescendants(nodeId);
       descendants.forEach(id => newExpanded.delete(id));
+      setExpandedNodes(newExpanded);
+      setActiveNode(nodeId);
+      setCurrentPath(getPathToNode(nodeId));
     } else {
-      // Expand: add 3 layers
+      // Expand: add 3 layers and collapse siblings
+      const path = getPathToNode(nodeId);
+      const newExpanded = new Set(path); // Keep only the path to this node
+      
+      // Add 3 layers from clicked node
       const toAdd = getNLayersOfChildren(nodeId, 3);
       toAdd.forEach(id => newExpanded.add(id));
+      
+      setExpandedNodes(newExpanded);
+      setActiveNode(nodeId);
+      setCurrentPath(getPathToNode(nodeId));
     }
-
-    setExpandedNodes(newExpanded);
-    setActiveNode(nodeId);
-    setCurrentPath(getPathToNode(nodeId));
   };
 
   // Add more layers from active node
@@ -188,33 +200,31 @@ const FlowDiagramNew = () => {
   };
 
   // Search functionality
-  const handleSearch = (term) => {
-    setSearchTerm(term);
-    
-    if (!term.trim()) {
-      setExpandedNodes(new Set([rootNode.id]));
-      setActiveNode(null);
-      setCurrentPath([]);
-      return;
-    }
+const handleSearch = (term) => {
+  const search = term.toLowerCase().trim();
+  setSearchTerm(term);
 
-    const matchedNode = graphData.nodes.find(n => 
-      n.data.label.toLowerCase().includes(term.toLowerCase())
-    );
+  if (!search) {
+    setExpandedNodes(new Set([rootNode.id]));
+    setActiveNode(null);
+    setCurrentPath([]);
+    return;
+  }
 
-    if (matchedNode) {
-      const path = getPathToNode(matchedNode.id);
-      const newExpanded = new Set(path);
-      
-      // Add 3 layers from matched node
-      const threeLayers = getNLayersOfChildren(matchedNode.id, 3);
-      threeLayers.forEach(id => newExpanded.add(id));
-      
-      setExpandedNodes(newExpanded);
-      setActiveNode(matchedNode.id);
-      setCurrentPath(path);
-    }
-  };
+  const matchedNode = graphData.nodes.find(n =>
+    (n.data?.label || "").toLowerCase().includes(search)
+  );
+
+  if (matchedNode) {
+    const path = getPathToNode(matchedNode.id);
+    const newExpanded = new Set(path);
+
+    setExpandedNodes(newExpanded);
+    setActiveNode(matchedNode.id);
+    setCurrentPath(path);
+  }
+};
+
 
   // Reset to initial state
   const handleReset = () => {
@@ -248,17 +258,44 @@ const FlowDiagramNew = () => {
 
   const nodesByLayer = calculateLayerPositions();
 
-  // Calculate positions
-  const layerWidth = 280;
-  const nodeHeight = 80;
+  // Calculate positions with dynamic layer widths
+  const nodeHeight = 70;
+  const nodeWidth = 140;
+  const collapsedNodeWidth = 30;
   const nodeSpacing = 25;
+  const expandedLayerWidth = 280;
+  const collapsedLayerWidth = 80;
+
+  // Determine which layers should be collapsed
+  const collapsedLayers = new Set();
+  Object.entries(nodesByLayer).forEach(([layer, nodeIds]) => {
+    const layerNum = parseInt(layer);
+    // Check if this layer has expanded children AND is not being hovered
+    const hasExpandedKids = layerHasExpandedChildren(nodeIds);
+    const isLayerHovered = nodeIds.some(nodeId => hoveredNode === nodeId);
+    
+    if (hasExpandedKids && !isLayerHovered) {
+      collapsedLayers.add(layerNum);
+    }
+  });
+
+  // Calculate cumulative X positions for layers
+  const layerXPositions = {};
+  let cumulativeX = 50;
+  const sortedLayers = Object.keys(nodesByLayer).map(Number).sort((a, b) => a - b);
+  
+  sortedLayers.forEach(layerNum => {
+    layerXPositions[layerNum] = cumulativeX;
+    const isCollapsed = collapsedLayers.has(layerNum);
+    cumulativeX += (isCollapsed ? collapsedLayerWidth : expandedLayerWidth);
+  });
 
   const nodePositions = {};
   Object.entries(nodesByLayer).forEach(([layer, nodeIds]) => {
     const layerNum = parseInt(layer);
     nodeIds.forEach((nodeId, index) => {
       nodePositions[nodeId] = {
-        x: layerNum * layerWidth + 50,
+        x: layerXPositions[layerNum],
         y: index * (nodeHeight + nodeSpacing) + 50
       };
     });
@@ -295,10 +332,8 @@ const FlowDiagramNew = () => {
     .join(' ---> ');
 
   // Calculate canvas size
-  const maxLayer = Math.max(...Object.keys(nodesByLayer).map(Number), 0);
   const maxNodesInLayer = Math.max(...Object.values(nodesByLayer).map(arr => arr.length), 1);
-  
-  const canvasWidth = (maxLayer + 1) * layerWidth + 200;
+  const canvasWidth = cumulativeX + 200;
   const canvasHeight = maxNodesInLayer * (nodeHeight + nodeSpacing) + 150;
 
   return (
@@ -450,6 +485,17 @@ const FlowDiagramNew = () => {
                     </marker>
                   );
                 })}
+                {/* Glow filter for searched node */}
+                <filter id="greenGlow" x="-50%" y="-50%" width="200%" height="200%">
+                  <feGaussianBlur in="SourceAlpha" stdDeviation="4" />
+                  <feOffset dx="0" dy="0" result="offsetblur" />
+                  <feFlood floodColor="#10B981" floodOpacity="0.8" />
+                  <feComposite in2="offsetblur" operator="in" />
+                  <feMerge>
+                    <feMergeNode />
+                    <feMergeNode in="SourceGraphic" />
+                  </feMerge>
+                </filter>
               </defs>
 
               {/* Render Edges */}
@@ -464,15 +510,22 @@ const FlowDiagramNew = () => {
                   const isInPath = currentPath.includes(edge.source) && currentPath.includes(edge.target);
                   const sourceDepth = getPathToNode(edge.source).length - 1;
 
-                  // Create smooth curve path
-                  const midX = (source.x + target.x) / 2;
+                  // Determine source layer collapse state
+                  const sourcePath = getPathToNode(edge.source);
+                  const sourceLayer = sourcePath.length - 1;
+                  const isSourceLayerCollapsed = collapsedLayers.has(sourceLayer);
+                  
+                  // Use collapsed width if source layer is collapsed
+                  const sourceWidth = isSourceLayerCollapsed ? collapsedNodeWidth : nodeWidth;
+
+                  // Create smooth curve path for rectangular nodes
                   const controlX1 = source.x + (target.x - source.x) * 0.5;
                   const controlX2 = source.x + (target.x - source.x) * 0.5;
                   
-                  const path = `M ${source.x + 200} ${source.y + 35} 
-                                C ${controlX1} ${source.y + 35}, 
-                                  ${controlX2} ${target.y + 35}, 
-                                  ${target.x} ${target.y + 35}`;
+                  const path = `M ${source.x + sourceWidth} ${source.y + nodeHeight/2} 
+                                C ${controlX1} ${source.y + nodeHeight/2}, 
+                                  ${controlX2} ${target.y + nodeHeight/2}, 
+                                  ${target.x} ${target.y + nodeHeight/2}`;
 
                   return (
                     <g key={edge.id}>
@@ -484,10 +537,11 @@ const FlowDiagramNew = () => {
                         opacity={isInPath ? 1 : 0.6}
                         markerEnd={`url(#arrowhead-${sourceDepth})`}
                         className={edge.animated && isInPath ? 'animate-pulse' : ''}
+                        style={{ transition: 'all 0.3s ease' }}
                       />
                       {/* Edge type label */}
                       <text
-                        x={(source.x + target.x) / 2 + 100}
+                        x={(source.x + target.x) / 2 + sourceWidth/2}
                         y={(source.y + target.y) / 2 + 20}
                         fill="#9CA3AF"
                         fontSize="10"
@@ -512,72 +566,125 @@ const FlowDiagramNew = () => {
                   const isInPath = currentPath.includes(node.id);
                   const hasChildren = (childrenMap[node.id] || []).length > 0;
                   const isExpanded = hasExpandedDescendants(node.id);
+                  const isSearchResult = searchTerm && node.data.label.toLowerCase().includes(searchTerm.toLowerCase());
+                  const isHovered = hoveredNode === node.id;
+
+                  // Determine if this node's layer should be collapsed
+                  const nodePath = getPathToNode(node.id);
+                  const nodeLayer = nodePath.length - 1;
+                  const isLayerCollapsed = collapsedLayers.has(nodeLayer);
+                  
+                  const currentWidth = isLayerCollapsed ? collapsedNodeWidth : nodeWidth;
 
                   return (
                     <g
                       key={node.id}
                       transform={`translate(${pos.x}, ${pos.y})`}
                       onClick={() => handleNodeClick(node.id)}
-                      className="cursor-pointer hover:opacity-90 transition-opacity"
+                      onMouseEnter={() => setHoveredNode(node.id)}
+                      onMouseLeave={() => setHoveredNode(null)}
+                      className="cursor-pointer transition-all duration-300"
+                      style={{ transition: 'all 0.3s ease' }}
                     >
                       {/* Glow for active/path nodes */}
-                      {(isActive || isInPath) && (
+                      {(isActive || isInPath) && !isSearchResult && (
                         <rect
                           x="-5"
                           y="-5"
-                          width="210"
-                          height="80"
-                          rx="15"
+                          width={currentWidth + 10}
+                          height={nodeHeight + 10}
+                          rx="8"
                           fill={color}
                           opacity="0.3"
                           className="animate-pulse"
                         />
                       )}
 
+                      {/* Green glow for search result */}
+                      {isSearchResult && (
+                        <>
+                          <rect
+                            x="-8"
+                            y="-8"
+                            width={currentWidth + 16}
+                            height={nodeHeight + 16}
+                            rx="8"
+                            fill="#10B981"
+                            opacity="0.5"
+                            className="animate-pulse"
+                          />
+                          <rect
+                            x="-5"
+                            y="-5"
+                            width={currentWidth + 10}
+                            height={nodeHeight + 10}
+                            rx="8"
+                            fill="none"
+                            stroke="#10B981"
+                            strokeWidth="3"
+                            opacity="0.8"
+                            className="animate-pulse"
+                          />
+                        </>
+                      )}
+
                       {/* Node Rectangle */}
                       <rect
-                        x="0"
-                        y="0"
-                        width="200"
-                        height="70"
-                        rx="12"
+                        width={currentWidth}
+                        height={nodeHeight}
+                        rx="6"
                         fill={color}
                         stroke={isInPath ? '#FBBF24' : 'white'}
                         strokeWidth={isInPath ? 3 : 2}
-                        className="transition-all duration-200 drop-shadow-lg"
+                        className="transition-all duration-300 drop-shadow-lg"
+                        filter={isSearchResult ? "url(#greenGlow)" : "none"}
                       />
 
-                      {/* Node Label */}
-                      <text
-                        x="100"
-                        y="30"
-                        fill="white"
-                        fontSize="13"
-                        fontWeight="bold"
-                        textAnchor="middle"
-                        className="pointer-events-none select-none"
-                      >
-                        {node.data.label.length > 18 
-                          ? node.data.label.substring(0, 16) + '...' 
-                          : node.data.label}
-                      </text>
+                      {/* Node Content - only show when expanded or hovered */}
+                      {!isLayerCollapsed && (
+                        <>
+                          {/* Node Label */}
+                          <text
+                            x={currentWidth / 2}
+                            y={nodeHeight / 2 - 8}
+                            fill="white"
+                            fontSize="13"
+                            fontWeight="bold"
+                            textAnchor="middle"
+                            className="pointer-events-none select-none"
+                          >
+                            {node.data.label.length > 12 
+                              ? node.data.label.substring(0, 10) + '...' 
+                              : node.data.label}
+                          </text>
 
-                      {/* Type badge */}
-                      <text
-                        x="100"
-                        y="50"
-                        fill="white"
-                        fontSize="10"
-                        opacity="0.8"
-                        textAnchor="middle"
-                        className="pointer-events-none select-none"
-                      >
-                        {node.type || 'N/A'}
-                      </text>
+                          {/* Type badge */}
+                          <text
+                            x={currentWidth / 2}
+                            y={nodeHeight / 2 + 12}
+                            fill="white"
+                            fontSize="10"
+                            opacity="0.8"
+                            textAnchor="middle"
+                            className="pointer-events-none select-none"
+                          >
+                            {node.type || 'N/A'}
+                          </text>
+                        </>
+                      )}
+
+                      {/* Collapsed state indicator - show 3 vertical dots */}
+                      {isLayerCollapsed && (
+                        <g>
+                          <circle cx={collapsedNodeWidth / 2} cy={nodeHeight / 2 - 12} r="2" fill="white" />
+                          <circle cx={collapsedNodeWidth / 2} cy={nodeHeight / 2} r="2" fill="white" />
+                          <circle cx={collapsedNodeWidth / 2} cy={nodeHeight / 2 + 12} r="2" fill="white" />
+                        </g>
+                      )}
 
                       {/* Expand/Collapse Indicator */}
-                      {hasChildren && (
-                        <g transform="translate(175, 30)">
+                      {hasChildren && !isLayerCollapsed && (
+                        <g transform={`translate(${currentWidth - 18}, 8)`}>
                           <circle
                             r="12"
                             fill="white"
@@ -594,6 +701,32 @@ const FlowDiagramNew = () => {
                             className="pointer-events-none"
                           >
                             {isExpanded ? '−' : '+'}
+                          </text>
+                        </g>
+                      )}
+
+                      {/* Tooltip on hover - show full label */}
+                      {isHovered && (
+                        <g transform={`translate(${currentWidth / 2}, ${-10})`}>
+                          <rect
+                            x={-Math.max(60, node.data.label.length * 4)}
+                            y={-25}
+                            width={Math.max(120, node.data.label.length * 8)}
+                            height="30"
+                            rx="4"
+                            fill="rgba(0, 0, 0, 0.9)"
+                            stroke="white"
+                            strokeWidth="1"
+                          />
+                          <text
+                            y={-8}
+                            fill="white"
+                            fontSize="12"
+                            fontWeight="500"
+                            textAnchor="middle"
+                            className="pointer-events-none select-none"
+                          >
+                            {node.data.label}
                           </text>
                         </g>
                       )}
