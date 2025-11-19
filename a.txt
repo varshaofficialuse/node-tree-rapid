@@ -1,0 +1,287 @@
+ "react_flow_for_layers_map": {
+                "edges": [
+                    {
+                        "animated": true,
+                        "id": "fe96d437-b763-4e88-9b59-cb8ce287dc7b-b12b79db-74cd-4d8e-bbf8-9b6f7db0d4b5",
+                        "source": "fe96d437-b763-4e88-9b59-cb8ce287dc7b",
+                        "target": "b12b79db-74cd-4d8e-bbf8-9b6f7db0d4b5",
+                        "type": "0"
+                    },
+                    {
+                        "animated": true,
+                        "id": "b12b79db-74cd-4d8e-bbf8-9b6f7db0d4b5-5e9db4d8-a696-4618-a248-3c0b63844df1",
+                        "source": "b12b79db-74cd-4d8e-bbf8-9b6f7db0d4b5",
+                        "target": "5e9db4d8-a696-4618-a248-3c0b63844df1",
+                        "type": "1"
+                    },
+                    {
+                        "animated": true,
+                        "id": "5e9db4d8-a696-4618-a248-3c0b63844df1-8f2e46de-c77d-49dd-82a6-6a21da3d3a14",
+                        "source": "5e9db4d8-a696-4618-a248-3c0b63844df1",
+                        "target": "8f2e46de-c77d-49dd-82a6-6a21da3d3a14",
+                        "type": "2"
+                    },
+                    {
+                        "animated": true,
+                        "id": "5e9db4d8-a696-4618-a248-3c0b63844df1-65b6ddd8-1096-4364-83b1-b4f6f8b009a7",
+                        "source": "5e9db4d8-a696-4618-a248-3c0b63844df1",
+                        "target": "65b6ddd8-1096-4364-83b1-b4f6f8b009a7",
+                        "type": "2"
+                    },
+                    {
+                        "animated": true,
+                        "id": "fe96d437-b763-4e88-9b59-cb8ce287dc7b-008bc4cb-d515-4f45-bca3-3d04db833146",
+                        "source": "fe96d437-b763-4e88-9b59-cb8ce287dc7b",
+                        "target": "008bc4cb-d515-4f45-bca3-3d04db833146",
+                        "type": "0"
+                    },
+                    {
+                        "animated": true,
+                        "id": "fe96d437-b763-4e88-9b59-cb8ce287dc7b-d8afe0d3-1c22-47f8-9911-04394d44c8ac",
+                        "source": "fe96d437-b763-4e88-9b59-cb8ce287dc7b",
+                        "target": "d8afe0d3-1c22-47f8-9911-04394d44c8ac",
+                        "type": "0"
+                    },
+                    {
+                        "animated": true,
+                        "id": "fe96d437-b763-4e88-9b59-cb8ce287dc7b-804768dc-1446-4810-9064-12c5c796b526",
+                        "source": "fe96d437-b763-4e88-9b59-cb8ce287dc7b",
+                        "target": "804768dc-1446-4810-9064-12c5c796b526",
+                        "type": "0"
+                    },
+                    {
+                        "animated": true,
+                        "id": "fe96d437-b763-4e88-9b59-cb8ce287dc7b-0c93bc26-1ed1-4bf0-b6c4-13a3fedbdcce",
+                        "source": "fe96d437-b763-4e88-9b59-cb8ce287dc7b",
+                        "target": "0c93bc26-1ed1-4bf0-b6c4-13a3fedbdcce",
+                        "type": "0"
+                    },
+                    {
+                        "animated": true,
+                        "id": "0c93bc26-1ed1-4bf0-b6c4-13a3fedbdcce-7ea89dc7-dec6-41d6-b6ba-78816ea4fefb",
+                        "source": "0c93bc26-1ed1-4bf0-b6c4-13a3fedbdcce",
+                        "target": "7ea89dc7-dec6-41d6-b6ba-78816ea4fefb",
+                        "type": "1"
+                    },
+                    {
+                        "animated": true,
+                        "id": "0c93bc26-1ed1-4bf0-b6c4-13a3fedbdcce-0b2e53e6-db01-40c3-b8d5-7b6ecd1ee9ee",
+                        "source": "0c93bc26-1ed1-4bf0-b6c4-13a3fedbdcce",
+                        "target": "0b2e53e6-db01-40c3-b8d5-7b6ecd1ee9ee",
+                        "type": "1"
+                    },
+                    {
+                        "animated": true,
+                        "id": "0b2e53e6-db01-40c3-b8d5-7b6ecd1ee9ee-fd250230-7e33-4597-889b-c59707ce61fd",
+                        "source": "0b2e53e6-db01-40c3-b8d5-7b6ecd1ee9ee",
+                        "target": "fd250230-7e33-4597-889b-c59707ce61fd",
+                        "type": "2"
+                    },
+                    {
+                        "animated": true,
+                        "id": "fd250230-7e33-4597-889b-c59707ce61fd-a20036ae-a7f3-4ffb-ae38-0c0044e44b16",
+                        "source": "fd250230-7e33-4597-889b-c59707ce61fd",
+                        "target": "a20036ae-a7f3-4ffb-ae38-0c0044e44b16",
+                        "type": "3"
+                    },
+                    {
+                        "animated": true,
+                        "id": "a20036ae-a7f3-4ffb-ae38-0c0044e44b16-04cbd5e1-1ae4-4cee-b6fa-bcb1b517792d",
+                        "source": "a20036ae-a7f3-4ffb-ae38-0c0044e44b16",
+                        "target": "04cbd5e1-1ae4-4cee-b6fa-bcb1b517792d",
+                        "type": "4"
+                    },
+                    {
+                        "animated": true,
+                        "id": "a20036ae-a7f3-4ffb-ae38-0c0044e44b16-69f670ac-6fdd-4ce5-b306-cda00676eb45",
+                        "source": "a20036ae-a7f3-4ffb-ae38-0c0044e44b16",
+                        "target": "69f670ac-6fdd-4ce5-b306-cda00676eb45",
+                        "type": "4"
+                    },
+                    {
+                        "animated": true,
+                        "id": "fe96d437-b763-4e88-9b59-cb8ce287dc7b-29799904-5bcc-465b-8616-bfba840b2e10",
+                        "source": "fe96d437-b763-4e88-9b59-cb8ce287dc7b",
+                        "target": "29799904-5bcc-465b-8616-bfba840b2e10",
+                        "type": "0"
+                    },
+                    {
+                        "animated": true,
+                        "id": "29799904-5bcc-465b-8616-bfba840b2e10-a3c58d62-463f-49f0-be20-7d44986fef40",
+                        "source": "29799904-5bcc-465b-8616-bfba840b2e10",
+                        "target": "a3c58d62-463f-49f0-be20-7d44986fef40",
+                        "type": "1"
+                    }
+                ],
+                "nodes": [
+                    {
+                        "data": {
+                            "label": "BOSSGETHOLDERS"
+                        },
+                        "id": "fe96d437-b763-4e88-9b59-cb8ce287dc7b",
+                        "order": 0,
+                        "type": "0"
+                    },
+			                    {
+                        "data": {
+                            "label": "DECLARATIVES"
+                        },
+                        "id": "b12b79db-74cd-4d8e-bbf8-9b6f7db0d4b5",
+                        "order": 1,
+                        "type": "1"
+                    },
+
+                    {
+                        "data": {
+                            "label": "START-OF-PGM"
+                        },
+                        "id": "008bc4cb-d515-4f45-bca3-3d04db833146",
+                        "order": 2,
+                        "type": "1"
+                    },
+                    {
+                        "data": {
+                            "label": "LEN-CHECK"
+                        },
+                        "id": "0c93bc26-1ed1-4bf0-b6c4-13a3fedbdcce",
+                        "order": 3,
+                        "type": "1"
+                    },
+                    {
+                        "data": {
+                            "label": "CLEAR-EXTENDED-STATUS"
+                        },
+                        "id": "804768dc-1446-4810-9064-12c5c796b526",
+                        "order": 4,
+                        "type": "1"
+                    },
+                    {
+                        "data": {
+                            "label": "A05-CONTROL"
+                        },
+                        "id": "29799904-5bcc-465b-8616-bfba840b2e10",
+                        "order": 5,
+                        "type": "1"
+                    },
+                    {
+                        "data": {
+                            "label": "DISPLAY-EXTENDED-STATUS"
+                        },
+                        "id": "d8afe0d3-1c22-47f8-9911-04394d44c8ac",
+                        "order": 6,
+                        "type": "1"
+                    },
+                    {
+                        "data": {
+                            "label": "DISC-ERRORS"
+                        },
+                        "id": "5e9db4d8-a696-4618-a248-3c0b63844df1",
+                        "order": 1,
+                        "type": "2"
+                    },
+                    {
+                        "data": {
+                            "label": "LEN-BEGIN"
+                        },
+                        "id": "0b2e53e6-db01-40c3-b8d5-7b6ecd1ee9ee",
+                        "order": 2,
+                        "type": "2"
+                    },
+                    {
+                        "data": {
+                            "label": "LEN-EX"
+                        },
+                        "id": "7ea89dc7-dec6-41d6-b6ba-78816ea4fefb",
+                        "order": 3,
+                        "type": "2"
+                    },
+                    {
+                        "data": {
+                            "label": "A05-99"
+                        },
+                        "id": "a3c58d62-463f-49f0-be20-7d44986fef40",
+                        "order": 4,
+                        "type": "2"
+                    },
+                    {
+                        "data": {
+                            "label": "DISC-ERRORS-EXIT"
+                        },
+                        "id": "8f2e46de-c77d-49dd-82a6-6a21da3d3a14",
+                        "order": 1,
+                        "type": "3"
+                    },
+                    {
+                        "data": {
+                            "label": "SAVE-STATUS-FOR-RETURN"
+                        },
+                        "id": "65b6ddd8-1096-4364-83b1-b4f6f8b009a7",
+                        "order": 2,
+                        "type": "3"
+                    },
+                    {
+                        "data": {
+                            "label": "ENABLEALL"
+                        },
+                        "id": "fd250230-7e33-4597-889b-c59707ce61fd",
+                        "order": 4,
+                        "type": "3"
+                    },
+                    {
+                        "data": {
+                            "label": "A05-INIT"
+                        },
+                        "id": "a20036ae-a7f3-4ffb-ae38-0c0044e44b16",
+                        "order": 1,
+                        "type": "4"
+                    },
+                    {
+                        "data": {
+                            "label": "A05-05"
+                        },
+                        "id": "04cbd5e1-1ae4-4cee-b6fa-bcb1b517792d",
+                        "order": 1,
+                        "type": "5"
+                    },
+                    {
+                        "data": {
+                            "label": "A05-EXIT"
+                        },
+                        "id": "69f670ac-6fdd-4ce5-b306-cda00676eb45",
+                        "order": 2,
+                        "type": "5"
+                    }
+                ]
+            }
+
+this will be my  data here "type" is the  layer number for both nodes and edges and "order" will be the  node's order to show the node within that layer
+
+
+requirements
+
+1.initially root node will be visible. by clicking on root node it's  next three layers will be visible and on the second click again all the expanded nodes will be collapse(toggle)
+
+2. there should one more button "Add More Layers" which should add next three layers of the graph
+
+3.when we click on any child node then the next three layers of corresponding node should visible and on second  click collapse(toggle) and this process will continue until we get the leaf node
+
+4. while adding next three layers of corresponding node previous  nodes  should be collapse or overlap and the path  from root node to till that node should be display
+
+5 route should be like label of nodes concatenate with --->
+
+6. edges should be the unidirectional  from parent to child with the same node colour of parent
+
+7.I want horizontal representation of the tree
+
+8. searching functionality  based on the node label  which should show the whole path start from root node to till the search query node and if we click on the node then  show only it's children nodes up to the  three layers and this process should continue if child node click by user as well as route should be display
+
+9 there will be one button which should display whole graph in one click (toggle) second click of button collapse to single node
+
+10. it should have horizontal as well as vertical scrolling because I will have n number of  huge data 
+
+
+
+
+
+
+
