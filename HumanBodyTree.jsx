@@ -4,7 +4,7 @@ import { ZoomIn, ZoomOut, Maximize2, Search } from 'lucide-react';
 // Deep nested anatomical data structure
 const anatomyData = {
   id: 'root',
-  name: 'Human Body',
+  name: 'Human Body 12',
   type: 'organism',
   children: [
     {

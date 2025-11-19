@@ -1,11 +1,15 @@
-import React from 'react';
-import HumanBodyTree from './HumanBodyTree.jsx'
+import { BrowserRouter, Routes, Route } from "react-router-dom";
+import NodeTreeMain from "./NodeTreeMain";
+import HumanBodyTree from "./HumanBodyTree";
 
 function App() {
   return (
- <>
- <HumanBodyTree/>
- </>
+    <BrowserRouter>
+      <Routes>
+        <Route path="/" element={<NodeTreeMain />} />
+        <Route path="/human-tree" element={<HumanBodyTree />} />
+      </Routes>
+    </BrowserRouter>
   );
 }
 
