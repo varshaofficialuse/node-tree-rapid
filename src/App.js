@@ -3,16 +3,16 @@ import NodeTreeMain from "./NodeTreeMain";
 import HumanBodyTree from "./HumanBodyTree";
 import FlowDiagram from "./FlowDiagram";
 import FlowDiagramNew from "./FlowDiagramNew";
-import layersData from './a.json';
+// import layersData from './a.json';
 
 function App() {
   return (
     <BrowserRouter>
       <Routes>
-        <Route path="/" element={<NodeTreeMain />} />
+        {/* <Route path="/" element={<NodeTreeMain />} />
         <Route path="/human-tree" element={<HumanBodyTree />} />
-        <Route path="/flowchart" element={<FlowDiagram />} />
-        <Route path="/flowchartnew" element={<FlowDiagramNew data={layersData}/>} />
+        <Route path="/flowchart" element={<FlowDiagram />} /> */}
+        <Route path="/flowchartnew" element={<FlowDiagramNew />} />
       </Routes>
     </BrowserRouter>
   );

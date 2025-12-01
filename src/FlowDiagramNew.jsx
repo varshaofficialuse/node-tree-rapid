@@ -1,6 +1,8 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { ZoomIn, ZoomOut, Maximize2, Search, Layers, ChevronRight, Home } from 'lucide-react';
-import graphData from './a.json';
+import rawData from './data/ a.json'
+// Sample data structure - replace this with your actual data
+
 
 const FlowDiagramNew = () => {
   const [searchTerm, setSearchTerm] = useState('');
@@ -12,12 +14,14 @@ const FlowDiagramNew = () => {
   const [hoveredNode, setHoveredNode] = useState(null);
   const containerRef = useRef(null);
 
+  // Extract the actual graph data from the nested structure
+  const graphData = rawData.react_flow_for_layers_map || rawData;
+
   // Build adjacency maps
   const buildGraph = () => {
     const nodeMap = {};
     const childrenMap = {};
     const parentMap = {};
-    const edgeMap = {};
 
     graphData.nodes.forEach(node => {
       nodeMap[node.id] = node;
@@ -28,17 +32,16 @@ const FlowDiagramNew = () => {
     graphData.edges.forEach(edge => {
       if (childrenMap[edge.source]) {
         childrenMap[edge.source].push(edge.target);
-        edgeMap[`${edge.source}-${edge.target}`] = edge;
       }
       if (parentMap[edge.target] === null) {
         parentMap[edge.target] = edge.source;
       }
     });
 
-    return { nodeMap, childrenMap, parentMap, edgeMap };
+    return { nodeMap, childrenMap, parentMap };
   };
 
-  const { nodeMap, childrenMap, parentMap, edgeMap } = buildGraph();
+  const { nodeMap, childrenMap, parentMap } = buildGraph();
 
   // Find root node (node with no parent)
   const findRootNode = () => {
@@ -52,7 +55,7 @@ const FlowDiagramNew = () => {
     if (rootNode && expandedNodes.size === 0 && !showAllGraph) {
       setExpandedNodes(new Set([rootNode.id]));
     }
-  }, []);
+  }, [rootNode, expandedNodes.size, showAllGraph]);
 
   // Get path from root to node
   const getPathToNode = (nodeId) => {
@@ -123,7 +126,35 @@ const FlowDiagramNew = () => {
   };
 
   // Handle node click - toggle expansion
+// const handleNodeClick = (nodeId) => {
+//     if (hasExpandedDescendants(nodeId)) {
+//       // Collapse: remove all descendants
+//       const newExpanded = new Set(expandedNodes);
+//       const descendants = getAllDescendants(nodeId);
+//       descendants.forEach(id => newExpanded.delete(id));
+//       setExpandedNodes(newExpanded);
+//       setActiveNode(nodeId);
+//       setCurrentPath(getPathToNode(nodeId));
+//     } else {
+//       // Expand: add 3 layers while keeping other expanded nodes
+//       const newExpanded = new Set(expandedNodes); // Keep all currently expanded nodes
+      
+//       // Add 3 layers from clicked node
+//       const toAdd = getNLayersOfChildren(nodeId, 3);
+//       toAdd.forEach(id => newExpanded.add(id));
+      
+//       setExpandedNodes(newExpanded);
+//       setActiveNode(nodeId);
+//       setCurrentPath(getPathToNode(nodeId));
+//     }
+//   };
+
+// Handle node click - toggle expansion
+// Handle node click - toggle expansion
+// Handle node click - toggle expansion
   const handleNodeClick = (nodeId) => {
+    const children = childrenMap[nodeId] || [];
+    
     if (hasExpandedDescendants(nodeId)) {
       // Collapse: remove all descendants
       const newExpanded = new Set(expandedNodes);
@@ -132,11 +163,12 @@ const FlowDiagramNew = () => {
       setExpandedNodes(newExpanded);
       setActiveNode(nodeId);
       setCurrentPath(getPathToNode(nodeId));
-    } else {
-      // Expand: add 3 layers and collapse siblings
+    } else if (children.length > 0) {
+      // Expand: show path to clicked node + 3 layers from clicked node
+      // This closes all other branches and shows only the clicked node's children
       const path = getPathToNode(nodeId);
-      const newExpanded = new Set(path); // Keep only the path to this node
-      
+      const newExpanded = new Set(path); // Start with path to this node
+      console.log(newExpanded);
       // Add 3 layers from clicked node
       const toAdd = getNLayersOfChildren(nodeId, 3);
       toAdd.forEach(id => newExpanded.add(id));
@@ -144,9 +176,12 @@ const FlowDiagramNew = () => {
       setExpandedNodes(newExpanded);
       setActiveNode(nodeId);
       setCurrentPath(getPathToNode(nodeId));
+    } else {
+      // Node has no children, just update active state
+      setActiveNode(nodeId);
+      setCurrentPath(getPathToNode(nodeId));
     }
   };
-
   // Add more layers from active node
   const addMoreLayers = () => {
     if (!activeNode) return;
@@ -200,31 +235,30 @@ const FlowDiagramNew = () => {
   };
 
   // Search functionality
-const handleSearch = (term) => {
-  const search = term.toLowerCase().trim();
-  setSearchTerm(term);
+  const handleSearch = (term) => {
+    const search = term.toLowerCase().trim();
+    setSearchTerm(term);
 
-  if (!search) {
-    setExpandedNodes(new Set([rootNode.id]));
-    setActiveNode(null);
-    setCurrentPath([]);
-    return;
-  }
+    if (!search) {
+      setExpandedNodes(new Set([rootNode.id]));
+      setActiveNode(null);
+      setCurrentPath([]);
+      return;
+    }
 
-  const matchedNode = graphData.nodes.find(n =>
-    (n.data?.label || "").toLowerCase().includes(search)
-  );
+    const matchedNode = graphData.nodes.find(n =>
+      (n.data?.label || "").toLowerCase().includes(search)
+    );
 
-  if (matchedNode) {
-    const path = getPathToNode(matchedNode.id);
-    const newExpanded = new Set(path);
+    if (matchedNode) {
+      const path = getPathToNode(matchedNode.id);
+      const newExpanded = new Set(path);
 
-    setExpandedNodes(newExpanded);
-    setActiveNode(matchedNode.id);
-    setCurrentPath(path);
-  }
-};
-
+      setExpandedNodes(newExpanded);
+      setActiveNode(matchedNode.id);
+      setCurrentPath(path);
+    }
+  };
 
   // Reset to initial state
   const handleReset = () => {
@@ -464,27 +498,22 @@ const handleSearch = (term) => {
               className="select-none"
             >
               <defs>
-                {/* Arrow markers */}
-                {Array.from({length: 10}, (_, i) => {
-                  const path = Array(i + 1).fill(rootNode?.id);
-                  const color = getNodeColor(path[path.length - 1] || rootNode?.id);
-                  return (
-                    <marker
-                      key={`arrow-${i}`}
-                      id={`arrowhead-${i}`}
-                      markerWidth="10"
-                      markerHeight="10"
-                      refX="9"
-                      refY="3"
-                      orient="auto"
-                    >
-                      <polygon
-                        points="0 0, 10 3, 0 6"
-                        fill={color}
-                      />
-                    </marker>
-                  );
-                })}
+                {/* Universal arrow marker for all edges */}
+                <marker
+                  id="arrowhead"
+                  markerWidth="12"
+                  markerHeight="12"
+                  refX="11"
+                  refY="6"
+                  orient="auto"
+                  markerUnits="strokeWidth"
+                >
+                  <path
+                    d="M 0 0 L 12 6 L 0 12 z"
+                    fill="context-stroke"
+                  />
+                </marker>
+                
                 {/* Glow filter for searched node */}
                 <filter id="greenGlow" x="-50%" y="-50%" width="200%" height="200%">
                   <feGaussianBlur in="SourceAlpha" stdDeviation="4" />
@@ -508,7 +537,6 @@ const handleSearch = (term) => {
 
                   const color = getNodeColor(edge.source);
                   const isInPath = currentPath.includes(edge.source) && currentPath.includes(edge.target);
-                  const sourceDepth = getPathToNode(edge.source).length - 1;
 
                   // Determine source layer collapse state
                   const sourcePath = getPathToNode(edge.source);
@@ -518,14 +546,18 @@ const handleSearch = (term) => {
                   // Use collapsed width if source layer is collapsed
                   const sourceWidth = isSourceLayerCollapsed ? collapsedNodeWidth : nodeWidth;
 
+                  // Calculate arrow position - slightly before the target node
+                  const arrowGap = 5; // Gap between arrow and target node
+                  const targetX = target.x - arrowGap;
+
                   // Create smooth curve path for rectangular nodes
-                  const controlX1 = source.x + (target.x - source.x) * 0.5;
-                  const controlX2 = source.x + (target.x - source.x) * 0.5;
+                  const controlX1 = source.x + (targetX - source.x) * 0.5;
+                  const controlX2 = source.x + (targetX - source.x) * 0.5;
                   
                   const path = `M ${source.x + sourceWidth} ${source.y + nodeHeight/2} 
                                 C ${controlX1} ${source.y + nodeHeight/2}, 
                                   ${controlX2} ${target.y + nodeHeight/2}, 
-                                  ${target.x} ${target.y + nodeHeight/2}`;
+                                  ${targetX} ${target.y + nodeHeight/2}`;
 
                   return (
                     <g key={edge.id}>
@@ -535,21 +567,23 @@ const handleSearch = (term) => {
                         stroke={color}
                         strokeWidth={isInPath ? 4 : 2}
                         opacity={isInPath ? 1 : 0.6}
-                        markerEnd={`url(#arrowhead-${sourceDepth})`}
+                        markerEnd="url(#arrowhead)"
                         className={edge.animated && isInPath ? 'animate-pulse' : ''}
                         style={{ transition: 'all 0.3s ease' }}
                       />
                       {/* Edge type label */}
-                      <text
-                        x={(source.x + target.x) / 2 + sourceWidth/2}
-                        y={(source.y + target.y) / 2 + 20}
-                        fill="#9CA3AF"
-                        fontSize="10"
-                        textAnchor="middle"
-                        className="pointer-events-none"
-                      >
-                        {edge.type}
-                      </text>
+                      {edge.type && (
+                        <text
+                          x={(source.x + target.x) / 2 + sourceWidth/2}
+                          y={(source.y + target.y) / 2 + 20}
+                          fill="#9CA3AF"
+                          fontSize="10"
+                          textAnchor="middle"
+                          className="pointer-events-none"
+                        >
+                          {edge.type}
+                        </text>
+                      )}
                     </g>
                   );
                 })}
@@ -566,7 +600,7 @@ const handleSearch = (term) => {
                   const isInPath = currentPath.includes(node.id);
                   const hasChildren = (childrenMap[node.id] || []).length > 0;
                   const isExpanded = hasExpandedDescendants(node.id);
-                  const isSearchResult = searchTerm && node.data.label.toLowerCase().includes(searchTerm.toLowerCase());
+                  const isSearchResult = searchTerm && node.data?.label && node.data.label.toLowerCase().includes(searchTerm.toLowerCase());
                   const isHovered = hoveredNode === node.id;
 
                   // Determine if this node's layer should be collapsed
@@ -653,9 +687,9 @@ const handleSearch = (term) => {
                             textAnchor="middle"
                             className="pointer-events-none select-none"
                           >
-                            {node.data.label.length > 12 
+                            {node.data?.label && node.data.label.length > 12 
                               ? node.data.label.substring(0, 10) + '...' 
-                              : node.data.label}
+                              : node.data?.label || 'N/A'}
                           </text>
 
                           {/* Type badge */}
@@ -706,7 +740,7 @@ const handleSearch = (term) => {
                       )}
 
                       {/* Tooltip on hover - show full label */}
-                      {isHovered && (
+                      {isHovered && node.data?.label && (
                         <g transform={`translate(${currentWidth / 2}, ${-10})`}>
                           <rect
                             x={-Math.max(60, node.data.label.length * 4)}
