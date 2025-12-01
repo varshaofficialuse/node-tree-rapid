@@ -126,35 +126,7 @@ const FlowDiagramNew = () => {
   };
 
   // Handle node click - toggle expansion
-// const handleNodeClick = (nodeId) => {
-//     if (hasExpandedDescendants(nodeId)) {
-//       // Collapse: remove all descendants
-//       const newExpanded = new Set(expandedNodes);
-//       const descendants = getAllDescendants(nodeId);
-//       descendants.forEach(id => newExpanded.delete(id));
-//       setExpandedNodes(newExpanded);
-//       setActiveNode(nodeId);
-//       setCurrentPath(getPathToNode(nodeId));
-//     } else {
-//       // Expand: add 3 layers while keeping other expanded nodes
-//       const newExpanded = new Set(expandedNodes); // Keep all currently expanded nodes
-      
-//       // Add 3 layers from clicked node
-//       const toAdd = getNLayersOfChildren(nodeId, 3);
-//       toAdd.forEach(id => newExpanded.add(id));
-      
-//       setExpandedNodes(newExpanded);
-//       setActiveNode(nodeId);
-//       setCurrentPath(getPathToNode(nodeId));
-//     }
-//   };
-
-// Handle node click - toggle expansion
-// Handle node click - toggle expansion
-// Handle node click - toggle expansion
-  const handleNodeClick = (nodeId) => {
-    const children = childrenMap[nodeId] || [];
-    
+const handleNodeClick = (nodeId) => {
     if (hasExpandedDescendants(nodeId)) {
       // Collapse: remove all descendants
       const newExpanded = new Set(expandedNodes);
@@ -163,12 +135,10 @@ const FlowDiagramNew = () => {
       setExpandedNodes(newExpanded);
       setActiveNode(nodeId);
       setCurrentPath(getPathToNode(nodeId));
-    } else if (children.length > 0) {
-      // Expand: show path to clicked node + 3 layers from clicked node
-      // This closes all other branches and shows only the clicked node's children
-      const path = getPathToNode(nodeId);
-      const newExpanded = new Set(path); // Start with path to this node
-      console.log(newExpanded);
+    } else {
+      // Expand: add 3 layers while keeping other expanded nodes
+      const newExpanded = new Set(expandedNodes); // Keep all currently expanded nodes
+      
       // Add 3 layers from clicked node
       const toAdd = getNLayersOfChildren(nodeId, 3);
       toAdd.forEach(id => newExpanded.add(id));
@@ -176,12 +146,42 @@ const FlowDiagramNew = () => {
       setExpandedNodes(newExpanded);
       setActiveNode(nodeId);
       setCurrentPath(getPathToNode(nodeId));
-    } else {
-      // Node has no children, just update active state
-      setActiveNode(nodeId);
-      setCurrentPath(getPathToNode(nodeId));
     }
   };
+
+// Handle node click - toggle expansion
+// Handle node click - toggle expansion
+// Handle node click - toggle expansion
+  // const handleNodeClick = (nodeId) => {
+  //   const children = childrenMap[nodeId] || [];
+    
+  //   if (hasExpandedDescendants(nodeId)) {
+  //     // Collapse: remove all descendants
+  //     const newExpanded = new Set(expandedNodes);
+  //     const descendants = getAllDescendants(nodeId);
+  //     descendants.forEach(id => newExpanded.delete(id));
+  //     setExpandedNodes(newExpanded);
+  //     setActiveNode(nodeId);
+  //     setCurrentPath(getPathToNode(nodeId));
+  //   } else if (children.length > 0) {
+  //     // Expand: show path to clicked node + 3 layers from clicked node
+  //     // This closes all other branches and shows only the clicked node's children
+  //     const path = getPathToNode(nodeId);
+  //     const newExpanded = new Set(path); // Start with path to this node
+  //     console.log(newExpanded);
+  //     // Add 3 layers from clicked node
+  //     const toAdd = getNLayersOfChildren(nodeId, 3);
+  //     toAdd.forEach(id => newExpanded.add(id));
+      
+  //     setExpandedNodes(newExpanded);
+  //     setActiveNode(nodeId);
+  //     setCurrentPath(getPathToNode(nodeId));
+  //   } else {
+  //     // Node has no children, just update active state
+  //     setActiveNode(nodeId);
+  //     setCurrentPath(getPathToNode(nodeId));
+  //   }
+  // };
   // Add more layers from active node
   const addMoreLayers = () => {
     if (!activeNode) return;
