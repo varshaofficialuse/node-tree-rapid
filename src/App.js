@@ -10,8 +10,8 @@ function App() {
     <BrowserRouter>
       <Routes>
         {/* <Route path="/" element={<NodeTreeMain />} />
-        <Route path="/human-tree" element={<HumanBodyTree />} />
-        <Route path="/flowchart" element={<FlowDiagram />} /> */}
+        <Route path="/human-tree" element={<HumanBodyTree />} />*/}
+        <Route path="/flowchart" element={<FlowDiagram />} /> 
         <Route path="/flowchartnew" element={<FlowDiagramNew />} />
       </Routes>
     </BrowserRouter>
