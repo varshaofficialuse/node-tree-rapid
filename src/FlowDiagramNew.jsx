@@ -13,15 +13,87 @@ const FlowDiagramNew = () => {
   const [currentPath, setCurrentPath] = useState([]);
   const [hoveredNode, setHoveredNode] = useState(null);
   const containerRef = useRef(null);
+  // temporary hides (session only)
+const [hiddenNodes, setHiddenNodes] = useState(new Set());
+// nodes currently selected via right-click (will be hidden when button pressed)
+const [selectedToHide, setSelectedToHide] = useState(new Set());
+
 
   // Extract the actual graph data from the nested structure
   const graphData = rawData.react_flow_for_layers_map || rawData;
+  const handleHideSelected = () => {
+  setHiddenNodes(prev => {
+    const next = new Set(prev);
+
+    selectedToHide.forEach(nodeId => {
+      next.add(nodeId);
+      getAllDescendants(nodeId).forEach(child => next.add(child));
+    });
+
+    return next;
+  });
+
+  setSelectedToHide(new Set());
+};
+
+
+  // toggle selection on right-click (does NOT hide yet)
+const handleNodeRightClick = (e, nodeId) => {
+  e.preventDefault(); // prevent default browser context menu
+
+  setSelectedToHide(prev => {
+    const next = new Set(prev);
+    if (next.has(nodeId)) next.delete(nodeId);
+    else next.add(nodeId);
+    return next;
+  });
+};
+
+const hasHiddenNodes = hiddenNodes.size > 0;
+const hasSelectedNodes = selectedToHide.size > 0;
+const toggleSelectNode = (nodeId) => {
+  setSelectedToHide(prev => {
+    const next = new Set(prev);
+    next.has(nodeId) ? next.delete(nodeId) : next.add(nodeId);
+    return next;
+  });
+};
+
+
+const handleToggleHideRestore = () => {
+  // If something is hidden -> restore everything
+  if (hasHiddenNodes) {
+    setHiddenNodes(new Set());
+    setSelectedToHide(new Set());
+    return;
+  }
+
+  // If nodes are selected -> hide them + their descendants
+  if (hasSelectedNodes) {
+    setHiddenNodes(prev => {
+      const next = new Set(prev);
+
+      // use your existing getAllDescendants function
+      selectedToHide.forEach(nodeId => {
+        next.add(nodeId);
+        getAllDescendants(nodeId).forEach(child => next.add(child));
+      });
+
+      return next;
+    });
+
+    // clear selection after hiding
+    setSelectedToHide(new Set());
+  }
+};
+
 
   // Build adjacency maps
   const buildGraph = () => {
     const nodeMap = {};
     const childrenMap = {};
     const parentMap = {};
+
 
     graphData.nodes.forEach(node => {
       nodeMap[node.id] = node;
@@ -220,19 +292,24 @@ const handleNodeClick = (nodeId) => {
   };
 
   // Show entire graph
-  const toggleShowAll = () => {
-    if (showAllGraph) {
-      setExpandedNodes(new Set([rootNode.id]));
-      setActiveNode(null);
-      setCurrentPath([]);
-    } else {
-      const allNodes = new Set(graphData.nodes.map(n => n.id));
-      setExpandedNodes(allNodes);
-      setActiveNode(rootNode?.id);
-      setCurrentPath([rootNode?.id]);
-    }
-    setShowAllGraph(!showAllGraph);
-  };
+const toggleShowAll = () => {
+  setHiddenNodes(new Set());        // ✅ ensure full visibility
+  setSelectedToHide(new Set());     // ✅ clear selection
+
+  if (showAllGraph) {
+    setExpandedNodes(new Set([rootNode.id]));
+    setActiveNode(null);
+    setCurrentPath([]);
+  } else {
+    const allNodes = new Set(graphData.nodes.map(n => n.id));
+    setExpandedNodes(allNodes);
+    setActiveNode(rootNode?.id);
+    setCurrentPath([rootNode?.id]);
+  }
+
+  setShowAllGraph(!showAllGraph);
+};
+
 
   // Search functionality
   const handleSearch = (term) => {
@@ -261,18 +338,23 @@ const handleNodeClick = (nodeId) => {
   };
 
   // Reset to initial state
-  const handleReset = () => {
-    setExpandedNodes(new Set([rootNode.id]));
-    setActiveNode(null);
-    setCurrentPath([]);
-    setSearchTerm('');
-    setShowAllGraph(false);
-    setZoom(100);
-  };
+const handleReset = () => {
+  setHiddenNodes(new Set());        // ✅ auto-restore hidden nodes
+  setSelectedToHide(new Set());     // ✅ clear selection
 
-  // Get visible nodes (only nodes in expandedNodes set)
-  const visibleNodeIds = Array.from(expandedNodes);
-  const visibleNodes = visibleNodeIds.map(id => nodeMap[id]).filter(Boolean);
+  setExpandedNodes(new Set([rootNode.id]));
+  setActiveNode(null);
+  setCurrentPath([]);
+  setSearchTerm('');
+  setShowAllGraph(false);
+  setZoom(100);
+};
+
+
+// filter out temporarily hidden nodes
+const visibleNodeIds = Array.from(expandedNodes).filter(id => !hiddenNodes.has(id));
+const visibleNodes = visibleNodeIds.map(id => nodeMap[id]).filter(Boolean);
+
 
   // Calculate layer positions (horizontal layout)
   const calculateLayerPositions = () => {
@@ -336,9 +418,13 @@ const handleNodeClick = (nodeId) => {
   });
 
   // Get visible edges
-  const visibleEdges = graphData.edges.filter(edge => 
-    expandedNodes.has(edge.source) && expandedNodes.has(edge.target)
-  );
+  const visibleEdges = graphData.edges.filter(edge =>
+  expandedNodes.has(edge.source) &&
+  expandedNodes.has(edge.target) &&
+  !hiddenNodes.has(edge.source) &&
+  !hiddenNodes.has(edge.target)
+);
+
 
   // Generate color based on node depth
   const getNodeColor = (nodeId) => {
@@ -458,6 +544,26 @@ const handleNodeClick = (nodeId) => {
                 <Home className="w-4 h-4" />
                 Reset
               </button>
+<button
+  onClick={handleHideSelected}
+  disabled={selectedToHide.size === 0 || showAllGraph}
+                  className="flex items-center gap-2 px-4 py-2 bg-pink-600 hover:bg-red-700 text-white rounded-lg font-medium transition-colors text-sm shadow-lg"
+
+>
+  Hide Selected ({selectedToHide.size})
+</button>
+
+<button
+  onClick={() => setHiddenNodes(new Set())}
+  disabled={hiddenNodes.size === 0}
+  className="flex items-center gap-2 px-4 py-2 bg-yellow-600 hover:bg-gray-700
+    disabled:opacity-40 disabled:cursor-not-allowed
+    text-white rounded-lg font-medium text-sm shadow-lg"
+>
+  Restore Hidden Nodes
+</button>
+
+
             </div>
           </div>
         </div>
@@ -594,6 +700,7 @@ const handleNodeClick = (nodeId) => {
                 {visibleNodes.map(node => {
                   const pos = nodePositions[node.id];
                   if (!pos) return null;
+                  const isSelectedToHide = selectedToHide.has(node.id);
 
                   const color = getNodeColor(node.id);
                   const isActive = activeNode === node.id;
@@ -611,15 +718,62 @@ const handleNodeClick = (nodeId) => {
                   const currentWidth = isLayerCollapsed ? collapsedNodeWidth : nodeWidth;
 
                   return (
-                    <g
-                      key={node.id}
-                      transform={`translate(${pos.x}, ${pos.y})`}
-                      onClick={() => handleNodeClick(node.id)}
-                      onMouseEnter={() => setHoveredNode(node.id)}
-                      onMouseLeave={() => setHoveredNode(null)}
-                      className="cursor-pointer transition-all duration-300"
-                      style={{ transition: 'all 0.3s ease' }}
-                    >
+              <g
+  key={node.id}
+  transform={`translate(${pos.x}, ${pos.y})`}
+  onClick={() => handleNodeClick(node.id)}
+  onContextMenu={(e) => handleNodeRightClick(e, node.id)}
+  onMouseEnter={() => setHoveredNode(node.id)}
+  onMouseLeave={() => setHoveredNode(null)}
+  className="cursor-pointer transition-all duration-300"
+  style={{ transition: 'all 0.3s ease' }}
+>
+
+
+  {/* Select / Unselect button */}
+<g
+  onClick={(e) => {
+    e.stopPropagation(); // VERY IMPORTANT
+    toggleSelectNode(node.id);
+  }}
+>
+  <circle
+    cx={currentWidth - 10}
+    cy={10}
+    r={8}
+    fill={isSelectedToHide ? '#22C55E' : '#1F2937'}
+    stroke="#22C55E"
+    strokeWidth="2"
+  />
+  <text
+    x={currentWidth - 10}
+    y={14}
+    textAnchor="middle"
+    fontSize="10"
+    fill="white"
+    fontWeight="bold"
+    className="pointer-events-none"
+  >
+    {isSelectedToHide ? '✓' : '+'}
+  </text>
+</g>
+
+
+ {isSelectedToHide && (
+  <rect
+    x="-6"
+    y="-6"
+    width={currentWidth + 12}
+    height={nodeHeight + 12}
+    rx="8"
+    fill="none"
+    stroke="#22C55E"
+    strokeWidth="3"
+    strokeDasharray="5 3"
+  />
+)}
+
+
                       {/* Glow for active/path nodes */}
                       {(isActive || isInPath) && !isSearchResult && (
                         <rect
