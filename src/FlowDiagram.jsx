@@ -1,348 +1,588 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { ZoomIn, ZoomOut, Maximize2, Search, Move } from 'lucide-react';
-import graphData from './structured_graphData.json';
+import { ZoomIn, ZoomOut, Maximize2, Search, Layers, ChevronRight, Home } from 'lucide-react';
+import rawData from './data/ a.json'
+// Sample graph data - replace with your actual data
+const graphData = rawData.react_flow_for_layers_map || rawData;
 
-const COLORS = {
-  node: {
-    default: '#3B82F6',
-    highlighted: '#10B981',
-    search: '#F59E0B',
-    hover: '#8B5CF6'
-  },
-  edge: {
-    default: '#6366F1',
-    highlighted: '#10B981',
-    smoothstep: '#EC4899',
-    animated: '#F97316'
-  }
-};
-
-const FlowDiagram = () => {
+const FlowDiagram= () => {
   const [searchTerm, setSearchTerm] = useState('');
   const [zoom, setZoom] = useState(100);
-  const [selectedNode, setSelectedNode] = useState(null);
+  const [expandedNodes, setExpandedNodes] = useState(new Set());
+  const [activeNode, setActiveNode] = useState(null);
+  const [showAllGraph, setShowAllGraph] = useState(false);
+  const [currentPath, setCurrentPath] = useState([]);
   const [hoveredNode, setHoveredNode] = useState(null);
-  const [pan, setPan] = useState({ x: 0, y: 0 });
-  const [isPanning, setIsPanning] = useState(false);
-  const [dragStart, setDragStart] = useState({ x: 0, y: 0 });
   const containerRef = useRef(null);
-  const svgRef = useRef(null);
 
-  // Calculate node positions using hierarchical layout
-  const layoutNodes = () => {
+  // Build adjacency maps
+  const buildGraph = () => {
     const nodeMap = {};
-    const levels = {};
-    const visited = new Set();
-    
-    // Create node map
+    const childrenMap = {};
+    const parentMap = {};
+    const edgeMap = {};
+
     graphData.nodes.forEach(node => {
-      nodeMap[node.id] = { ...node, children: [], parents: [] };
+      nodeMap[node.id] = node;
+      childrenMap[node.id] = [];
+      parentMap[node.id] = null;
     });
 
-    // Build parent-child relationships
     graphData.edges.forEach(edge => {
-      if (nodeMap[edge.source] && nodeMap[edge.target]) {
-        nodeMap[edge.source].children.push(edge.target);
-        nodeMap[edge.target].parents.push(edge.source);
+      if (childrenMap[edge.source]) {
+        childrenMap[edge.source].push(edge.target);
+        edgeMap[`${edge.source}-${edge.target}`] = edge;
+      }
+      if (parentMap[edge.target] === null) {
+        parentMap[edge.target] = edge.source;
       }
     });
 
-    // Find root nodes (nodes with no parents)
-    const roots = graphData.nodes.filter(node => 
-      nodeMap[node.id].parents.length === 0
-    );
+    return { nodeMap, childrenMap, parentMap, edgeMap };
+  };
 
-    // BFS to assign levels
-    const queue = roots.map(node => ({ id: node.id, level: 0 }));
+  const { nodeMap, childrenMap, parentMap, edgeMap } = buildGraph();
+
+  // Find root node (node with no parent)
+  const findRootNode = () => {
+    return graphData.nodes.find(node => !parentMap[node.id]);
+  };
+
+  const rootNode = findRootNode();
+
+  // Initialize with root node visible
+  useEffect(() => {
+    if (rootNode && expandedNodes.size === 0 && !showAllGraph) {
+      setExpandedNodes(new Set([rootNode.id]));
+    }
+  }, []);
+
+  // Get path from root to node
+  const getPathToNode = (nodeId) => {
+    const path = [];
+    let current = nodeId;
     
+    while (current) {
+      path.unshift(current);
+      current = parentMap[current];
+    }
+    
+    return path;
+  };
+
+  // Get N layers of children from a node
+  const getNLayersOfChildren = (startNodeId, layers) => {
+    const visited = new Set();
+    const queue = [{ id: startNodeId, depth: 0 }];
+    const result = [];
+
     while (queue.length > 0) {
-      const { id, level } = queue.shift();
+      const { id, depth } = queue.shift();
       
-      if (visited.has(id)) continue;
+      if (visited.has(id) || depth > layers) continue;
       visited.add(id);
+      result.push(id);
+
+      if (depth < layers) {
+        const children = childrenMap[id] || [];
+        children.forEach(childId => {
+          queue.push({ id: childId, depth: depth + 1 });
+        });
+      }
+    }
+
+    return result;
+  };
+
+  // Get all descendants of a node
+  const getAllDescendants = (nodeId) => {
+    const descendants = new Set();
+    const queue = [nodeId];
+
+    while (queue.length > 0) {
+      const current = queue.shift();
+      const children = childrenMap[current] || [];
       
-      if (!levels[level]) levels[level] = [];
-      levels[level].push(id);
-      
-      nodeMap[id].children.forEach(childId => {
-        if (!visited.has(childId)) {
-          queue.push({ id: childId, level: level + 1 });
+      children.forEach(child => {
+        if (!descendants.has(child)) {
+          descendants.add(child);
+          queue.push(child);
         }
       });
     }
 
-    // Position nodes
-    const positioned = {};
-    const levelHeight = 150;
-    const nodeSpacing = 200;
-    
-    Object.keys(levels).forEach(level => {
-      const levelNodes = levels[level];
-      const levelWidth = levelNodes.length * nodeSpacing;
+    return descendants;
+  };
+
+  // Check if node has expanded descendants
+  const hasExpandedDescendants = (nodeId) => {
+    const children = childrenMap[nodeId] || [];
+    return children.some(childId => expandedNodes.has(childId));
+  };
+
+  // Check if any node in a layer has expanded children
+  const layerHasExpandedChildren = (layerNodes) => {
+    return layerNodes.some(nodeId => hasExpandedDescendants(nodeId));
+  };
+
+  // Handle node click - toggle expansion
+  const handleNodeClick = (nodeId) => {
+    if (hasExpandedDescendants(nodeId)) {
+      // Collapse: remove all descendants
+      const newExpanded = new Set(expandedNodes);
+      const descendants = getAllDescendants(nodeId);
+      descendants.forEach(id => newExpanded.delete(id));
+      setExpandedNodes(newExpanded);
+      setActiveNode(nodeId);
+      setCurrentPath(getPathToNode(nodeId));
+    } else {
+      // Expand: add 3 layers and collapse siblings
+      const path = getPathToNode(nodeId);
+      const newExpanded = new Set(path); // Keep only the path to this node
       
-      levelNodes.forEach((nodeId, index) => {
-        positioned[nodeId] = {
-          x: (index * nodeSpacing) - (levelWidth / 2) + (nodeSpacing / 2),
-          y: parseInt(level) * levelHeight,
-          ...nodeMap[nodeId]
-        };
-      });
+      // Add 3 layers from clicked node
+      const toAdd = getNLayersOfChildren(nodeId, 3);
+      toAdd.forEach(id => newExpanded.add(id));
+      
+      setExpandedNodes(newExpanded);
+      setActiveNode(nodeId);
+      setCurrentPath(getPathToNode(nodeId));
+    }
+  };
+
+  // Add more layers from active node
+  const addMoreLayers = () => {
+    if (!activeNode) return;
+    
+    const newExpanded = new Set(expandedNodes);
+    
+    // Get all currently visible descendants of active node
+    const visibleDescendants = [];
+    const queue = [activeNode];
+    const visited = new Set();
+    
+    while (queue.length > 0) {
+      const current = queue.shift();
+      if (visited.has(current)) continue;
+      visited.add(current);
+      
+      if (expandedNodes.has(current)) {
+        visibleDescendants.push(current);
+        const children = childrenMap[current] || [];
+        children.forEach(child => queue.push(child));
+      }
+    }
+    
+    // For each leaf node in the visible tree, add 3 more layers
+    visibleDescendants.forEach(nodeId => {
+      const children = childrenMap[nodeId] || [];
+      const hasVisibleChildren = children.some(child => expandedNodes.has(child));
+      
+      if (!hasVisibleChildren && children.length > 0) {
+        const toAdd = getNLayersOfChildren(nodeId, 3);
+        toAdd.forEach(id => newExpanded.add(id));
+      }
+    });
+    
+    setExpandedNodes(newExpanded);
+  };
+
+  // Show entire graph
+  const toggleShowAll = () => {
+    if (showAllGraph) {
+      setExpandedNodes(new Set([rootNode.id]));
+      setActiveNode(null);
+      setCurrentPath([]);
+    } else {
+      const allNodes = new Set(graphData.nodes.map(n => n.id));
+      setExpandedNodes(allNodes);
+      setActiveNode(rootNode?.id);
+      setCurrentPath([rootNode?.id]);
+    }
+    setShowAllGraph(!showAllGraph);
+  };
+
+  // Search functionality
+  const handleSearch = (term) => {
+    const search = term.toLowerCase().trim();
+    setSearchTerm(term);
+
+    if (!search) {
+      setExpandedNodes(new Set([rootNode.id]));
+      setActiveNode(null);
+      setCurrentPath([]);
+      return;
+    }
+
+    const matchedNode = graphData.nodes.find(n =>
+      (n.data?.label || "").toLowerCase().includes(search)
+    );
+
+    if (matchedNode) {
+      const path = getPathToNode(matchedNode.id);
+      const newExpanded = new Set(path);
+
+      setExpandedNodes(newExpanded);
+      setActiveNode(matchedNode.id);
+      setCurrentPath(path);
+    }
+  };
+
+  // Reset to initial state
+  const handleReset = () => {
+    setExpandedNodes(new Set([rootNode.id]));
+    setActiveNode(null);
+    setCurrentPath([]);
+    setSearchTerm('');
+    setShowAllGraph(false);
+    setZoom(100);
+  };
+
+  // Get visible nodes (only nodes in expandedNodes set)
+  const visibleNodeIds = Array.from(expandedNodes);
+  const visibleNodes = visibleNodeIds.map(id => nodeMap[id]).filter(Boolean);
+
+  // Calculate layer positions (horizontal layout)
+  const calculateLayerPositions = () => {
+    const layers = {};
+    
+    // Assign each node to a layer based on distance from root
+    visibleNodeIds.forEach(nodeId => {
+      const path = getPathToNode(nodeId);
+      const layer = path.length - 1;
+      
+      if (!layers[layer]) layers[layer] = [];
+      layers[layer].push(nodeId);
     });
 
-    return positioned;
+    return layers;
   };
 
-  const positionedNodes = layoutNodes();
+  const nodesByLayer = calculateLayerPositions();
 
-  // Calculate SVG bounds
-  const bounds = Object.values(positionedNodes).reduce(
-    (acc, node) => ({
-      minX: Math.min(acc.minX, node.x),
-      maxX: Math.max(acc.maxX, node.x),
-      minY: Math.min(acc.minY, node.y),
-      maxY: Math.max(acc.maxY, node.y)
-    }),
-    { minX: Infinity, maxX: -Infinity, minY: Infinity, maxY: -Infinity }
-  );
+  // Calculate positions with dynamic layer widths
+  const nodeHeight = 70;
+  const nodeWidth = 140;
+  const collapsedNodeWidth = 30;
+  const nodeSpacing = 25;
+  const expandedLayerWidth = 280;
+  const collapsedLayerWidth = 80;
 
-  const padding = 100;
-  const svgWidth = bounds.maxX - bounds.minX + padding * 2;
-  const svgHeight = bounds.maxY - bounds.minY + padding * 2;
-  const offsetX = -bounds.minX + padding;
-  const offsetY = -bounds.minY + padding;
-
-  // Search filtering
-  const matchesSearch = (node) => {
-    if (!searchTerm.trim()) return true;
-    const term = searchTerm.toLowerCase();
-    return node.data?.label?.toLowerCase().includes(term) || node.id.toLowerCase().includes(term);
-  };
-
-  const highlightedNodes = new Set(
-    graphData.nodes.filter(matchesSearch).map(n => n.id)
-  );
-
-  // Pan handlers
-  const handleMouseDown = (e) => {
-    if (e.button === 0) {
-      setIsPanning(true);
-      setDragStart({ x: e.clientX - pan.x, y: e.clientY - pan.y });
-    }
-  };
-
-  const handleMouseMove = (e) => {
-    if (isPanning) {
-      setPan({
-        x: e.clientX - dragStart.x,
-        y: e.clientY - dragStart.y
-      });
-    }
-  };
-
-  const handleMouseUp = () => {
-    setIsPanning(false);
-  };
-
-  useEffect(() => {
-    document.addEventListener('mousemove', handleMouseMove);
-    document.addEventListener('mouseup', handleMouseUp);
-    return () => {
-      document.removeEventListener('mousemove', handleMouseMove);
-      document.removeEventListener('mouseup', handleMouseUp);
-    };
-  }, [isPanning, dragStart]);
-
-  // Center on node
-  const centerOnNode = (nodeId) => {
-    const node = positionedNodes[nodeId];
-    if (node && containerRef.current) {
-      const containerRect = containerRef.current.getBoundingClientRect();
-      const scale = zoom / 100;
+  // Get last 3 layers of children from active node
+  const getLastThreeChildLayers = () => {
+    if (!activeNode) return new Set();
+    
+    const result = new Set();
+    const layersByDepth = {};
+    
+    // BFS to get all visible descendants with their depth
+    const queue = [{ id: activeNode, depth: 0 }];
+    const visited = new Set();
+    
+    while (queue.length > 0) {
+      const { id, depth } = queue.shift();
+      if (visited.has(id)) continue;
+      visited.add(id);
       
-      setPan({
-        x: containerRect.width / 2 - (node.x + offsetX) * scale,
-        y: containerRect.height / 2 - (node.y + offsetY) * scale
-      });
+      if (!layersByDepth[depth]) layersByDepth[depth] = [];
+      layersByDepth[depth].push(id);
+      
+      if (expandedNodes.has(id)) {
+        const children = childrenMap[id] || [];
+        children.forEach(childId => {
+          if (expandedNodes.has(childId)) {
+            queue.push({ id: childId, depth: depth + 1 });
+          }
+        });
+      }
     }
+    
+    // Get last 3 depth levels
+    const depths = Object.keys(layersByDepth).map(Number).sort((a, b) => b - a);
+    const lastThreeDepths = depths.slice(0, 3);
+    
+    lastThreeDepths.forEach(depth => {
+      layersByDepth[depth].forEach(nodeId => result.add(nodeId));
+    });
+    
+    return result;
   };
 
-  // Draw arrow marker
-  const renderArrowMarker = () => (
-    <defs>
-      <marker
-        id="arrowhead"
-        markerWidth="10"
-        markerHeight="10"
-        refX="9"
-        refY="3"
-        orient="auto"
-        markerUnits="strokeWidth"
-      >
-        <polygon
-          points="0 0, 10 3, 0 6"
-          fill={COLORS.edge.default}
-        />
-      </marker>
-      <marker
-        id="arrowhead-highlighted"
-        markerWidth="10"
-        markerHeight="10"
-        refX="9"
-        refY="3"
-        orient="auto"
-        markerUnits="strokeWidth"
-      >
-        <polygon
-          points="0 0, 10 3, 0 6"
-          fill={COLORS.edge.highlighted}
-        />
-      </marker>
-    </defs>
+  const lastThreeChildNodes = getLastThreeChildLayers();
+
+  // Determine which layers should be collapsed
+  const collapsedLayers = new Set();
+  Object.entries(nodesByLayer).forEach(([layer, nodeIds]) => {
+    const layerNum = parseInt(layer);
+    // Check if this layer has expanded children AND is not being hovered AND not in last 3 child layers
+    const hasExpandedKids = layerHasExpandedChildren(nodeIds);
+    const isLayerHovered = nodeIds.some(nodeId => hoveredNode === nodeId);
+    const isInLastThreeChildren = nodeIds.some(nodeId => lastThreeChildNodes.has(nodeId));
+    
+    if (hasExpandedKids && !isLayerHovered && !isInLastThreeChildren) {
+      collapsedLayers.add(layerNum);
+    }
+  });
+
+  // Calculate cumulative X positions for layers
+  const layerXPositions = {};
+  let cumulativeX = 50;
+  const sortedLayers = Object.keys(nodesByLayer).map(Number).sort((a, b) => a - b);
+  
+  sortedLayers.forEach(layerNum => {
+    layerXPositions[layerNum] = cumulativeX;
+    const isCollapsed = collapsedLayers.has(layerNum);
+    cumulativeX += (isCollapsed ? collapsedLayerWidth : expandedLayerWidth);
+  });
+
+  const nodePositions = {};
+  Object.entries(nodesByLayer).forEach(([layer, nodeIds]) => {
+    const layerNum = parseInt(layer);
+    nodeIds.forEach((nodeId, index) => {
+      nodePositions[nodeId] = {
+        x: layerXPositions[layerNum],
+        y: index * (nodeHeight + nodeSpacing) + 50
+      };
+    });
+  });
+
+  // Get visible edges
+  const visibleEdges = graphData.edges.filter(edge => 
+    expandedNodes.has(edge.source) && expandedNodes.has(edge.target)
   );
 
-  // Calculate edge path
-  const getEdgePath = (edge) => {
-    const source = positionedNodes[edge.source];
-    const target = positionedNodes[edge.target];
+  // Generate color based on node depth
+  const getNodeColor = (nodeId) => {
+    const path = getPathToNode(nodeId);
+    const depth = path.length - 1;
     
-    if (!source || !target) return '';
-
-    const x1 = source.x + offsetX;
-    const y1 = source.y + offsetY + 30; // Bottom of source node
-    const x2 = target.x + offsetX;
-    const y2 = target.y + offsetY - 30; // Top of target node
-
-    if (edge.type === 'smoothstep') {
-      const midY = (y1 + y2) / 2;
-      return `M ${x1},${y1} L ${x1},${midY} L ${x2},${midY} L ${x2},${y2}`;
-    }
+    const colors = [
+      '#8B5CF6', // Purple
+      '#3B82F6', // Blue
+      '#10B981', // Green
+      '#F59E0B', // Amber
+      '#EF4444', // Red
+      '#EC4899', // Pink
+      '#06B6D4', // Cyan
+      '#84CC16', // Lime
+    ];
     
-    return `M ${x1},${y1} L ${x2},${y2}`;
+    return colors[depth % colors.length];
   };
+
+  // Build path string
+  const pathString = currentPath
+    .map(id => nodeMap[id]?.data?.label || '')
+    .filter(Boolean)
+    .join(' ---> ');
+
+  // Calculate canvas size
+  const maxNodesInLayer = Math.max(...Object.values(nodesByLayer).map(arr => arr.length), 1);
+  const canvasWidth = cumulativeX + 200;
+  const canvasHeight = maxNodesInLayer * (nodeHeight + nodeSpacing) + 150;
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-slate-900 via-blue-900 to-slate-900 p-4">
+    <div className="min-h-screen bg-gradient-to-br from-slate-900 via-purple-900 to-slate-900 p-4">
       <div className="max-w-full mx-auto">
         {/* Header */}
         <div className="text-center mb-4">
           <h1 className="text-5xl font-bold text-white mb-2 drop-shadow-lg">
-            🔄 COBOL Program Flow Diagram
+            🌳 Layered Tree Diagram
           </h1>
-          <p className="text-blue-200 text-lg">
-            Interactive visualization of program structure - {graphData.nodes.length} nodes, {graphData.edges.length} edges
+          <p className="text-purple-200 text-lg">
+            Click nodes to expand/collapse 3 layers • {graphData.nodes.length} total nodes
           </p>
         </div>
 
         {/* Controls */}
         <div className="bg-white/10 backdrop-blur-lg rounded-xl p-4 mb-4 shadow-2xl border border-white/20">
-          <div className="flex flex-col md:flex-row gap-3 items-center justify-between">
-            {/* Search */}
-            <div className="flex-1 w-full relative">
-              <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-blue-300 w-4 h-4" />
-              <input
-                type="text"
-                placeholder="Search nodes by label or ID..."
-                value={searchTerm}
-                onChange={(e) => setSearchTerm(e.target.value)}
-                className="w-full pl-10 pr-3 py-2 bg-white/20 border-2 border-white/30 rounded-lg text-white placeholder-blue-200 focus:outline-none focus:ring-2 focus:ring-blue-400 text-sm"
-              />
-            </div>
-            
-            {/* Zoom Controls */}
-            <div className="flex items-center gap-2 bg-white/20 rounded-lg p-1">
-              <button
-                onClick={() => setZoom(Math.max(25, zoom - 25))}
-                className="p-2 hover:bg-white/20 rounded transition-colors"
-                title="Zoom Out"
-              >
-                <ZoomOut className="w-4 h-4 text-white" />
-              </button>
+          <div className="flex flex-col gap-3">
+            {/* Top Row */}
+            <div className="flex flex-col md:flex-row gap-3 items-stretch md:items-center">
+              {/* Search */}
+              <div className="flex-1 relative">
+                <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-purple-300 w-5 h-5" />
+                <input
+                  type="text"
+                  placeholder="Search nodes by label..."
+                  value={searchTerm}
+                  onChange={(e) => handleSearch(e.target.value)}
+                  className="w-full pl-11 pr-4 py-2.5 bg-white/20 border-2 border-white/30 rounded-lg text-white placeholder-purple-200 focus:outline-none focus:ring-2 focus:ring-purple-400 text-sm"
+                />
+              </div>
               
-              <span className="px-3 py-1 text-sm font-bold text-white min-w-[3.5rem] text-center">
-                {zoom}%
-              </span>
-              
-              <button
-                onClick={() => setZoom(Math.min(400, zoom + 25))}
-                className="p-2 hover:bg-white/20 rounded transition-colors"
-                title="Zoom In"
-              >
-                <ZoomIn className="w-4 h-4 text-white" />
-              </button>
-              
-              <button
-                onClick={() => { setZoom(100); setPan({ x: 0, y: 0 }); }}
-                className="ml-2 p-2 hover:bg-white/20 rounded transition-colors"
-                title="Reset View"
-              >
-                <Maximize2 className="w-4 h-4 text-white" />
-              </button>
+              {/* Zoom Controls */}
+              <div className="flex items-center gap-2 bg-white/20 rounded-lg p-1.5">
+                <button
+                  onClick={() => setZoom(Math.max(25, zoom - 25))}
+                  className="p-2 hover:bg-white/20 rounded transition-colors"
+                  title="Zoom Out"
+                >
+                  <ZoomOut className="w-5 h-5 text-white" />
+                </button>
+                
+                <span className="px-4 py-1 text-sm font-bold text-white min-w-[4rem] text-center">
+                  {zoom}%
+                </span>
+                
+                <button
+                  onClick={() => setZoom(Math.min(200, zoom + 25))}
+                  className="p-2 hover:bg-white/20 rounded transition-colors"
+                  title="Zoom In"
+                >
+                  <ZoomIn className="w-5 h-5 text-white" />
+                </button>
+                
+                <button
+                  onClick={() => setZoom(100)}
+                  className="ml-1 p-2 hover:bg-white/20 rounded transition-colors"
+                  title="Reset Zoom"
+                >
+                  <Maximize2 className="w-5 h-5 text-white" />
+                </button>
+              </div>
             </div>
 
-            <div className="flex items-center gap-2 text-white text-sm">
-              <Move className="w-4 h-4" />
-              <span>Drag to pan</span>
+            {/* Action Buttons */}
+            <div className="flex flex-wrap gap-2">
+              <button
+                onClick={addMoreLayers}
+                disabled={!activeNode}
+                className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white rounded-lg font-medium transition-colors text-sm shadow-lg"
+              >
+                <Layers className="w-4 h-4" />
+                Add More Layers
+              </button>
+
+              <button
+                onClick={toggleShowAll}
+                className="flex items-center gap-2 px-4 py-2 bg-purple-600 hover:bg-purple-700 text-white rounded-lg font-medium transition-colors text-sm shadow-lg"
+              >
+                <Maximize2 className="w-4 h-4" />
+                {showAllGraph ? 'Collapse All' : 'Show All Graph'}
+              </button>
+
+              <button
+                onClick={handleReset}
+                className="flex items-center gap-2 px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg font-medium transition-colors text-sm shadow-lg"
+              >
+                <Home className="w-4 h-4" />
+                Reset
+              </button>
             </div>
           </div>
         </div>
 
+        {/* Path Display */}
+        {currentPath.length > 1 && (
+          <div className="bg-white/10 backdrop-blur-lg rounded-xl p-4 mb-4 shadow-2xl border border-white/20">
+            <div className="flex items-start gap-3">
+              <ChevronRight className="w-5 h-5 text-purple-300 flex-shrink-0 mt-1" />
+              <div className="flex-1 min-w-0">
+                <p className="text-sm font-semibold text-purple-200 mb-1">Current Path:</p>
+                <p className="text-white font-mono text-sm break-all leading-relaxed">
+                  {pathString}
+                </p>
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* Diagram Container */}
         <div 
           ref={containerRef}
-          className="bg-white/5 backdrop-blur-sm rounded-2xl shadow-2xl border border-white/10 overflow-hidden relative"
-          style={{ height: 'calc(100vh - 280px)', cursor: isPanning ? 'grabbing' : 'grab' }}
-          onMouseDown={handleMouseDown}
+          className="bg-white/5 backdrop-blur-sm rounded-2xl shadow-2xl border border-white/10 overflow-auto"
+          style={{ height: 'calc(100vh - 420px)' }}
         >
           <div
             style={{
-              transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom / 100})`,
+              transform: `scale(${zoom / 100})`,
               transformOrigin: '0 0',
-              transition: isPanning ? 'none' : 'transform 0.3s ease-out',
-              width: svgWidth,
-              height: svgHeight
+              padding: '20px',
+              minWidth: canvasWidth,
+              minHeight: canvasHeight
             }}
           >
             <svg
-              ref={svgRef}
-              width={svgWidth}
-              height={svgHeight}
+              width={canvasWidth}
+              height={canvasHeight}
               className="select-none"
             >
-              {renderArrowMarker()}
-              
+              <defs>
+                {/* Arrow markers for each depth level */}
+                {Array.from({length: graphData.edges.length}, (_, i) => {
+                  const dummyPath = Array(i + 1).fill('root');
+                  const color = getNodeColor(dummyPath[0]);
+                  return (
+                    <marker
+                      key={`arrow-${i}`}
+                      id={`arrowhead-${i}`}
+                      markerWidth="10"
+                      markerHeight="10"
+                      refX="9"
+                      refY="3"
+                      orient="auto"
+                    >
+                      <polygon
+                        points="0 0, 10 3, 0 6"
+                        fill={color}
+                      />
+                    </marker>
+                  );
+                })}
+                {/* Glow filter for searched node */}
+                <filter id="greenGlow" x="-50%" y="-50%" width="200%" height="200%">
+                  <feGaussianBlur in="SourceAlpha" stdDeviation="4" />
+                  <feOffset dx="0" dy="0" result="offsetblur" />
+                  <feFlood floodColor="#10B981" floodOpacity="0.8" />
+                  <feComposite in2="offsetblur" operator="in" />
+                  <feMerge>
+                    <feMergeNode />
+                    <feMergeNode in="SourceGraphic" />
+                  </feMerge>
+                </filter>
+              </defs>
+
               {/* Render Edges */}
               <g className="edges">
-                {graphData.edges.map((edge) => {
-                  const isHighlighted = 
-                    highlightedNodes.has(edge.source) && highlightedNodes.has(edge.target);
-                  const isSelected = 
-                    selectedNode === edge.source || selectedNode === edge.target;
+                {visibleEdges.map(edge => {
+                  const source = nodePositions[edge.source];
+                  const target = nodePositions[edge.target];
                   
+                  if (!source || !target) return null;
+
+                  const color = getNodeColor(edge.source);
+                  const isInPath = currentPath.includes(edge.source) && currentPath.includes(edge.target);
+                  const sourceDepth = getPathToNode(edge.source).length - 1;
+
+                  // Determine source layer collapse state
+                  const sourcePath = getPathToNode(edge.source);
+                  const sourceLayer = sourcePath.length - 1;
+                  const isSourceLayerCollapsed = collapsedLayers.has(sourceLayer);
+                  
+                  // Use collapsed width if source layer is collapsed
+                  const sourceWidth = isSourceLayerCollapsed ? collapsedNodeWidth : nodeWidth;
+
+                  // Create smooth curve path for rectangular nodes
+                  const controlX1 = source.x + (target.x - source.x) * 0.5;
+                  const controlX2 = source.x + (target.x - source.x) * 0.5;
+                  
+                  const path = `M ${source.x + sourceWidth} ${source.y + nodeHeight/2} 
+                                C ${controlX1} ${source.y + nodeHeight/2}, 
+                                  ${controlX2} ${target.y + nodeHeight/2}, 
+                                  ${target.x} ${target.y + nodeHeight/2}`;
+
                   return (
                     <g key={edge.id}>
                       <path
-                        d={getEdgePath(edge)}
-                        stroke={isHighlighted || isSelected ? COLORS.edge.highlighted : COLORS.edge.default}
-                        strokeWidth={isSelected ? 3 : 2}
+                        d={path}
                         fill="none"
-                        opacity={searchTerm && !isHighlighted ? 0.2 : 0.6}
-                        markerEnd={`url(#${isHighlighted || isSelected ? 'arrowhead-highlighted' : 'arrowhead'})`}
-                        className={edge.animated ? 'animate-pulse' : ''}
+                        stroke={color}
+                        strokeWidth={isInPath ? 4 : 2}
+                        opacity={isInPath ? 1 : 0.6}
+                        markerEnd={`url(#arrowhead-${sourceDepth})`}
+                        className={edge.animated && isInPath ? 'animate-pulse' : ''}
+                        style={{ transition: 'all 0.3s ease' }}
                       />
-                      {/* Edge type label */}
-                      {edge.type && isSelected && (
-                        <text
-                          x={(positionedNodes[edge.source]?.x + positionedNodes[edge.target]?.x) / 2 + offsetX}
-                          y={(positionedNodes[edge.source]?.y + positionedNodes[edge.target]?.y) / 2 + offsetY}
-                          fill={COLORS.edge.highlighted}
-                          fontSize="10"
-                          fontWeight="bold"
-                          textAnchor="middle"
-                          className="pointer-events-none"
-                        >
-                          {edge.type}
-                        </text>
-                      )}
                     </g>
                   );
                 })}
@@ -350,61 +590,166 @@ const FlowDiagram = () => {
 
               {/* Render Nodes */}
               <g className="nodes">
-                {graphData.nodes.map((node) => {
-                  const positioned = positionedNodes[node.id];
-                  if (!positioned) return null;
+                {visibleNodes.map(node => {
+                  const pos = nodePositions[node.id];
+                  if (!pos) return null;
 
-                  const isHighlighted = highlightedNodes.has(node.id);
-                  const isSelected = selectedNode === node.id;
+                  const color = getNodeColor(node.id);
+                  const isActive = activeNode === node.id;
+                  const isInPath = currentPath.includes(node.id);
+                  const hasChildren = (childrenMap[node.id] || []).length > 0;
+                  const isExpanded = hasExpandedDescendants(node.id);
+                  const isSearchResult = searchTerm && node.data.label.toLowerCase().includes(searchTerm.toLowerCase());
                   const isHovered = hoveredNode === node.id;
+
+                  // Determine if this node's layer should be collapsed
+                  const nodePath = getPathToNode(node.id);
+                  const nodeLayer = nodePath.length - 1;
+                  const isLayerCollapsed = collapsedLayers.has(nodeLayer);
                   
+                  const currentWidth = isLayerCollapsed ? collapsedNodeWidth : nodeWidth;
+
                   return (
                     <g
                       key={node.id}
-                      transform={`translate(${positioned.x + offsetX}, ${positioned.y + offsetY})`}
-                      onClick={() => {
-                        setSelectedNode(isSelected ? null : node.id);
-                        centerOnNode(node.id);
-                      }}
+                      transform={`translate(${pos.x}, ${pos.y})`}
+                      onClick={() => handleNodeClick(node.id)}
                       onMouseEnter={() => setHoveredNode(node.id)}
                       onMouseLeave={() => setHoveredNode(null)}
-                      className="cursor-pointer"
-                      style={{ opacity: searchTerm && !isHighlighted ? 0.3 : 1 }}
+                      className="cursor-pointer transition-all duration-300"
+                      style={{ transition: 'all 0.3s ease' }}
                     >
-                      {/* Node glow */}
-                      {(isSelected || isHovered) && (
-                        <circle
-                          cx="0"
-                          cy="0"
-                          r="35"
-                          fill={isSelected ? COLORS.node.highlighted : COLORS.node.hover}
+                      {/* Glow for active/path nodes */}
+                      {(isActive || isInPath) && !isSearchResult && (
+                        <rect
+                          x="-5"
+                          y="-5"
+                          width={currentWidth + 10}
+                          height={nodeHeight + 10}
+                          rx="8"
+                          fill={color}
                           opacity="0.3"
                           className="animate-pulse"
                         />
                       )}
-                      
-                      {/* Node circle */}
-                      <circle
-                        cx="0"
-                        cy="0"
-                        r="25"
-                        fill={isSelected ? COLORS.node.highlighted : isHighlighted ? COLORS.node.search : COLORS.node.default}
-                        stroke="white"
-                        strokeWidth={isSelected ? 3 : 2}
-                        className="transition-all duration-200"
+
+                      {/* Green glow for search result */}
+                      {isSearchResult && (
+                        <>
+                          <rect
+                            x="-8"
+                            y="-8"
+                            width={currentWidth + 16}
+                            height={nodeHeight + 16}
+                            rx="8"
+                            fill="#10B981"
+                            opacity="0.5"
+                            className="animate-pulse"
+                          />
+                          <rect
+                            x="-5"
+                            y="-5"
+                            width={currentWidth + 10}
+                            height={nodeHeight + 10}
+                            rx="8"
+                            fill="none"
+                            stroke="#10B981"
+                            strokeWidth="3"
+                            opacity="0.8"
+                            className="animate-pulse"
+                          />
+                        </>
+                      )}
+
+                      {/* Node Rectangle */}
+                      <rect
+                        width={currentWidth}
+                        height={nodeHeight}
+                        rx="6"
+                        fill={color}
+                        stroke={isInPath ? '#FBBF24' : 'white'}
+                        strokeWidth={isInPath ? 3 : 2}
+                        className="transition-all duration-300 drop-shadow-lg"
+                        filter={isSearchResult ? "url(#greenGlow)" : "none"}
                       />
-                      
-                      {/* Node label */}
-                      <text
-                        y="5"
-                        fill="white"
-                        fontSize="11"
-                        fontWeight="bold"
-                        textAnchor="middle"
-                        className="pointer-events-none select-none"
-                      >
-                        {node.data?.label || node.id}
-                      </text>
+
+                      {/* Node Content - only show when expanded or hovered */}
+                      {!isLayerCollapsed && (
+                        <>
+                          {/* Node Label */}
+                          <text
+                            x={currentWidth / 2}
+                            y={nodeHeight / 2 - 8}
+                            fill="white"
+                            fontSize="13"
+                            fontWeight="bold"
+                            textAnchor="middle"
+                            className="pointer-events-none select-none"
+                          >
+                            {node.data.label.length > 12 
+                              ? node.data.label.substring(0, 10) + '...' 
+                              : node.data.label}
+                          </text>
+                        </>
+                      )}
+
+                      {/* Collapsed state indicator - show 3 vertical dots */}
+                      {isLayerCollapsed && (
+                        <g>
+                          <circle cx={collapsedNodeWidth / 2} cy={nodeHeight / 2 - 12} r="2" fill="white" />
+                          <circle cx={collapsedNodeWidth / 2} cy={nodeHeight / 2} r="2" fill="white" />
+                          <circle cx={collapsedNodeWidth / 2} cy={nodeHeight / 2 + 12} r="2" fill="white" />
+                        </g>
+                      )}
+
+                      {/* Expand/Collapse Indicator */}
+                      {hasChildren && !isLayerCollapsed && (
+                        <g transform={`translate(${currentWidth - 18}, 8)`}>
+                          <circle
+                            r="12"
+                            fill="white"
+                            opacity="0.95"
+                            className="drop-shadow"
+                          />
+                          <text
+                            x="0"
+                            y="5"
+                            fill={color}
+                            fontSize="16"
+                            fontWeight="bold"
+                            textAnchor="middle"
+                            className="pointer-events-none"
+                          >
+                            {isExpanded ? '−' : '+'}
+                          </text>
+                        </g>
+                      )}
+
+                      {/* Tooltip on hover - show full label */}
+                      {isHovered && (
+                        <g transform={`translate(${currentWidth / 2}, ${-10})`}>
+                          <rect
+                            x={-Math.max(60, node.data.label.length * 4)}
+                            y={-25}
+                            width={Math.max(120, node.data.label.length * 8)}
+                            height="30"
+                            rx="4"
+                            fill="rgba(0, 0, 0, 0.9)"
+                            stroke="white"
+                            strokeWidth="1"
+                          />
+                          <text
+                            y={-8}
+                            fill="white"
+                            fontSize="12"
+                            fontWeight="500"
+                            textAnchor="middle"
+                            className="pointer-events-none select-none"
+                          >
+                            {node.data.label}
+                          </text>
+                        </g>
+                      )}
                     </g>
                   );
                 })}
@@ -413,43 +758,26 @@ const FlowDiagram = () => {
           </div>
         </div>
 
-        {/* Legend & Info */}
-        <div className="mt-4 grid grid-cols-1 md:grid-cols-2 gap-4">
-          <div className="bg-white/10 backdrop-blur-lg rounded-xl p-4 border border-white/20">
-            <h3 className="text-lg font-bold text-white mb-2">📊 Legend</h3>
-            <div className="space-y-2 text-sm">
-              <div className="flex items-center gap-2">
-                <div className="w-4 h-4 rounded-full" style={{ backgroundColor: COLORS.node.default }} />
-                <span className="text-white">Default Node</span>
-              </div>
-              <div className="flex items-center gap-2">
-                <div className="w-4 h-4 rounded-full" style={{ backgroundColor: COLORS.node.highlighted }} />
-                <span className="text-white">Selected/Highlighted Node</span>
-              </div>
-              <div className="flex items-center gap-2">
-                <div className="w-8 h-0.5" style={{ backgroundColor: COLORS.edge.default }} />
-                <span className="text-white">Edge with arrow</span>
-              </div>
+        {/* Stats */}
+        <div className="mt-4 bg-white/10 backdrop-blur-lg rounded-xl p-4 shadow-2xl border border-white/20">
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-center">
+            <div>
+              <div className="text-3xl font-bold text-purple-300">{graphData.nodes.length}</div>
+              <div className="text-sm text-white">Total Nodes</div>
+            </div>
+            <div>
+              <div className="text-3xl font-bold text-blue-300">{graphData.edges.length}</div>
+              <div className="text-sm text-white">Total Edges</div>
+            </div>
+            <div>
+              <div className="text-3xl font-bold text-green-300">{expandedNodes.size}</div>
+              <div className="text-sm text-white">Visible Nodes</div>
+            </div>
+            <div>
+              <div className="text-3xl font-bold text-yellow-300">{Object.keys(nodesByLayer).length}</div>
+              <div className="text-sm text-white">Active Layers</div>
             </div>
           </div>
-
-          {selectedNode && (
-            <div className="bg-white/10 backdrop-blur-lg rounded-xl p-4 border border-white/20">
-              <h3 className="text-lg font-bold text-white mb-2">🎯 Selected Node</h3>
-              <div className="text-sm text-white space-y-1">
-                <p><strong>ID:</strong> {selectedNode}</p>
-                <p><strong>Label:</strong> {positionedNodes[selectedNode]?.data?.label || 'N/A'}</p>
-                <p><strong>Children:</strong> {positionedNodes[selectedNode]?.children.length || 0}</p>
-                <p><strong>Parents:</strong> {positionedNodes[selectedNode]?.parents.length || 0}</p>
-              </div>
-            </div>
-          )}
-        </div>
-
-        {/* Instructions */}
-        <div className="mt-4 text-center text-blue-200 text-sm space-y-1">
-          <p>💡 Click a node to select and center on it • Drag to pan • Scroll/buttons to zoom</p>
-          <p>🔍 Search highlights matching nodes • Arrows show program flow direction</p>
         </div>
       </div>
     </div>
