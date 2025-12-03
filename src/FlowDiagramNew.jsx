@@ -157,9 +157,16 @@ const FlowDiagramNew = () => {
   // Keyboard shortcut for undo (Ctrl+Z)
   useEffect(() => {
     const handleKeyDown = (e) => {
+      // CTRL/CMD + Z  => Undo
       if ((e.ctrlKey || e.metaKey) && e.key === "z" && !e.shiftKey) {
         e.preventDefault();
         handleUndo();
+      }
+
+      // CTRL/CMD + SHIFT + Z => Redo
+      if ((e.ctrlKey || e.metaKey) && e.key === "z" && e.shiftKey) {
+        e.preventDefault();
+        handleRedo();
       }
     };
 
@@ -223,6 +230,30 @@ const FlowDiagramNew = () => {
   const layerHasExpandedChildren = (layerNodes) => {
     return layerNodes.some((nodeId) => hasExpandedDescendants(nodeId));
   };
+  const handleRedo = useCallback(() => {
+    if (currentHistoryIndex >= historyRef.current.length - 1) return;
+
+    const newIndex = currentHistoryIndex + 1;
+    const nextState = historyRef.current[newIndex];
+
+    if (nextState) {
+      isRestoringRef.current = true;
+
+      setExpandedNodes(new Set(nextState.expandedNodes || []));
+      setActiveNode(
+        nextState.activeNode !== undefined ? nextState.activeNode : null
+      );
+      setCurrentPath(nextState.currentPath || []);
+      setHiddenNodes(new Set(nextState.hiddenNodes || []));
+      setSelectedToHide(new Set(nextState.selectedToHide || []));
+      setShowSelectedMode(!!nextState.showSelectedMode);
+      setZoom(nextState.zoom ?? 100);
+      setSearchTerm(nextState.searchTerm ?? "");
+      setShowAllGraph(!!nextState.showAllGraph);
+
+      setCurrentHistoryIndex(newIndex);
+    }
+  }, [currentHistoryIndex]);
 
   const handleHideSelected = () => {
     setHiddenNodes((prev) => {
@@ -573,6 +604,15 @@ const FlowDiagramNew = () => {
               >
                 <Undo className="w-4 h-4" />
                 Undo
+              </button>
+              <button
+                onClick={handleRedo}
+                disabled={currentHistoryIndex >= historyRef.current.length - 1}
+                className="flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white rounded-lg font-medium transition-colors text-sm shadow-lg"
+                title="Redo (Ctrl+Shift+Z)"
+              >
+                <Undo className="w-4 h-4 rotate-180" />
+                Redo
               </button>
 
               <button
