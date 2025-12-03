@@ -1,11 +1,20 @@
-import React, { useState, useRef, useEffect } from 'react';
-import { ZoomIn, ZoomOut, Maximize2, Search, Layers, ChevronRight, Home , Undo} from 'lucide-react';
-import rawData from './data/ a.json'
+import React, { useState, useRef, useEffect } from "react";
+import {
+  ZoomIn,
+  ZoomOut,
+  Maximize2,
+  Search,
+  Layers,
+  ChevronRight,
+  Home,
+  Undo,
+} from "lucide-react";
+import rawData from "./data/ a.json";
 // Sample data structure - replace this with your actual data
-  // Use sample data - replace with: import rawData from './data/a.json'
+// Use sample data - replace with: import rawData from './data/a.json'
 // const graphData = rawData.react_flow_for_layers_map || rawData;
 const FlowDiagramNew = () => {
-  const [searchTerm, setSearchTerm] = useState('');
+  const [searchTerm, setSearchTerm] = useState("");
   const [zoom, setZoom] = useState(100);
   const [expandedNodes, setExpandedNodes] = useState(new Set());
   const [activeNode, setActiveNode] = useState(null);
@@ -16,7 +25,7 @@ const FlowDiagramNew = () => {
   const [hiddenNodes, setHiddenNodes] = useState(new Set());
   const [selectedToHide, setSelectedToHide] = useState(new Set());
   const [showSelectedMode, setShowSelectedMode] = useState(false);
-  
+
   // History state for undo functionality
   const [history, setHistory] = useState([]);
   const [currentHistoryIndex, setCurrentHistoryIndex] = useState(-1);
@@ -35,17 +44,27 @@ const FlowDiagramNew = () => {
       showSelectedMode,
       zoom,
       searchTerm,
-      showAllGraph
+      showAllGraph,
     };
 
-    console.log('Saving to history - Current index:', currentHistoryIndex, 'Expanded nodes:', expandedNodes.size);
+    console.log(
+      "Saving to history - Current index:",
+      currentHistoryIndex,
+      "Expanded nodes:",
+      expandedNodes.size
+    );
 
     // Remove any future history if we're not at the end
     const newHistory = history.slice(0, currentHistoryIndex + 1);
     newHistory.push(state);
-    
-    console.log('New history length:', newHistory.length, 'New index will be:', newHistory.length - 1);
-    
+
+    console.log(
+      "New history length:",
+      newHistory.length,
+      "New index will be:",
+      newHistory.length - 1
+    );
+
     // Limit history to last 50 states
     if (newHistory.length > 50) {
       newHistory.shift();
@@ -58,15 +77,23 @@ const FlowDiagramNew = () => {
 
   // Undo to previous state
   const handleUndo = () => {
-    console.log('Undo clicked - Current index:', currentHistoryIndex, 'History length:', history.length);
-    
+    console.log(
+      "Undo clicked - Current index:",
+      currentHistoryIndex,
+      "History length:",
+      history.length
+    );
+
     if (currentHistoryIndex > 0) {
       const newIndex = currentHistoryIndex - 1;
       const previousState = history[newIndex];
-      
-      console.log('Going to index:', newIndex);
-      console.log('Previous state expanded nodes:', previousState.expandedNodes.size);
-      
+
+      console.log("Going to index:", newIndex);
+      console.log(
+        "Previous state expanded nodes:",
+        previousState.expandedNodes.size
+      );
+
       setExpandedNodes(new Set(previousState.expandedNodes));
       setActiveNode(previousState.activeNode);
       setCurrentPath([...previousState.currentPath]);
@@ -76,7 +103,7 @@ const FlowDiagramNew = () => {
       setZoom(previousState.zoom);
       setSearchTerm(previousState.searchTerm);
       setShowAllGraph(previousState.showAllGraph);
-      
+
       setCurrentHistoryIndex(newIndex);
     }
   };
@@ -84,12 +111,12 @@ const FlowDiagramNew = () => {
   const handleHideSelected = () => {
     // Save current state BEFORE applying changes
     saveToHistory();
-    
-    setHiddenNodes(prev => {
+
+    setHiddenNodes((prev) => {
       const next = new Set(prev);
-      selectedToHide.forEach(nodeId => {
+      selectedToHide.forEach((nodeId) => {
         next.add(nodeId);
-        getAllDescendants(nodeId).forEach(child => next.add(child));
+        getAllDescendants(nodeId).forEach((child) => next.add(child));
       });
       return next;
     });
@@ -98,41 +125,41 @@ const FlowDiagramNew = () => {
 
   const handleShowSelected = () => {
     if (selectedToHide.size === 0) return;
-    
+
     // Save current state BEFORE applying changes
     saveToHistory();
 
     const nodesToKeep = new Set(selectedToHide);
 
-    selectedToHide.forEach(nodeId => {
+    selectedToHide.forEach((nodeId) => {
       const path = getPathToNode(nodeId);
-      path.forEach(id => nodesToKeep.add(id));
+      path.forEach((id) => nodesToKeep.add(id));
     });
 
-    selectedToHide.forEach(nodeId => {
+    selectedToHide.forEach((nodeId) => {
       const descendants = getAllDescendants(nodeId);
-      descendants.forEach(id => nodesToKeep.add(id));
+      descendants.forEach((id) => nodesToKeep.add(id));
     });
 
-    selectedToHide.forEach(nodeId => {
-      graphData.edges.forEach(edge => {
+    selectedToHide.forEach((nodeId) => {
+      graphData.edges.forEach((edge) => {
         if (edge.source === nodeId) {
           nodesToKeep.add(edge.target);
           const targetPath = getPathToNode(edge.target);
-          targetPath.forEach(id => nodesToKeep.add(id));
+          targetPath.forEach((id) => nodesToKeep.add(id));
         }
         if (edge.target === nodeId) {
           nodesToKeep.add(edge.source);
           const sourcePath = getPathToNode(edge.source);
-          sourcePath.forEach(id => nodesToKeep.add(id));
+          sourcePath.forEach((id) => nodesToKeep.add(id));
         }
       });
     });
 
-    const allNodeIds = new Set(graphData.nodes.map(n => n.id));
+    const allNodeIds = new Set(graphData.nodes.map((n) => n.id));
     const nodesToHide = new Set();
-    
-    allNodeIds.forEach(nodeId => {
+
+    allNodeIds.forEach((nodeId) => {
       if (!nodesToKeep.has(nodeId)) {
         nodesToHide.add(nodeId);
       }
@@ -145,7 +172,7 @@ const FlowDiagramNew = () => {
 
   const handleNodeRightClick = (e, nodeId) => {
     e.preventDefault();
-    setSelectedToHide(prev => {
+    setSelectedToHide((prev) => {
       const next = new Set(prev);
       if (next.has(nodeId)) next.delete(nodeId);
       else next.add(nodeId);
@@ -154,7 +181,7 @@ const FlowDiagramNew = () => {
   };
 
   const toggleSelectNode = (nodeId) => {
-    setSelectedToHide(prev => {
+    setSelectedToHide((prev) => {
       const next = new Set(prev);
       next.has(nodeId) ? next.delete(nodeId) : next.add(nodeId);
       return next;
@@ -166,13 +193,13 @@ const FlowDiagramNew = () => {
     const childrenMap = {};
     const parentMap = {};
 
-    graphData.nodes.forEach(node => {
+    graphData.nodes.forEach((node) => {
       nodeMap[node.id] = node;
       childrenMap[node.id] = [];
       parentMap[node.id] = null;
     });
 
-    graphData.edges.forEach(edge => {
+    graphData.edges.forEach((edge) => {
       if (childrenMap[edge.source]) {
         childrenMap[edge.source].push(edge.target);
       }
@@ -187,7 +214,7 @@ const FlowDiagramNew = () => {
   const { nodeMap, childrenMap, parentMap } = buildGraph();
 
   const findRootNode = () => {
-    return graphData.nodes.find(node => !parentMap[node.id]);
+    return graphData.nodes.find((node) => !parentMap[node.id]);
   };
 
   const rootNode = findRootNode();
@@ -209,8 +236,8 @@ const FlowDiagramNew = () => {
         selectedToHide: new Set(),
         showSelectedMode: false,
         zoom: 100,
-        searchTerm: '',
-        showAllGraph: false
+        searchTerm: "",
+        showAllGraph: false,
       };
       setHistory([initialState]);
       setCurrentHistoryIndex(0);
@@ -221,12 +248,12 @@ const FlowDiagramNew = () => {
   // Keyboard shortcut for undo (Ctrl+Z)
   useEffect(() => {
     const handleKeyDown = (e) => {
-      if ((e.ctrlKey || e.metaKey) && e.key === 'z' && !e.shiftKey) {
+      if ((e.ctrlKey || e.metaKey) && e.key === "z" && !e.shiftKey) {
         e.preventDefault();
         if (currentHistoryIndex > 0) {
           const newIndex = currentHistoryIndex - 1;
           const previousState = history[newIndex];
-          
+
           setExpandedNodes(new Set(previousState.expandedNodes));
           setActiveNode(previousState.activeNode);
           setCurrentPath([...previousState.currentPath]);
@@ -236,14 +263,14 @@ const FlowDiagramNew = () => {
           setZoom(previousState.zoom);
           setSearchTerm(previousState.searchTerm);
           setShowAllGraph(previousState.showAllGraph);
-          
+
           setCurrentHistoryIndex(newIndex);
         }
       }
     };
 
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
   }, [currentHistoryIndex, history]);
 
   const getPathToNode = (nodeId) => {
@@ -269,7 +296,7 @@ const FlowDiagramNew = () => {
 
       if (depth < layers) {
         const children = childrenMap[id] || [];
-        children.forEach(childId => {
+        children.forEach((childId) => {
           queue.push({ id: childId, depth: depth + 1 });
         });
       }
@@ -284,7 +311,7 @@ const FlowDiagramNew = () => {
     while (queue.length > 0) {
       const current = queue.shift();
       const children = childrenMap[current] || [];
-      children.forEach(child => {
+      children.forEach((child) => {
         if (!descendants.has(child)) {
           descendants.add(child);
           queue.push(child);
@@ -296,35 +323,35 @@ const FlowDiagramNew = () => {
 
   const hasExpandedDescendants = (nodeId) => {
     const children = childrenMap[nodeId] || [];
-    return children.some(childId => expandedNodes.has(childId));
+    return children.some((childId) => expandedNodes.has(childId));
   };
 
   const layerHasExpandedChildren = (layerNodes) => {
-    return layerNodes.some(nodeId => hasExpandedDescendants(nodeId));
+    return layerNodes.some((nodeId) => hasExpandedDescendants(nodeId));
   };
 
   const handleNodeClick = (nodeId) => {
     let newExpanded;
     let newActiveNode;
     let newCurrentPath;
-    
+
     if (hasExpandedDescendants(nodeId)) {
       newExpanded = new Set(expandedNodes);
       const descendants = getAllDescendants(nodeId);
-      descendants.forEach(id => newExpanded.delete(id));
+      descendants.forEach((id) => newExpanded.delete(id));
       newActiveNode = nodeId;
       newCurrentPath = getPathToNode(nodeId);
     } else {
       newExpanded = new Set(expandedNodes);
       const toAdd = getNLayersOfChildren(nodeId, 3);
-      toAdd.forEach(id => newExpanded.add(id));
+      toAdd.forEach((id) => newExpanded.add(id));
       newActiveNode = nodeId;
       newCurrentPath = getPathToNode(nodeId);
     }
-    
+
     // Save current state BEFORE applying changes
     saveToHistory();
-    
+
     // Now apply the changes
     setExpandedNodes(newExpanded);
     setActiveNode(newActiveNode);
@@ -333,7 +360,7 @@ const FlowDiagramNew = () => {
 
   const addMoreLayers = () => {
     if (!activeNode) return;
-    
+
     const newExpanded = new Set(expandedNodes);
     const visibleDescendants = [];
     const queue = [activeNode];
@@ -347,30 +374,32 @@ const FlowDiagramNew = () => {
       if (expandedNodes.has(current)) {
         visibleDescendants.push(current);
         const children = childrenMap[current] || [];
-        children.forEach(child => queue.push(child));
+        children.forEach((child) => queue.push(child));
       }
     }
 
-    visibleDescendants.forEach(nodeId => {
+    visibleDescendants.forEach((nodeId) => {
       const children = childrenMap[nodeId] || [];
-      const hasVisibleChildren = children.some(child => expandedNodes.has(child));
+      const hasVisibleChildren = children.some((child) =>
+        expandedNodes.has(child)
+      );
 
       if (!hasVisibleChildren && children.length > 0) {
         const toAdd = getNLayersOfChildren(nodeId, 3);
-        toAdd.forEach(id => newExpanded.add(id));
+        toAdd.forEach((id) => newExpanded.add(id));
       }
     });
 
     // Save current state BEFORE applying changes
     saveToHistory();
-    
+
     setExpandedNodes(newExpanded);
   };
 
   const toggleShowAll = () => {
     // Save current state BEFORE applying changes
     saveToHistory();
-    
+
     setHiddenNodes(new Set());
     setSelectedToHide(new Set());
     setShowSelectedMode(false);
@@ -380,7 +409,7 @@ const FlowDiagramNew = () => {
       setActiveNode(null);
       setCurrentPath([]);
     } else {
-      const allNodes = new Set(graphData.nodes.map(n => n.id));
+      const allNodes = new Set(graphData.nodes.map((n) => n.id));
       setExpandedNodes(allNodes);
       setActiveNode(rootNode?.id);
       setCurrentPath([rootNode?.id]);
@@ -390,11 +419,11 @@ const FlowDiagramNew = () => {
 
   const handleSearch = (term) => {
     const search = term.toLowerCase().trim();
-    
-    if (term !== searchTerm && searchTerm !== '') {
+
+    if (term !== searchTerm && searchTerm !== "") {
       saveToHistory(); // Save state before change (but not on initial typing)
     }
-    
+
     setSearchTerm(term);
 
     if (!search) {
@@ -404,7 +433,7 @@ const FlowDiagramNew = () => {
       return;
     }
 
-    const matchedNode = graphData.nodes.find(n =>
+    const matchedNode = graphData.nodes.find((n) =>
       (n.data?.label || "").toLowerCase().includes(search)
     );
 
@@ -420,24 +449,26 @@ const FlowDiagramNew = () => {
   const handleReset = () => {
     // Save current state BEFORE applying changes
     saveToHistory();
-    
+
     setHiddenNodes(new Set());
     setSelectedToHide(new Set());
     setShowSelectedMode(false);
     setExpandedNodes(new Set([rootNode.id]));
     setActiveNode(null);
     setCurrentPath([]);
-    setSearchTerm('');
+    setSearchTerm("");
     setShowAllGraph(false);
     setZoom(100);
   };
 
-  const visibleNodeIds = Array.from(expandedNodes).filter(id => !hiddenNodes.has(id));
-  const visibleNodes = visibleNodeIds.map(id => nodeMap[id]).filter(Boolean);
+  const visibleNodeIds = Array.from(expandedNodes).filter(
+    (id) => !hiddenNodes.has(id)
+  );
+  const visibleNodes = visibleNodeIds.map((id) => nodeMap[id]).filter(Boolean);
 
   const calculateLayerPositions = () => {
     const layers = {};
-    visibleNodeIds.forEach(nodeId => {
+    visibleNodeIds.forEach((nodeId) => {
       const path = getPathToNode(nodeId);
       const layer = path.length - 1;
       if (!layers[layer]) layers[layer] = [];
@@ -458,18 +489,18 @@ const FlowDiagramNew = () => {
   const activeExpansionNodes = new Set();
   if (activeNode) {
     const expansionNodes = getNLayersOfChildren(activeNode, 3);
-    expansionNodes.forEach(id => activeExpansionNodes.add(id));
+    expansionNodes.forEach((id) => activeExpansionNodes.add(id));
     const path = getPathToNode(activeNode);
-    path.forEach(id => activeExpansionNodes.add(id));
+    path.forEach((id) => activeExpansionNodes.add(id));
   }
 
   const collapsedLayers = new Set();
-  
+
   // Collapse ALL layers except the one being hovered
   Object.entries(nodesByLayer).forEach(([layer, nodeIds]) => {
     const layerNum = parseInt(layer);
-    const isLayerHovered = nodeIds.some(nodeId => hoveredNode === nodeId);
-    
+    const isLayerHovered = nodeIds.some((nodeId) => hoveredNode === nodeId);
+
     // Collapse all layers that are not being hovered
     if (!isLayerHovered) {
       collapsedLayers.add(layerNum);
@@ -478,12 +509,14 @@ const FlowDiagramNew = () => {
 
   const layerXPositions = {};
   let cumulativeX = 50;
-  const sortedLayers = Object.keys(nodesByLayer).map(Number).sort((a, b) => a - b);
+  const sortedLayers = Object.keys(nodesByLayer)
+    .map(Number)
+    .sort((a, b) => a - b);
 
-  sortedLayers.forEach(layerNum => {
+  sortedLayers.forEach((layerNum) => {
     layerXPositions[layerNum] = cumulativeX;
     const isCollapsed = collapsedLayers.has(layerNum);
-    cumulativeX += (isCollapsed ? collapsedLayerWidth : expandedLayerWidth);
+    cumulativeX += isCollapsed ? collapsedLayerWidth : expandedLayerWidth;
   });
 
   const nodePositions = {};
@@ -492,34 +525,44 @@ const FlowDiagramNew = () => {
     nodeIds.forEach((nodeId, index) => {
       nodePositions[nodeId] = {
         x: layerXPositions[layerNum],
-        y: index * (nodeHeight + nodeSpacing) + 50
+        y: index * (nodeHeight + nodeSpacing) + 50,
       };
     });
   });
 
-  const visibleEdges = graphData.edges.filter(edge =>
-    expandedNodes.has(edge.source) &&
-    expandedNodes.has(edge.target) &&
-    !hiddenNodes.has(edge.source) &&
-    !hiddenNodes.has(edge.target)
+  const visibleEdges = graphData.edges.filter(
+    (edge) =>
+      expandedNodes.has(edge.source) &&
+      expandedNodes.has(edge.target) &&
+      !hiddenNodes.has(edge.source) &&
+      !hiddenNodes.has(edge.target)
   );
 
   const getNodeColor = (nodeId) => {
     const path = getPathToNode(nodeId);
     const depth = path.length - 1;
     const colors = [
-      '#8B5CF6', '#3B82F6', '#10B981', '#F59E0B',
-      '#EF4444', '#EC4899', '#06B6D4', '#84CC16',
+      "#8B5CF6",
+      "#3B82F6",
+      "#10B981",
+      "#F59E0B",
+      "#EF4444",
+      "#EC4899",
+      "#06B6D4",
+      "#84CC16",
     ];
     return colors[depth % colors.length];
   };
 
   const pathString = currentPath
-    .map(id => nodeMap[id]?.data?.label || '')
+    .map((id) => nodeMap[id]?.data?.label || "")
     .filter(Boolean)
-    .join(' ---> ');
+    .join(" ---> ");
 
-  const maxNodesInLayer = Math.max(...Object.values(nodesByLayer).map(arr => arr.length), 1);
+  const maxNodesInLayer = Math.max(
+    ...Object.values(nodesByLayer).map((arr) => arr.length),
+    1
+  );
   const canvasWidth = cumulativeX + 200;
   const canvasHeight = maxNodesInLayer * (nodeHeight + nodeSpacing) + 150;
 
@@ -531,7 +574,8 @@ const FlowDiagramNew = () => {
             🌳 Layered Tree Diagram
           </h1>
           <p className="text-purple-200 text-lg">
-            Click nodes to expand/collapse 3 layers • {graphData.nodes.length} total nodes
+            Click nodes to expand/collapse 3 layers • {graphData.nodes.length}{" "}
+            total nodes
           </p>
         </div>
 
@@ -602,7 +646,7 @@ const FlowDiagramNew = () => {
                 className="flex items-center gap-2 px-4 py-2 bg-purple-600 hover:bg-purple-700 text-white rounded-lg font-medium transition-colors text-sm shadow-lg"
               >
                 <Maximize2 className="w-4 h-4" />
-                {showAllGraph ? 'Collapse All' : 'Show All Graph'}
+                {showAllGraph ? "Collapse All" : "Show All Graph"}
               </button>
 
               <button
@@ -623,7 +667,9 @@ const FlowDiagramNew = () => {
 
               <button
                 onClick={handleShowSelected}
-                disabled={selectedToHide.size === 0 || showAllGraph || showSelectedMode}
+                disabled={
+                  selectedToHide.size === 0 || showAllGraph || showSelectedMode
+                }
                 className="flex items-center gap-2 px-4 py-2 bg-green-600 hover:bg-green-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white rounded-lg font-medium transition-colors text-sm shadow-lg"
               >
                 Show Selected ({selectedToHide.size})
@@ -638,7 +684,9 @@ const FlowDiagramNew = () => {
                 disabled={hiddenNodes.size === 0}
                 className="flex items-center gap-2 px-4 py-2 bg-yellow-600 hover:bg-yellow-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white rounded-lg font-medium text-sm shadow-lg"
               >
-                {showSelectedMode ? 'Exit Show Selected' : 'Restore Hidden Nodes'}
+                {showSelectedMode
+                  ? "Exit Show Selected"
+                  : "Restore Hidden Nodes"}
               </button>
             </div>
           </div>
@@ -649,7 +697,9 @@ const FlowDiagramNew = () => {
             <div className="flex items-start gap-3">
               <ChevronRight className="w-5 h-5 text-purple-300 flex-shrink-0 mt-1" />
               <div className="flex-1 min-w-0">
-                <p className="text-sm font-semibold text-purple-200 mb-1">Current Path:</p>
+                <p className="text-sm font-semibold text-purple-200 mb-1">
+                  Current Path:
+                </p>
                 <p className="text-white font-mono text-sm break-all leading-relaxed">
                   {pathString}
                 </p>
@@ -661,15 +711,15 @@ const FlowDiagramNew = () => {
         <div
           ref={containerRef}
           className="bg-white/5 backdrop-blur-sm rounded-2xl shadow-2xl border border-white/10 overflow-auto"
-          style={{ height: 'calc(100vh - 420px)' }}
+          style={{ height: "calc(100vh - 420px)" }}
         >
           <div
             style={{
               transform: `scale(${zoom / 100})`,
-              transformOrigin: '0 0',
-              padding: '20px',
+              transformOrigin: "0 0",
+              padding: "20px",
               minWidth: canvasWidth,
-              minHeight: canvasHeight
+              minHeight: canvasHeight,
             }}
           >
             <svg
@@ -685,11 +735,17 @@ const FlowDiagramNew = () => {
                   refX="11"
                   refY="6"
                   orient="auto"
-                  markerUnits="strokeWidth"
+                  markerUnits="userSpaceOnUse"
                 >
                   <path d="M 0 0 L 12 6 L 0 12 z" fill="context-stroke" />
                 </marker>
-                <filter id="greenGlow" x="-50%" y="-50%" width="200%" height="200%">
+                <filter
+                  id="greenGlow"
+                  x="-50%"
+                  y="-50%"
+                  width="200%"
+                  height="200%"
+                >
                   <feGaussianBlur in="SourceAlpha" stdDeviation="4" />
                   <feOffset dx="0" dy="0" result="offsetblur" />
                   <feFlood floodColor="#10B981" floodOpacity="0.8" />
@@ -702,25 +758,32 @@ const FlowDiagramNew = () => {
               </defs>
 
               <g className="edges">
-                {visibleEdges.map(edge => {
+                {visibleEdges.map((edge) => {
                   const source = nodePositions[edge.source];
                   const target = nodePositions[edge.target];
                   if (!source || !target) return null;
 
                   const color = getNodeColor(edge.source);
-                  const isInPath = currentPath.includes(edge.source) && currentPath.includes(edge.target);
+                  const isInPath =
+                    currentPath.includes(edge.source) &&
+                    currentPath.includes(edge.target);
 
                   const sourcePath = getPathToNode(edge.source);
                   const sourceLayer = sourcePath.length - 1;
-                  const isSourceLayerCollapsed = collapsedLayers.has(sourceLayer);
-                  const sourceWidth = isSourceLayerCollapsed ? collapsedNodeWidth : nodeWidth;
+                  const isSourceLayerCollapsed =
+                    collapsedLayers.has(sourceLayer);
+                  const sourceWidth = isSourceLayerCollapsed
+                    ? collapsedNodeWidth
+                    : nodeWidth;
 
                   const arrowGap = 5;
                   const targetX = target.x - arrowGap;
                   const controlX1 = source.x + (targetX - source.x) * 0.5;
                   const controlX2 = source.x + (targetX - source.x) * 0.5;
 
-                  const path = `M ${source.x + sourceWidth} ${source.y + nodeHeight / 2} 
+                  const path = `M ${source.x + sourceWidth} ${
+                    source.y + nodeHeight / 2
+                  } 
                                 C ${controlX1} ${source.y + nodeHeight / 2}, 
                                   ${controlX2} ${target.y + nodeHeight / 2}, 
                                   ${targetX} ${target.y + nodeHeight / 2}`;
@@ -734,8 +797,10 @@ const FlowDiagramNew = () => {
                         strokeWidth={isInPath ? 4 : 2}
                         opacity={isInPath ? 1 : 0.6}
                         markerEnd="url(#arrowhead)"
-                        className={edge.animated && isInPath ? 'animate-pulse' : ''}
-                        style={{ transition: 'all 0.3s ease' }}
+                        className={
+                          edge.animated && isInPath ? "animate-pulse" : ""
+                        }
+                        style={{ transition: "all 0.3s ease" }}
                       />
                     </g>
                   );
@@ -743,7 +808,7 @@ const FlowDiagramNew = () => {
               </g>
 
               <g className="nodes">
-                {visibleNodes.map(node => {
+                {visibleNodes.map((node) => {
                   const pos = nodePositions[node.id];
                   if (!pos) return null;
 
@@ -753,13 +818,20 @@ const FlowDiagramNew = () => {
                   const isInPath = currentPath.includes(node.id);
                   const hasChildren = (childrenMap[node.id] || []).length > 0;
                   const isExpanded = hasExpandedDescendants(node.id);
-                  const isSearchResult = searchTerm && node.data?.label && node.data.label.toLowerCase().includes(searchTerm.toLowerCase());
+                  const isSearchResult =
+                    searchTerm &&
+                    node.data?.label &&
+                    node.data.label
+                      .toLowerCase()
+                      .includes(searchTerm.toLowerCase());
                   const isHovered = hoveredNode === node.id;
 
                   const nodePath = getPathToNode(node.id);
                   const nodeLayer = nodePath.length - 1;
                   const isLayerCollapsed = collapsedLayers.has(nodeLayer);
-                  const currentWidth = isLayerCollapsed ? collapsedNodeWidth : nodeWidth;
+                  const currentWidth = isLayerCollapsed
+                    ? collapsedNodeWidth
+                    : nodeWidth;
 
                   return (
                     <g
@@ -770,7 +842,7 @@ const FlowDiagramNew = () => {
                       onMouseEnter={() => setHoveredNode(node.id)}
                       onMouseLeave={() => setHoveredNode(null)}
                       className="cursor-pointer transition-all duration-300"
-                      style={{ transition: 'all 0.3s ease' }}
+                      style={{ transition: "all 0.3s ease" }}
                     >
                       <g
                         onClick={(e) => {
@@ -782,7 +854,7 @@ const FlowDiagramNew = () => {
                           cx={currentWidth - 10}
                           cy={10}
                           r={8}
-                          fill={isSelectedToHide ? '#22C55E' : '#1F2937'}
+                          fill={isSelectedToHide ? "#22C55E" : "#1F2937"}
                           stroke="#22C55E"
                           strokeWidth="2"
                         />
@@ -795,7 +867,7 @@ const FlowDiagramNew = () => {
                           fontWeight="bold"
                           className="pointer-events-none"
                         >
-                          {isSelectedToHide ? '✓' : '+'}
+                          {isSelectedToHide ? "✓" : "+"}
                         </text>
                       </g>
 
@@ -858,7 +930,7 @@ const FlowDiagramNew = () => {
                         height={nodeHeight}
                         rx="6"
                         fill={color}
-                        stroke={isInPath ? '#FBBF24' : 'white'}
+                        stroke={isInPath ? "#FBBF24" : "white"}
                         strokeWidth={isInPath ? 3 : 2}
                         className="transition-all duration-300 drop-shadow-lg"
                         filter={isSearchResult ? "url(#greenGlow)" : "none"}
@@ -876,63 +948,85 @@ const FlowDiagramNew = () => {
                             className="pointer-events-none select-none"
                           >
                             {node.data?.label && node.data.label.length > 12
-                              ? node.data.label.substring(0, 10) + '...'
-                              : node.data?.label || 'N/A'}
+                              ? node.data.label.substring(0, 10) + "..."
+                              : node.data?.label || "N/A"}
                           </text>
                         </>
                       )}
 
                       {isLayerCollapsed && (
                         <g>
-                          <circle cx={collapsedNodeWidth / 2} cy={nodeHeight / 2 - 12} r="2" fill="white" />
-                          <circle cx={collapsedNodeWidth / 2} cy={nodeHeight / 2} r="2" fill="white" />
-                          <circle cx={collapsedNodeWidth / 2} cy={nodeHeight / 2 + 12} r="2" fill="white" />
+                          <circle
+                            cx={collapsedNodeWidth / 2}
+                            cy={nodeHeight / 2 - 12}
+                            r="2"
+                            fill="white"
+                          />
+                          <circle
+                            cx={collapsedNodeWidth / 2}
+                            cy={nodeHeight / 2}
+                            r="2"
+                            fill="white"
+                          />
+                          <circle
+                            cx={collapsedNodeWidth / 2}
+                            cy={nodeHeight / 2 + 12}
+                            r="2"
+                            fill="white"
+                          />
                         </g>
                       )}
 
+                      {/* Expand/Collapse Indicator */}
                       {hasChildren && !isLayerCollapsed && (
-                        <g transform={`translate(${currentWidth - 18}, 8)`}>
+                        <g transform={`translate(${currentWidth - 22}, 8)`}>
                           <circle
-                            r="12"
+                            r="16"
                             fill="white"
                             opacity="0.95"
                             className="drop-shadow"
                           />
                           <text
                             x="0"
-                            y="5"
+                            y="6"
                             fill={color}
-                            fontSize="16"
+                            fontSize="14"
                             fontWeight="bold"
                             textAnchor="middle"
                             className="pointer-events-none"
                           >
-                            {isExpanded ? '−' : '+'}
+                            {isExpanded ? "−" : "+"}
+                            {childrenMap[node.id]?.length || 0}
                           </text>
                         </g>
                       )}
 
-                      {isHovered && node.data?.label && (
+                      {isHovered && (
                         <g transform={`translate(${currentWidth / 2}, ${-10})`}>
                           <rect
-                            x={-Math.max(60, node.data.label.length * 4)}
-                            y={-25}
-                            width={Math.max(120, node.data.label.length * 8)}
-                            height="30"
+                            x="-80"
+                            y="-50"
+                            width="140"
+                            height="50"
                             rx="4"
                             fill="rgba(0, 0, 0, 0.9)"
                             stroke="white"
                             strokeWidth="1"
                           />
                           <text
-                            y={-8}
                             fill="white"
-                            fontSize="12"
+                            fontSize="11"
                             fontWeight="500"
                             textAnchor="middle"
                             className="pointer-events-none select-none"
                           >
-                            {node.data.label}
+                            {/* <tspan x="0" dy="-45" fontWeight="bold" fontSize="12">{node.data?.label || 'N/A'}</tspan> */}
+                            <tspan x="0" dy="-30" fill="#94A3B8">
+                              File: {node.data?.file || "N/A"}
+                            </tspan>
+                            <tspan x="0" dy="16" fill="#94A3B8">
+                              Function: {node.data?.function || "N/A"}
+                            </tspan>
                           </text>
                         </g>
                       )}
@@ -947,15 +1041,21 @@ const FlowDiagramNew = () => {
         <div className="mt-4 bg-white/10 backdrop-blur-lg rounded-xl p-4 shadow-2xl border border-white/20">
           <div className="grid grid-cols-2 md:grid-cols-3 gap-4 text-center">
             <div>
-              <div className="text-3xl font-bold text-purple-300">{graphData.nodes.length}</div>
+              <div className="text-3xl font-bold text-purple-300">
+                {graphData.nodes.length}
+              </div>
               <div className="text-sm text-white">Total Nodes</div>
             </div>
             <div>
-              <div className="text-3xl font-bold text-green-300">{expandedNodes.size}</div>
+              <div className="text-3xl font-bold text-green-300">
+                {expandedNodes.size}
+              </div>
               <div className="text-sm text-white">Visible Nodes</div>
             </div>
             <div>
-              <div className="text-3xl font-bold text-yellow-300">{Object.keys(nodesByLayer).length}</div>
+              <div className="text-3xl font-bold text-yellow-300">
+                {Object.keys(nodesByLayer).length}
+              </div>
               <div className="text-sm text-white">Active Levels</div>
             </div>
           </div>
