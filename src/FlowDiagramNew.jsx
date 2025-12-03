@@ -38,24 +38,34 @@ const FlowDiagramNew = () => {
       showAllGraph
     };
 
+    console.log('Saving to history - Current index:', currentHistoryIndex, 'Expanded nodes:', expandedNodes.size);
+
     // Remove any future history if we're not at the end
     const newHistory = history.slice(0, currentHistoryIndex + 1);
     newHistory.push(state);
     
+    console.log('New history length:', newHistory.length, 'New index will be:', newHistory.length - 1);
+    
     // Limit history to last 50 states
     if (newHistory.length > 50) {
       newHistory.shift();
+      setHistory(newHistory);
     } else {
-      setCurrentHistoryIndex(currentHistoryIndex + 1);
+      setHistory(newHistory);
+      setCurrentHistoryIndex(newHistory.length - 1);
     }
-    
-    setHistory(newHistory);
   };
 
   // Undo to previous state
   const handleUndo = () => {
+    console.log('Undo clicked - Current index:', currentHistoryIndex, 'History length:', history.length);
+    
     if (currentHistoryIndex > 0) {
-      const previousState = history[currentHistoryIndex - 1];
+      const newIndex = currentHistoryIndex - 1;
+      const previousState = history[newIndex];
+      
+      console.log('Going to index:', newIndex);
+      console.log('Previous state expanded nodes:', previousState.expandedNodes.size);
       
       setExpandedNodes(new Set(previousState.expandedNodes));
       setActiveNode(previousState.activeNode);
@@ -67,12 +77,13 @@ const FlowDiagramNew = () => {
       setSearchTerm(previousState.searchTerm);
       setShowAllGraph(previousState.showAllGraph);
       
-      setCurrentHistoryIndex(currentHistoryIndex - 1);
+      setCurrentHistoryIndex(newIndex);
     }
   };
 
   const handleHideSelected = () => {
-    saveToHistory(); // Save state before change
+    // Save current state BEFORE applying changes
+    saveToHistory();
     
     setHiddenNodes(prev => {
       const next = new Set(prev);
@@ -88,7 +99,8 @@ const FlowDiagramNew = () => {
   const handleShowSelected = () => {
     if (selectedToHide.size === 0) return;
     
-    saveToHistory(); // Save state before change
+    // Save current state BEFORE applying changes
+    saveToHistory();
 
     const nodesToKeep = new Set(selectedToHide);
 
@@ -186,12 +198,47 @@ const FlowDiagramNew = () => {
     }
   }, [rootNode, expandedNodes.size, showAllGraph]);
 
+  // Save initial state to history on mount
+  useEffect(() => {
+    if (rootNode && history.length === 0) {
+      const initialState = {
+        expandedNodes: new Set([rootNode.id]),
+        activeNode: null,
+        currentPath: [],
+        hiddenNodes: new Set(),
+        selectedToHide: new Set(),
+        showSelectedMode: false,
+        zoom: 100,
+        searchTerm: '',
+        showAllGraph: false
+      };
+      setHistory([initialState]);
+      setCurrentHistoryIndex(0);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rootNode]);
+
   // Keyboard shortcut for undo (Ctrl+Z)
   useEffect(() => {
     const handleKeyDown = (e) => {
       if ((e.ctrlKey || e.metaKey) && e.key === 'z' && !e.shiftKey) {
         e.preventDefault();
-        handleUndo();
+        if (currentHistoryIndex > 0) {
+          const newIndex = currentHistoryIndex - 1;
+          const previousState = history[newIndex];
+          
+          setExpandedNodes(new Set(previousState.expandedNodes));
+          setActiveNode(previousState.activeNode);
+          setCurrentPath([...previousState.currentPath]);
+          setHiddenNodes(new Set(previousState.hiddenNodes));
+          setSelectedToHide(new Set(previousState.selectedToHide));
+          setShowSelectedMode(previousState.showSelectedMode);
+          setZoom(previousState.zoom);
+          setSearchTerm(previousState.searchTerm);
+          setShowAllGraph(previousState.showAllGraph);
+          
+          setCurrentHistoryIndex(newIndex);
+        }
       }
     };
 
@@ -257,29 +304,35 @@ const FlowDiagramNew = () => {
   };
 
   const handleNodeClick = (nodeId) => {
-    saveToHistory(); // Save state before change
+    let newExpanded;
+    let newActiveNode;
+    let newCurrentPath;
     
     if (hasExpandedDescendants(nodeId)) {
-      const newExpanded = new Set(expandedNodes);
+      newExpanded = new Set(expandedNodes);
       const descendants = getAllDescendants(nodeId);
       descendants.forEach(id => newExpanded.delete(id));
-      setExpandedNodes(newExpanded);
-      setActiveNode(nodeId);
-      setCurrentPath(getPathToNode(nodeId));
+      newActiveNode = nodeId;
+      newCurrentPath = getPathToNode(nodeId);
     } else {
-      const newExpanded = new Set(expandedNodes);
+      newExpanded = new Set(expandedNodes);
       const toAdd = getNLayersOfChildren(nodeId, 3);
       toAdd.forEach(id => newExpanded.add(id));
-      setExpandedNodes(newExpanded);
-      setActiveNode(nodeId);
-      setCurrentPath(getPathToNode(nodeId));
+      newActiveNode = nodeId;
+      newCurrentPath = getPathToNode(nodeId);
     }
+    
+    // Save current state BEFORE applying changes
+    saveToHistory();
+    
+    // Now apply the changes
+    setExpandedNodes(newExpanded);
+    setActiveNode(newActiveNode);
+    setCurrentPath(newCurrentPath);
   };
 
   const addMoreLayers = () => {
     if (!activeNode) return;
-    
-    saveToHistory(); // Save state before change
     
     const newExpanded = new Set(expandedNodes);
     const visibleDescendants = [];
@@ -308,11 +361,15 @@ const FlowDiagramNew = () => {
       }
     });
 
+    // Save current state BEFORE applying changes
+    saveToHistory();
+    
     setExpandedNodes(newExpanded);
   };
 
   const toggleShowAll = () => {
-    saveToHistory(); // Save state before change
+    // Save current state BEFORE applying changes
+    saveToHistory();
     
     setHiddenNodes(new Set());
     setSelectedToHide(new Set());
@@ -332,11 +389,12 @@ const FlowDiagramNew = () => {
   };
 
   const handleSearch = (term) => {
-    if (term !== searchTerm) {
-      saveToHistory(); // Save state before change
+    const search = term.toLowerCase().trim();
+    
+    if (term !== searchTerm && searchTerm !== '') {
+      saveToHistory(); // Save state before change (but not on initial typing)
     }
     
-    const search = term.toLowerCase().trim();
     setSearchTerm(term);
 
     if (!search) {
@@ -360,7 +418,8 @@ const FlowDiagramNew = () => {
   };
 
   const handleReset = () => {
-    saveToHistory(); // Save state before change
+    // Save current state BEFORE applying changes
+    saveToHistory();
     
     setHiddenNodes(new Set());
     setSelectedToHide(new Set());
@@ -535,7 +594,7 @@ const FlowDiagramNew = () => {
                 className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white rounded-lg font-medium transition-colors text-sm shadow-lg"
               >
                 <Layers className="w-4 h-4" />
-                Add More Layers
+                Add More Levels
               </button>
 
               <button
@@ -678,18 +737,6 @@ const FlowDiagramNew = () => {
                         className={edge.animated && isInPath ? 'animate-pulse' : ''}
                         style={{ transition: 'all 0.3s ease' }}
                       />
-                      {edge.type && (
-                        <text
-                          x={(source.x + target.x) / 2 + sourceWidth / 2}
-                          y={(source.y + target.y) / 2 + 20}
-                          fill="#9CA3AF"
-                          fontSize="10"
-                          textAnchor="middle"
-                          className="pointer-events-none"
-                        >
-                          {edge.type}
-                        </text>
-                      )}
                     </g>
                   );
                 })}
@@ -821,7 +868,7 @@ const FlowDiagramNew = () => {
                         <>
                           <text
                             x={currentWidth / 2}
-                            y={nodeHeight / 2 - 8}
+                            y={nodeHeight / 2}
                             fill="white"
                             fontSize="13"
                             fontWeight="bold"
@@ -831,18 +878,6 @@ const FlowDiagramNew = () => {
                             {node.data?.label && node.data.label.length > 12
                               ? node.data.label.substring(0, 10) + '...'
                               : node.data?.label || 'N/A'}
-                          </text>
-
-                          <text
-                            x={currentWidth / 2}
-                            y={nodeHeight / 2 + 12}
-                            fill="white"
-                            fontSize="10"
-                            opacity="0.8"
-                            textAnchor="middle"
-                            className="pointer-events-none select-none"
-                          >
-                            {node.type || 'N/A'}
                           </text>
                         </>
                       )}
@@ -910,14 +945,10 @@ const FlowDiagramNew = () => {
         </div>
 
         <div className="mt-4 bg-white/10 backdrop-blur-lg rounded-xl p-4 shadow-2xl border border-white/20">
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-center">
+          <div className="grid grid-cols-2 md:grid-cols-3 gap-4 text-center">
             <div>
               <div className="text-3xl font-bold text-purple-300">{graphData.nodes.length}</div>
               <div className="text-sm text-white">Total Nodes</div>
-            </div>
-            <div>
-              <div className="text-3xl font-bold text-blue-300">{graphData.edges.length}</div>
-              <div className="text-sm text-white">Total Edges</div>
             </div>
             <div>
               <div className="text-3xl font-bold text-green-300">{expandedNodes.size}</div>
@@ -925,7 +956,7 @@ const FlowDiagramNew = () => {
             </div>
             <div>
               <div className="text-3xl font-bold text-yellow-300">{Object.keys(nodesByLayer).length}</div>
-              <div className="text-sm text-white">Active Layers</div>
+              <div className="text-sm text-white">Active Levels</div>
             </div>
           </div>
         </div>
