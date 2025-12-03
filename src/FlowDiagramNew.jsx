@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from "react";
+import React, { useState, useRef, useEffect, useCallback } from "react";
 import {
   ZoomIn,
   ZoomOut,
@@ -10,9 +10,7 @@ import {
   Undo,
 } from "lucide-react";
 import rawData from "./data/ a.json";
-// Sample data structure - replace this with your actual data
-// Use sample data - replace with: import rawData from './data/a.json'
-// const graphData = rawData.react_flow_for_layers_map || rawData;
+
 const FlowDiagramNew = () => {
   const [searchTerm, setSearchTerm] = useState("");
   const [zoom, setZoom] = useState(100);
@@ -26,92 +24,207 @@ const FlowDiagramNew = () => {
   const [selectedToHide, setSelectedToHide] = useState(new Set());
   const [showSelectedMode, setShowSelectedMode] = useState(false);
 
-  // History state for undo functionality
-  const [history, setHistory] = useState([]);
-  const [currentHistoryIndex, setCurrentHistoryIndex] = useState(-1);
+  // History state for undo functionality - using refs for immediate updates
+  const historyRef = useRef([]);
+  const [currentHistoryIndex, setCurrentHistoryIndex] = useState(0);
+  const isRestoringRef = useRef(false);
+  const hasInitializedHistoryRef = useRef(false);
 
   // Use sample data - replace with: import rawData from './data/a.json'
   const graphData = rawData.react_flow_for_layers_map || rawData;
 
-  // Save state to history
-  const saveToHistory = () => {
-    const state = {
-      expandedNodes: new Set(expandedNodes),
+  const buildGraph = () => {
+    const nodeMap = {};
+    const childrenMap = {};
+    const parentMap = {};
+
+    graphData.nodes.forEach((node) => {
+      nodeMap[node.id] = node;
+      childrenMap[node.id] = [];
+      parentMap[node.id] = null;
+    });
+
+    graphData.edges.forEach((edge) => {
+      if (childrenMap[edge.source]) {
+        childrenMap[edge.source].push(edge.target);
+      }
+      if (parentMap[edge.target] === null) {
+        parentMap[edge.target] = edge.source;
+      }
+    });
+
+    return { nodeMap, childrenMap, parentMap };
+  };
+
+  const { nodeMap, childrenMap, parentMap } = buildGraph();
+
+  const findRootNode = () => {
+    return graphData.nodes.find((node) => !parentMap[node.id]);
+  };
+
+  const rootNode = findRootNode();
+
+  // Ensure root node is expanded initially
+  useEffect(() => {
+    if (rootNode && expandedNodes.size === 0 && !showAllGraph) {
+      setExpandedNodes(new Set([rootNode.id]));
+    }
+  }, [rootNode, expandedNodes.size, showAllGraph]);
+
+  // 🔥 Centralized history management
+  useEffect(() => {
+    if (!rootNode) return;
+
+    // Snapshot of the *current* state (after changes)
+    const snapshot = {
+      expandedNodes: Array.from(expandedNodes),
       activeNode,
       currentPath: [...currentPath],
-      hiddenNodes: new Set(hiddenNodes),
-      selectedToHide: new Set(selectedToHide),
+      hiddenNodes: Array.from(hiddenNodes),
+      selectedToHide: Array.from(selectedToHide),
       showSelectedMode,
       zoom,
       searchTerm,
       showAllGraph,
     };
 
-    console.log(
-      "Saving to history - Current index:",
-      currentHistoryIndex,
-      "Expanded nodes:",
-      expandedNodes.size
-    );
-
-    // Remove any future history if we're not at the end
-    const newHistory = history.slice(0, currentHistoryIndex + 1);
-    newHistory.push(state);
-
-    console.log(
-      "New history length:",
-      newHistory.length,
-      "New index will be:",
-      newHistory.length - 1
-    );
-
-    // Limit history to last 50 states
-    if (newHistory.length > 50) {
-      newHistory.shift();
-      setHistory(newHistory);
-    } else {
-      setHistory(newHistory);
-      setCurrentHistoryIndex(newHistory.length - 1);
+    // First time: initialize history with initial state
+    if (!hasInitializedHistoryRef.current) {
+      historyRef.current = [snapshot];
+      setCurrentHistoryIndex(0);
+      hasInitializedHistoryRef.current = true;
+      return;
     }
-  };
 
-  // Undo to previous state
-  const handleUndo = () => {
-    console.log(
-      "Undo clicked - Current index:",
-      currentHistoryIndex,
-      "History length:",
-      history.length
-    );
+    // If we are restoring from history (undo), don't create a new history entry
+    if (isRestoringRef.current) {
+      isRestoringRef.current = false;
+      return;
+    }
 
-    if (currentHistoryIndex > 0) {
-      const newIndex = currentHistoryIndex - 1;
-      const previousState = history[newIndex];
+    // Normal path: user changed something -> push new snapshot
+    historyRef.current = historyRef.current.slice(0, currentHistoryIndex + 1);
+    historyRef.current.push(snapshot);
 
-      console.log("Going to index:", newIndex);
-      console.log(
-        "Previous state expanded nodes:",
-        previousState.expandedNodes.size
+    if (historyRef.current.length > 50) {
+      historyRef.current.shift();
+      // Keep the index aligned with the shifted history
+      setCurrentHistoryIndex((prev) => Math.max(prev - 1, 0));
+    } else {
+      setCurrentHistoryIndex(historyRef.current.length - 1);
+    }
+    // We intentionally do NOT include currentHistoryIndex in deps to avoid double pushes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    expandedNodes,
+    activeNode,
+    currentPath,
+    hiddenNodes,
+    selectedToHide,
+    showSelectedMode,
+    zoom,
+    searchTerm,
+    showAllGraph,
+    rootNode,
+  ]);
+
+  // ✅ Undo to previous state (exactly one step)
+  const handleUndo = useCallback(() => {
+    if (currentHistoryIndex <= 0) return;
+
+    const newIndex = currentHistoryIndex - 1;
+    const previousState = historyRef.current[newIndex];
+
+    if (previousState) {
+      isRestoringRef.current = true;
+
+      setExpandedNodes(new Set(previousState.expandedNodes || []));
+      setActiveNode(
+        previousState.activeNode !== undefined ? previousState.activeNode : null
       );
-
-      setExpandedNodes(new Set(previousState.expandedNodes));
-      setActiveNode(previousState.activeNode);
-      setCurrentPath([...previousState.currentPath]);
-      setHiddenNodes(new Set(previousState.hiddenNodes));
-      setSelectedToHide(new Set(previousState.selectedToHide));
-      setShowSelectedMode(previousState.showSelectedMode);
-      setZoom(previousState.zoom);
-      setSearchTerm(previousState.searchTerm);
-      setShowAllGraph(previousState.showAllGraph);
+      setCurrentPath(previousState.currentPath || []);
+      setHiddenNodes(new Set(previousState.hiddenNodes || []));
+      setSelectedToHide(new Set(previousState.selectedToHide || []));
+      setShowSelectedMode(!!previousState.showSelectedMode);
+      setZoom(previousState.zoom ?? 100);
+      setSearchTerm(previousState.searchTerm ?? "");
+      setShowAllGraph(!!previousState.showAllGraph);
 
       setCurrentHistoryIndex(newIndex);
     }
+  }, [currentHistoryIndex]);
+
+  // Keyboard shortcut for undo (Ctrl+Z)
+  useEffect(() => {
+    const handleKeyDown = (e) => {
+      if ((e.ctrlKey || e.metaKey) && e.key === "z" && !e.shiftKey) {
+        e.preventDefault();
+        handleUndo();
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [handleUndo]);
+
+  const getPathToNode = (nodeId) => {
+    const path = [];
+    let current = nodeId;
+    while (current) {
+      path.unshift(current);
+      current = parentMap[current];
+    }
+    return path;
+  };
+
+  const getNLayersOfChildren = (startNodeId, layers) => {
+    const visited = new Set();
+    const queue = [{ id: startNodeId, depth: 0 }];
+    const result = [];
+
+    while (queue.length > 0) {
+      const { id, depth } = queue.shift();
+      if (visited.has(id) || depth > layers) continue;
+      visited.add(id);
+      result.push(id);
+
+      if (depth < layers) {
+        const children = childrenMap[id] || [];
+        children.forEach((childId) => {
+          queue.push({ id: childId, depth: depth + 1 });
+        });
+      }
+    }
+    return result;
+  };
+
+  const getAllDescendants = (nodeId) => {
+    const descendants = new Set();
+    const queue = [nodeId];
+
+    while (queue.length > 0) {
+      const current = queue.shift();
+      const children = childrenMap[current] || [];
+      children.forEach((child) => {
+        if (!descendants.has(child)) {
+          descendants.add(child);
+          queue.push(child);
+        }
+      });
+    }
+    return descendants;
+  };
+
+  const hasExpandedDescendants = (nodeId) => {
+    const children = childrenMap[nodeId] || [];
+    return children.some((childId) => expandedNodes.has(childId));
+  };
+
+  const layerHasExpandedChildren = (layerNodes) => {
+    return layerNodes.some((nodeId) => hasExpandedDescendants(nodeId));
   };
 
   const handleHideSelected = () => {
-    // Save current state BEFORE applying changes
-    saveToHistory();
-
     setHiddenNodes((prev) => {
       const next = new Set(prev);
       selectedToHide.forEach((nodeId) => {
@@ -125,9 +238,6 @@ const FlowDiagramNew = () => {
 
   const handleShowSelected = () => {
     if (selectedToHide.size === 0) return;
-
-    // Save current state BEFORE applying changes
-    saveToHistory();
 
     const nodesToKeep = new Set(selectedToHide);
 
@@ -188,174 +298,22 @@ const FlowDiagramNew = () => {
     });
   };
 
-  const buildGraph = () => {
-    const nodeMap = {};
-    const childrenMap = {};
-    const parentMap = {};
-
-    graphData.nodes.forEach((node) => {
-      nodeMap[node.id] = node;
-      childrenMap[node.id] = [];
-      parentMap[node.id] = null;
-    });
-
-    graphData.edges.forEach((edge) => {
-      if (childrenMap[edge.source]) {
-        childrenMap[edge.source].push(edge.target);
-      }
-      if (parentMap[edge.target] === null) {
-        parentMap[edge.target] = edge.source;
-      }
-    });
-
-    return { nodeMap, childrenMap, parentMap };
-  };
-
-  const { nodeMap, childrenMap, parentMap } = buildGraph();
-
-  const findRootNode = () => {
-    return graphData.nodes.find((node) => !parentMap[node.id]);
-  };
-
-  const rootNode = findRootNode();
-
-  useEffect(() => {
-    if (rootNode && expandedNodes.size === 0 && !showAllGraph) {
-      setExpandedNodes(new Set([rootNode.id]));
-    }
-  }, [rootNode, expandedNodes.size, showAllGraph]);
-
-  // Save initial state to history on mount
-  useEffect(() => {
-    if (rootNode && history.length === 0) {
-      const initialState = {
-        expandedNodes: new Set([rootNode.id]),
-        activeNode: null,
-        currentPath: [],
-        hiddenNodes: new Set(),
-        selectedToHide: new Set(),
-        showSelectedMode: false,
-        zoom: 100,
-        searchTerm: "",
-        showAllGraph: false,
-      };
-      setHistory([initialState]);
-      setCurrentHistoryIndex(0);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [rootNode]);
-
-  // Keyboard shortcut for undo (Ctrl+Z)
-  useEffect(() => {
-    const handleKeyDown = (e) => {
-      if ((e.ctrlKey || e.metaKey) && e.key === "z" && !e.shiftKey) {
-        e.preventDefault();
-        if (currentHistoryIndex > 0) {
-          const newIndex = currentHistoryIndex - 1;
-          const previousState = history[newIndex];
-
-          setExpandedNodes(new Set(previousState.expandedNodes));
-          setActiveNode(previousState.activeNode);
-          setCurrentPath([...previousState.currentPath]);
-          setHiddenNodes(new Set(previousState.hiddenNodes));
-          setSelectedToHide(new Set(previousState.selectedToHide));
-          setShowSelectedMode(previousState.showSelectedMode);
-          setZoom(previousState.zoom);
-          setSearchTerm(previousState.searchTerm);
-          setShowAllGraph(previousState.showAllGraph);
-
-          setCurrentHistoryIndex(newIndex);
-        }
-      }
-    };
-
-    window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [currentHistoryIndex, history]);
-
-  const getPathToNode = (nodeId) => {
-    const path = [];
-    let current = nodeId;
-    while (current) {
-      path.unshift(current);
-      current = parentMap[current];
-    }
-    return path;
-  };
-
-  const getNLayersOfChildren = (startNodeId, layers) => {
-    const visited = new Set();
-    const queue = [{ id: startNodeId, depth: 0 }];
-    const result = [];
-
-    while (queue.length > 0) {
-      const { id, depth } = queue.shift();
-      if (visited.has(id) || depth > layers) continue;
-      visited.add(id);
-      result.push(id);
-
-      if (depth < layers) {
-        const children = childrenMap[id] || [];
-        children.forEach((childId) => {
-          queue.push({ id: childId, depth: depth + 1 });
-        });
-      }
-    }
-    return result;
-  };
-
-  const getAllDescendants = (nodeId) => {
-    const descendants = new Set();
-    const queue = [nodeId];
-
-    while (queue.length > 0) {
-      const current = queue.shift();
-      const children = childrenMap[current] || [];
-      children.forEach((child) => {
-        if (!descendants.has(child)) {
-          descendants.add(child);
-          queue.push(child);
-        }
-      });
-    }
-    return descendants;
-  };
-
-  const hasExpandedDescendants = (nodeId) => {
-    const children = childrenMap[nodeId] || [];
-    return children.some((childId) => expandedNodes.has(childId));
-  };
-
-  const layerHasExpandedChildren = (layerNodes) => {
-    return layerNodes.some((nodeId) => hasExpandedDescendants(nodeId));
-  };
-
   const handleNodeClick = (nodeId) => {
-    let newExpanded;
-    let newActiveNode;
-    let newCurrentPath;
-
     if (hasExpandedDescendants(nodeId)) {
-      newExpanded = new Set(expandedNodes);
+      const newExpanded = new Set(expandedNodes);
       const descendants = getAllDescendants(nodeId);
       descendants.forEach((id) => newExpanded.delete(id));
-      newActiveNode = nodeId;
-      newCurrentPath = getPathToNode(nodeId);
+      setExpandedNodes(newExpanded);
+      setActiveNode(nodeId);
+      setCurrentPath(getPathToNode(nodeId));
     } else {
-      newExpanded = new Set(expandedNodes);
+      const newExpanded = new Set(expandedNodes);
       const toAdd = getNLayersOfChildren(nodeId, 3);
       toAdd.forEach((id) => newExpanded.add(id));
-      newActiveNode = nodeId;
-      newCurrentPath = getPathToNode(nodeId);
+      setExpandedNodes(newExpanded);
+      setActiveNode(nodeId);
+      setCurrentPath(getPathToNode(nodeId));
     }
-
-    // Save current state BEFORE applying changes
-    saveToHistory();
-
-    // Now apply the changes
-    setExpandedNodes(newExpanded);
-    setActiveNode(newActiveNode);
-    setCurrentPath(newCurrentPath);
   };
 
   const addMoreLayers = () => {
@@ -390,16 +348,10 @@ const FlowDiagramNew = () => {
       }
     });
 
-    // Save current state BEFORE applying changes
-    saveToHistory();
-
     setExpandedNodes(newExpanded);
   };
 
   const toggleShowAll = () => {
-    // Save current state BEFORE applying changes
-    saveToHistory();
-
     setHiddenNodes(new Set());
     setSelectedToHide(new Set());
     setShowSelectedMode(false);
@@ -419,11 +371,6 @@ const FlowDiagramNew = () => {
 
   const handleSearch = (term) => {
     const search = term.toLowerCase().trim();
-
-    if (term !== searchTerm && searchTerm !== "") {
-      saveToHistory(); // Save state before change (but not on initial typing)
-    }
-
     setSearchTerm(term);
 
     if (!search) {
@@ -447,9 +394,6 @@ const FlowDiagramNew = () => {
   };
 
   const handleReset = () => {
-    // Save current state BEFORE applying changes
-    saveToHistory();
-
     setHiddenNodes(new Set());
     setSelectedToHide(new Set());
     setShowSelectedMode(false);
@@ -496,12 +440,9 @@ const FlowDiagramNew = () => {
 
   const collapsedLayers = new Set();
 
-  // Collapse ALL layers except the one being hovered
   Object.entries(nodesByLayer).forEach(([layer, nodeIds]) => {
     const layerNum = parseInt(layer);
     const isLayerHovered = nodeIds.some((nodeId) => hoveredNode === nodeId);
-
-    // Collapse all layers that are not being hovered
     if (!isLayerHovered) {
       collapsedLayers.add(layerNum);
     }
@@ -541,16 +482,18 @@ const FlowDiagramNew = () => {
   const getNodeColor = (nodeId) => {
     const path = getPathToNode(nodeId);
     const depth = path.length - 1;
+
     const colors = [
-      "#8B5CF6",
-      "#3B82F6",
-      "#10B981",
-      "#F59E0B",
-      "#EF4444",
-      "#EC4899",
-      "#06B6D4",
-      "#84CC16",
+      "#2563EB",
+      "#7C3AED",
+      "#059669",
+      "#DC2626",
+      "#EA580C",
+      "#0891B2",
+      "#4F46E5",
+      "#BE185D",
     ];
+
     return colors[depth % colors.length];
   };
 
@@ -677,7 +620,6 @@ const FlowDiagramNew = () => {
 
               <button
                 onClick={() => {
-                  saveToHistory();
                   setHiddenNodes(new Set());
                   setShowSelectedMode(false);
                 }}
@@ -977,7 +919,6 @@ const FlowDiagramNew = () => {
                         </g>
                       )}
 
-                      {/* Expand/Collapse Indicator */}
                       {hasChildren && !isLayerCollapsed && (
                         <g transform={`translate(${currentWidth - 22}, 8)`}>
                           <circle
@@ -1020,7 +961,6 @@ const FlowDiagramNew = () => {
                             textAnchor="middle"
                             className="pointer-events-none select-none"
                           >
-                            {/* <tspan x="0" dy="-45" fontWeight="bold" fontSize="12">{node.data?.label || 'N/A'}</tspan> */}
                             <tspan x="0" dy="-30" fill="#94A3B8">
                               File: {node.data?.file || "N/A"}
                             </tspan>
