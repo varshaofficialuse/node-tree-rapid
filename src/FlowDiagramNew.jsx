@@ -13,6 +13,9 @@ import rawData from "./data/ a.json";
 
 const FlowDiagramNew = () => {
   const [searchTerm, setSearchTerm] = useState("");
+  const [searchResults, setSearchResults] = useState([]);
+const [currentSearchIndex, setCurrentSearchIndex] = useState(0);
+const [showAllSearchResults, setShowAllSearchResults] = useState(false);
   const [zoom, setZoom] = useState(100);
   const [expandedNodes, setExpandedNodes] = useState(new Set());
   const [activeNode, setActiveNode] = useState(null);
@@ -29,7 +32,9 @@ const FlowDiagramNew = () => {
   const [currentHistoryIndex, setCurrentHistoryIndex] = useState(0);
   const isRestoringRef = useRef(false);
   const hasInitializedHistoryRef = useRef(false);
-
+ const saveToHistory = () => {
+  // no-op
+};
   // Use sample data - replace with: import rawData from './data/a.json'
   const graphData = rawData.react_flow_for_layers_map || rawData;
 
@@ -227,9 +232,9 @@ const FlowDiagramNew = () => {
     return children.some((childId) => expandedNodes.has(childId));
   };
 
-  const layerHasExpandedChildren = (layerNodes) => {
-    return layerNodes.some((nodeId) => hasExpandedDescendants(nodeId));
-  };
+  // const layerHasExpandedChildren = (layerNodes) => {
+  //   return layerNodes.some((nodeId) => hasExpandedDescendants(nodeId));
+  // };
   const handleRedo = useCallback(() => {
     if (currentHistoryIndex >= historyRef.current.length - 1) return;
 
@@ -401,29 +406,117 @@ const FlowDiagramNew = () => {
   };
 
   const handleSearch = (term) => {
-    const search = term.toLowerCase().trim();
-    setSearchTerm(term);
+  const search = term.toLowerCase().trim();
+  setSearchTerm(term);
 
-    if (!search) {
-      setExpandedNodes(new Set([rootNode.id]));
-      setActiveNode(null);
-      setCurrentPath([]);
-      return;
-    }
+  if (!search) {
+    setExpandedNodes(new Set([rootNode.id]));
+    setActiveNode(null);
+    setCurrentPath([]);
+    setSearchResults([]);
+    setCurrentSearchIndex(0);
+    setShowAllSearchResults(false);
+    return;
+  }
 
-    const matchedNode = graphData.nodes.find((n) =>
-      (n.data?.label || "").toLowerCase().includes(search)
-    );
+  // Find ALL matching nodes
+  const matchedNodes = graphData.nodes.filter(n =>
+    (n.data?.label || "").toLowerCase().includes(search)
+  );
 
-    if (matchedNode) {
-      const path = getPathToNode(matchedNode.id);
-      const newExpanded = new Set(path);
-      setExpandedNodes(newExpanded);
-      setActiveNode(matchedNode.id);
-      setCurrentPath(path);
-    }
-  };
+  if (matchedNodes.length === 0) {
+    setSearchResults([]);
+    setCurrentSearchIndex(0);
+    return;
+  }
 
+  setSearchResults(matchedNodes);
+  setCurrentSearchIndex(0);
+
+  // Show first result by default
+  if (!showAllSearchResults) {
+    const firstMatch = matchedNodes[0];
+    const path = getPathToNode(firstMatch.id);
+    const newExpanded = new Set(path);
+    setExpandedNodes(newExpanded);
+    setActiveNode(firstMatch.id);
+    setCurrentPath(path);
+  } else {
+    // Show all results
+    handleShowAllSearchResults(matchedNodes);
+  }
+};
+
+
+const handleNextSearchResult = () => {
+  if (searchResults.length === 0) return;
+  
+  saveToHistory();
+  
+  const nextIndex = (currentSearchIndex + 1) % searchResults.length;
+  setCurrentSearchIndex(nextIndex);
+  
+  const matchedNode = searchResults[nextIndex];
+  const path = getPathToNode(matchedNode.id);
+  const newExpanded = new Set(path);
+  
+  setExpandedNodes(newExpanded);
+  setActiveNode(matchedNode.id);
+  setCurrentPath(path);
+};
+
+const handlePreviousSearchResult = () => {
+  if (searchResults.length === 0) return;
+  
+  saveToHistory();
+  
+  const prevIndex = currentSearchIndex === 0 ? searchResults.length - 1 : currentSearchIndex - 1;
+  setCurrentSearchIndex(prevIndex);
+  
+  const matchedNode = searchResults[prevIndex];
+  const path = getPathToNode(matchedNode.id);
+  const newExpanded = new Set(path);
+  
+  setExpandedNodes(newExpanded);
+  setActiveNode(matchedNode.id);
+  setCurrentPath(path);
+};
+
+const handleShowAllSearchResults = (results = searchResults) => {
+  if (results.length === 0) return;
+  
+  saveToHistory();
+  
+  const allPaths = new Set();
+  
+  // Collect all paths to all matching nodes
+  results.forEach(node => {
+    const path = getPathToNode(node.id);
+    path.forEach(id => allPaths.add(id));
+    
+    // Also add 3 layers of children for each result
+    const children = getNLayersOfChildren(node.id, 3);
+    children.forEach(id => allPaths.add(id));
+  });
+  
+  setExpandedNodes(allPaths);
+  setShowAllSearchResults(true);
+};
+
+const handleShowSingleSearchResult = () => {
+  if (searchResults.length === 0) return;
+  
+  saveToHistory();
+  
+  const matchedNode = searchResults[currentSearchIndex];
+  const path = getPathToNode(matchedNode.id);
+  const newExpanded = new Set(path);
+  
+  setExpandedNodes(newExpanded);
+  setActiveNode(matchedNode.id);
+  setCurrentPath(path);
+  setShowAllSearchResults(false);
+};
   const handleReset = () => {
     setHiddenNodes(new Set());
     setSelectedToHide(new Set());
@@ -552,16 +645,44 @@ const FlowDiagramNew = () => {
         <div className="bg-white/10 backdrop-blur-lg rounded-xl p-4 mb-4 shadow-2xl border border-white/20">
           <div className="flex flex-col gap-3">
             <div className="flex flex-col md:flex-row gap-3 items-stretch md:items-center">
-              <div className="flex-1 relative">
-                <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-purple-300 w-5 h-5" />
-                <input
-                  type="text"
-                  placeholder="Search nodes by label..."
-                  value={searchTerm}
-                  onChange={(e) => handleSearch(e.target.value)}
-                  className="w-full pl-11 pr-4 py-2.5 bg-white/20 border-2 border-white/30 rounded-lg text-white placeholder-purple-200 focus:outline-none focus:ring-2 focus:ring-purple-400 text-sm"
-                />
-              </div>
+            <div className="flex-1 relative">
+  <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-purple-300 w-5 h-5" />
+  <input
+    type="text"
+    placeholder="Search nodes by label..."
+    value={searchTerm}
+    onChange={(e) => handleSearch(e.target.value)}
+    className="w-full pl-11 pr-4 py-2.5 bg-white/20 border-2 border-white/30 rounded-lg text-white placeholder-purple-200 focus:outline-none focus:ring-2 focus:ring-purple-400 text-sm"
+  />
+  
+  {/* Search Results Counter */}
+  {searchResults.length > 0 && (
+    <div className="absolute right-3 top-1/2 -translate-y-1/2 flex items-center gap-2">
+      <span className="text-xs text-purple-200 font-semibold bg-purple-900/50 px-2 py-1 rounded">
+        {currentSearchIndex + 1} / {searchResults.length}
+      </span>
+      
+      {searchResults.length > 1 && (
+        <div className="flex gap-1">
+          <button
+            onClick={handlePreviousSearchResult}
+            className="p-1 hover:bg-white/20 rounded transition-colors"
+            title="Previous result"
+          >
+            <ChevronRight className="w-4 h-4 text-white rotate-180" />
+          </button>
+          <button
+            onClick={handleNextSearchResult}
+            className="p-1 hover:bg-white/20 rounded transition-colors"
+            title="Next result"
+          >
+            <ChevronRight className="w-4 h-4 text-white" />
+          </button>
+        </div>
+      )}
+    </div>
+  )}
+</div>
 
               <div className="flex items-center gap-2 bg-white/20 rounded-lg p-1.5">
                 <button
@@ -592,7 +713,26 @@ const FlowDiagramNew = () => {
             </div>
 
             <div className="flex flex-wrap gap-2">
-             
+             {/* <button
+  onClick={handleUndo}
+  disabled={currentHistoryIndex <= 0}
+  className="flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white rounded-lg font-medium transition-colors text-sm shadow-lg"
+  title="Undo (Ctrl+Z)"
+>
+  <Undo className="w-4 h-4" />
+  Undo
+</button> */}
+
+{/* ADD THIS NEW BUTTON */}
+{/* {searchResults.length > 1 && (
+  <button
+    onClick={() => showAllSearchResults ? handleShowSingleSearchResult() : handleShowAllSearchResults()}
+    className="flex items-center gap-2 px-4 py-2 bg-teal-600 hover:bg-teal-700 text-white rounded-lg font-medium transition-colors text-sm shadow-lg"
+  >
+    <Search className="w-4 h-4" />
+    {showAllSearchResults ? `Show Current (${currentSearchIndex + 1}/${searchResults.length})` : `Show All (${searchResults.length})`}
+  </button>
+)} */}
 
               <button
                 onClick={addMoreLayers}
@@ -797,12 +937,8 @@ const FlowDiagramNew = () => {
                   const isInPath = currentPath.includes(node.id);
                   const hasChildren = (childrenMap[node.id] || []).length > 0;
                   const isExpanded = hasExpandedDescendants(node.id);
-                  const isSearchResult =
-                    searchTerm &&
-                    node.data?.label &&
-                    node.data.label
-                      .toLowerCase()
-                      .includes(searchTerm.toLowerCase());
+                 const isSearchResult = searchResults.some(result => result.id === node.id);
+const isCurrentSearchResult = searchResults.length > 0 && searchResults[currentSearchIndex]?.id === node.id;
                   const isHovered = hoveredNode === node.id;
 
                   const nodePath = getPathToNode(node.id);
@@ -877,32 +1013,32 @@ const FlowDiagramNew = () => {
                         />
                       )}
 
-                      {isSearchResult && (
-                        <>
-                          <rect
-                            x="-8"
-                            y="-8"
-                            width={currentWidth + 16}
-                            height={nodeHeight + 16}
-                            rx="8"
-                            fill="#10B981"
-                            opacity="0.5"
-                            className="animate-pulse"
-                          />
-                          <rect
-                            x="-5"
-                            y="-5"
-                            width={currentWidth + 10}
-                            height={nodeHeight + 10}
-                            rx="8"
-                            fill="none"
-                            stroke="#10B981"
-                            strokeWidth="3"
-                            opacity="0.8"
-                            className="animate-pulse"
-                          />
-                        </>
-                      )}
+                     {isSearchResult && (
+  <>
+    <rect
+      x="-8"
+      y="-8"
+      width={currentWidth + 16}
+      height={nodeHeight + 16}
+      rx="8"
+      fill={isCurrentSearchResult ? "#10B981" : "#3B82F6"}
+      opacity="0.5"
+      className="animate-pulse"
+    />
+    <rect
+      x="-5"
+      y="-5"
+      width={currentWidth + 10}
+      height={nodeHeight + 10}
+      rx="8"
+      fill="none"
+      stroke={isCurrentSearchResult ? "#10B981" : "#3B82F6"}
+      strokeWidth={isCurrentSearchResult ? 4 : 2}
+      opacity="0.8"
+      className="animate-pulse"
+    />
+  </>
+)}
 
                       <rect
                         width={currentWidth}
