@@ -543,15 +543,11 @@ const FlowDiagramNew = () => {
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-900 via-purple-900 to-slate-900 p-4">
       <div className="max-w-full mx-auto">
-        <div className="text-center mb-4">
+        {/* <div className="text-center mb-4">
           <h1 className="text-5xl font-bold text-white mb-2 drop-shadow-lg">
-            🌳 Layered Tree Diagram
+            React Flow Diagram
           </h1>
-          <p className="text-purple-200 text-lg">
-            Click nodes to expand/collapse 3 layers • {graphData.nodes.length}{" "}
-            total nodes
-          </p>
-        </div>
+          </div> */}
 
         <div className="bg-white/10 backdrop-blur-lg rounded-xl p-4 mb-4 shadow-2xl border border-white/20">
           <div className="flex flex-col gap-3">
@@ -596,24 +592,7 @@ const FlowDiagramNew = () => {
             </div>
 
             <div className="flex flex-wrap gap-2">
-              <button
-                onClick={handleUndo}
-                disabled={currentHistoryIndex <= 0}
-                className="flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white rounded-lg font-medium transition-colors text-sm shadow-lg"
-                title="Undo (Ctrl+Z)"
-              >
-                <Undo className="w-4 h-4" />
-                Undo
-              </button>
-              <button
-                onClick={handleRedo}
-                disabled={currentHistoryIndex >= historyRef.current.length - 1}
-                className="flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white rounded-lg font-medium transition-colors text-sm shadow-lg"
-                title="Redo (Ctrl+Shift+Z)"
-              >
-                <Undo className="w-4 h-4 rotate-180" />
-                Redo
-              </button>
+             
 
               <button
                 onClick={addMoreLayers}
@@ -670,6 +649,24 @@ const FlowDiagramNew = () => {
                   ? "Exit Show Selected"
                   : "Restore Hidden Nodes"}
               </button>
+              <button
+                onClick={handleUndo}
+                disabled={currentHistoryIndex <= 0}
+                className="flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white rounded-lg font-medium transition-colors text-sm shadow-lg"
+                title="Undo (Ctrl+Z)"
+              >
+                <Undo className="w-4 h-4" />
+                Undo
+              </button>
+              <button
+                onClick={handleRedo}
+                disabled={currentHistoryIndex >= historyRef.current.length - 1}
+                className="flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white rounded-lg font-medium transition-colors text-sm shadow-lg"
+                title="Redo (Ctrl+Shift+Z)"
+              >
+                <Undo className="w-4 h-4 rotate-180" />
+                Redo
+              </button>
             </div>
           </div>
         </div>
@@ -693,7 +690,7 @@ const FlowDiagramNew = () => {
         <div
           ref={containerRef}
           className="bg-white/5 backdrop-blur-sm rounded-2xl shadow-2xl border border-white/10 overflow-auto"
-          style={{ height: "calc(100vh - 420px)" }}
+          style={{ height: "calc(100vh - 220px)" }}
         >
           <div
             style={{
