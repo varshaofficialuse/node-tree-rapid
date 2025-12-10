@@ -565,13 +565,22 @@ const FlowDiagramNew = () => {
   }
 
   const collapsedLayers = new Set();
+const rootLayer = 0;
+
+const getMaxLayer = () => {
+  return Math.max(...Object.keys(nodesByLayer).map(Number));
+};
+
+const leafLayer = getMaxLayer();
 
   Object.entries(nodesByLayer).forEach(([layer, nodeIds]) => {
     const layerNum = parseInt(layer);
     const isLayerHovered = nodeIds.some((nodeId) => hoveredNode === nodeId);
-    if (!isLayerHovered) {
-      collapsedLayers.add(layerNum);
-    }
+    if (!showAllGraph && !isLayerHovered && layerNum !== rootLayer && layerNum !== leafLayer) {
+
+  collapsedLayers.add(layerNum);
+}
+
   });
 
   const layerXPositions = {};
@@ -740,7 +749,7 @@ const FlowDiagramNew = () => {
 
               <button
                 onClick={handleHideSelected}
-                disabled={selectedToHide.size === 0 || showAllGraph}
+                disabled={selectedToHide.size === 0}
                 className="flex items-center gap-2 px-4 py-2 bg-pink-600 hover:bg-pink-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white rounded-lg font-medium transition-colors text-sm shadow-lg"
               >
                 Hide Selected ({selectedToHide.size})
@@ -749,7 +758,7 @@ const FlowDiagramNew = () => {
               <button
                 onClick={handleShowSelected}
                 disabled={
-                  selectedToHide.size === 0 || showAllGraph || showSelectedMode
+                  selectedToHide.size === 0 || showSelectedMode
                 }
                 className="flex items-center gap-2 px-4 py-2 bg-green-600 hover:bg-green-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white rounded-lg font-medium transition-colors text-sm shadow-lg"
               >
