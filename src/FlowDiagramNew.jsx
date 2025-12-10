@@ -29,6 +29,7 @@ const FlowDiagramNew = () => {
   const [showSelectedMode, setShowSelectedMode] = useState(false);
   const [pinnedPathNodes, setPinnedPathNodes] = useState(new Set());
   const [contextMenu, setContextMenu] = useState(null);
+  const [collapseAllVisual, setCollapseAllVisual] = useState(false);
 
   // NEW: sidebar toggle
   const [sidebarOpen, setSidebarOpen] = useState(true);
@@ -396,21 +397,28 @@ const FlowDiagramNew = () => {
   };
 
   const toggleShowAll = () => {
+    // always clear hide/show selections when toggling
     setHiddenNodes(new Set());
     setSelectedToHide(new Set());
     setShowSelectedMode(false);
 
-    if (showAllGraph) {
-      setExpandedNodes(new Set([rootNode.id]));
-      setActiveNode(null);
-      setCurrentPath([]);
+    const allNodes = new Set(graphData.nodes.map((n) => n.id));
+
+    if (!showAllGraph) {
+      // 1️⃣ First click: go from normal view → SHOW ALL (full size)
+      setExpandedNodes(allNodes); // all nodes visible
+      setActiveNode(rootNode?.id || null);
+      setCurrentPath(rootNode ? [rootNode.id] : []);
+      setShowAllGraph(true);
+      setCollapseAllVisual(false); // no visual collapsing
+    } else if (!collapseAllVisual) {
+      // 2️⃣ Second click: SHOW ALL → COLLAPSE ALL (visual shrink)
+      // Data stays fully expanded; only visual collapsing via collapseAllVisual
+      setCollapseAllVisual(true);
     } else {
-      const allNodes = new Set(graphData.nodes.map((n) => n.id));
-      setExpandedNodes(allNodes);
-      setActiveNode(rootNode?.id);
-      setCurrentPath([rootNode?.id]);
+      // 3️⃣ Third click: COLLAPSE ALL → SHOW ALL (full size again)
+      setCollapseAllVisual(false);
     }
-    setShowAllGraph(!showAllGraph);
   };
 
   const handleSearch = (term) => {
@@ -593,12 +601,20 @@ const FlowDiagramNew = () => {
   Object.entries(nodesByLayer).forEach(([layer, nodeIds]) => {
     const layerNum = parseInt(layer);
     const isLayerHovered = nodeIds.some((nodeId) => hoveredNode === nodeId);
-    if (
-      !showAllGraph &&
+
+    // We collapse a layer in two cases:
+    // 1) Normal mode (showAllGraph === false) -> your original behaviour
+    // 2) Show-all-data mode WITH visual collapse enabled
+    const shouldCollapseThisLayer =
+      // original behaviour
+      (!showAllGraph ||
+        // visual collapse when full graph is shown
+        (showAllGraph && collapseAllVisual)) &&
       !isLayerHovered &&
       layerNum !== rootLayer &&
-      layerNum !== leafLayer
-    ) {
+      layerNum !== leafLayer;
+
+    if (shouldCollapseThisLayer) {
       collapsedLayers.add(layerNum);
     }
   });
@@ -789,9 +805,7 @@ const FlowDiagramNew = () => {
 
             {/* Zoom */}
             <div>
-              <label className="block text-xs mb-1 text-purple-100">
-                Zoom
-              </label>
+              <label className="block text-xs mb-1 text-purple-100">Zoom</label>
               <div className="flex items-center gap-1 bg-white/10 rounded-lg px-1 py-1">
                 <button
                   onClick={() => setZoom(Math.max(25, zoom - 25))}
@@ -835,10 +849,13 @@ const FlowDiagramNew = () => {
 
                 <button
                   onClick={toggleShowAll}
-                  className="flex items-center gap-1 px-2 py-1 bg-purple-600 hover:bg-purple-700 text-xs rounded shadow"
+                  className="flex items-center gap-2 px-4 py-2 bg-purple-600 hover:bg-purple-700 text-white rounded-lg font-medium transition-colors text-sm shadow-lg"
                 >
-                  <Maximize2 className="w-3 h-3" />
-                  {showAllGraph ? "Collapse" : "Show All"}
+                  <Maximize2 className="w-4 h-4" />
+                  {/* Label logic */}
+                  {!showAllGraph || collapseAllVisual
+                    ? "Show All Graph"
+                    : "Collapse All"}
                 </button>
 
                 <button
@@ -888,7 +905,9 @@ const FlowDiagramNew = () => {
 
                 <button
                   onClick={handleRedo}
-                  disabled={currentHistoryIndex >= historyRef.current.length - 1}
+                  disabled={
+                    currentHistoryIndex >= historyRef.current.length - 1
+                  }
                   className="flex items-center gap-1 px-2 py-1 bg-indigo-600 hover:bg-indigo-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-xs rounded shadow"
                   title="Redo (Ctrl+Shift+Z)"
                 >
@@ -1069,8 +1088,7 @@ const FlowDiagramNew = () => {
                   const startY = baseStartY + laneOffsetY;
                   const endY = baseEndY + laneOffsetY;
 
-                  const midXBase =
-                    source.x + (targetX - source.x) * 0.5;
+                  const midXBase = source.x + (targetX - source.x) * 0.5;
                   const controlXOffset =
                     (siblingIndex - centerIndex) * EDGE_TRACK_SPACING_X;
 
@@ -1296,28 +1314,29 @@ const FlowDiagramNew = () => {
                         </text>
                       )}
 
-                      {isLayerCollapsed && currentWidth === collapsedNodeWidth && (
-                        <g>
-                          <circle
-                            cx={collapsedNodeWidth / 2}
-                            cy={nodeHeight / 2 - 12}
-                            r="2"
-                            fill="white"
-                          />
-                          <circle
-                            cx={collapsedNodeWidth / 2}
-                            cy={nodeHeight / 2}
-                            r="2"
-                            fill="white"
-                          />
-                          <circle
-                            cx={collapsedNodeWidth / 2}
-                            cy={nodeHeight / 2 + 12}
-                            r="2"
-                            fill="white"
-                          />
-                        </g>
-                      )}
+                      {isLayerCollapsed &&
+                        currentWidth === collapsedNodeWidth && (
+                          <g>
+                            <circle
+                              cx={collapsedNodeWidth / 2}
+                              cy={nodeHeight / 2 - 12}
+                              r="2"
+                              fill="white"
+                            />
+                            <circle
+                              cx={collapsedNodeWidth / 2}
+                              cy={nodeHeight / 2}
+                              r="2"
+                              fill="white"
+                            />
+                            <circle
+                              cx={collapsedNodeWidth / 2}
+                              cy={nodeHeight / 2 + 12}
+                              r="2"
+                              fill="white"
+                            />
+                          </g>
+                        )}
 
                       {hasChildren && currentWidth === nodeWidth && (
                         <g transform={`translate(${currentWidth - 22}, 8)`}>
