@@ -33,6 +33,8 @@ const FlowDiagramNew = () => {
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [miniMapVisible, setMiniMapVisible] = useState(true);
   const [miniMapHoveredNode, setMiniMapHoveredNode] = useState(null);
+  const [isolatedNodeId, setIsolatedNodeId] = useState(null);
+const [preIsolateState, setPreIsolateState] = useState(null);
 
   const historyRef = useRef([]);
   const [currentHistoryIndex, setCurrentHistoryIndex] = useState(0);
@@ -81,18 +83,19 @@ const FlowDiagramNew = () => {
   useEffect(() => {
     if (!rootNode) return;
 
-    const snapshot = {
-      expandedNodes: Array.from(expandedNodes),
-      activeNode,
-      currentPath: [...currentPath],
-      hiddenNodes: Array.from(hiddenNodes),
-      selectedToHide: Array.from(selectedToHide),
-      showSelectedMode,
-      zoom,
-      searchTerm,
-      showAllGraph,
-      pinnedPathNodes: Array.from(pinnedPathNodes),
-    };
+   const snapshot = {
+  expandedNodes: Array.from(expandedNodes),
+  activeNode,
+  currentPath: [...currentPath],
+  hiddenNodes: Array.from(hiddenNodes),
+  selectedToHide: Array.from(selectedToHide),
+  showSelectedMode,
+  zoom,
+  searchTerm,
+  showAllGraph,
+  pinnedPathNodes: Array.from(pinnedPathNodes),
+  isolatedNodeId,
+};
 
     if (!hasInitializedHistoryRef.current) {
       historyRef.current = [snapshot];
@@ -150,6 +153,7 @@ const FlowDiagramNew = () => {
       setSearchTerm(previousState.searchTerm ?? "");
       setShowAllGraph(!!previousState.showAllGraph);
       setPinnedPathNodes(new Set(previousState.pinnedPathNodes || []));
+setIsolatedNodeId(previousState.isolatedNodeId !== undefined ? previousState.isolatedNodeId : null);
 
       setCurrentHistoryIndex(newIndex);
     }
@@ -176,6 +180,7 @@ const FlowDiagramNew = () => {
       setSearchTerm(nextState.searchTerm ?? "");
       setShowAllGraph(!!nextState.showAllGraph);
       setPinnedPathNodes(new Set(nextState.pinnedPathNodes || []));
+setIsolatedNodeId(nextState.isolatedNodeId !== undefined ? nextState.isolatedNodeId : null);
 
       setCurrentHistoryIndex(newIndex);
     }
@@ -516,7 +521,7 @@ const FlowDiagramNew = () => {
     setShowAllSearchResults(false);
   };
 
-  const handleReset = () => {
+ const handleReset = () => {
     setHiddenNodes(new Set());
     setSelectedToHide(new Set());
     setShowSelectedMode(false);
@@ -527,6 +532,8 @@ const FlowDiagramNew = () => {
     setShowAllGraph(false);
     setZoom(100);
     setPinnedPathNodes(new Set());
+    setIsolatedNodeId(null);
+    setPreIsolateState(null);
   };
 
   const scrollToNode = (nodeId) => {
@@ -559,7 +566,70 @@ const FlowDiagramNew = () => {
     setCurrentPath(getPathToNode(nodeId));
     scrollToNode(nodeId);
   };
+const handleIsolateNode = (nodeId) => {
+    if (isolatedNodeId === nodeId) {
+      // Un-isolate: restore previous state
+      handleUnisolate();
+      return;
+    }
 
+    // Save current state before isolating
+    setPreIsolateState({
+      hiddenNodes: new Set(hiddenNodes),
+      expandedNodes: new Set(expandedNodes),
+      showSelectedMode,
+      activeNode,
+      currentPath: [...currentPath],
+    });
+
+    // Get all descendants of the isolated node
+    const descendants = getAllDescendants(nodeId);
+    const nodesToKeep = new Set([nodeId, ...descendants]);
+
+    // TRUE ISOLATION: Hide ALL other nodes (including ancestors, siblings, etc.)
+    const allNodeIds = new Set(graphData.nodes.map(n => n.id));
+    const nodesToHide = new Set();
+
+    allNodeIds.forEach(id => {
+      if (!nodesToKeep.has(id)) {
+        nodesToHide.add(id);
+      }
+    });
+
+    // Expand the isolated node and its descendants
+    const newExpanded = new Set();
+    nodesToKeep.forEach(id => newExpanded.add(id));
+
+    setHiddenNodes(nodesToHide);
+    setExpandedNodes(newExpanded);
+    setIsolatedNodeId(nodeId);
+    setActiveNode(nodeId);
+    setCurrentPath([nodeId]); // Only the isolated node in path, no ancestors
+    setShowSelectedMode(false);
+    setSelectedToHide(new Set());
+
+    // Auto-scroll to isolated node
+    setTimeout(() => scrollToNode(nodeId), 100);
+  };
+
+const handleUnisolate = () => {
+    if (!preIsolateState) {
+      // Fallback: just clear hidden nodes
+      setHiddenNodes(new Set());
+      setIsolatedNodeId(null);
+      setShowSelectedMode(false);
+      return;
+    }
+
+    // Restore the previous state completely
+    setHiddenNodes(preIsolateState.hiddenNodes);
+    setExpandedNodes(preIsolateState.expandedNodes);
+    setShowSelectedMode(preIsolateState.showSelectedMode);
+    setActiveNode(preIsolateState.activeNode);
+    setCurrentPath(preIsolateState.currentPath || []);
+    setIsolatedNodeId(null);
+    setPreIsolateState(null);
+  };
   const visibleNodeIds = Array.from(expandedNodes).filter(
     (id) => !hiddenNodes.has(id)
   );
@@ -899,17 +969,11 @@ const FlowDiagramNew = () => {
                   <Undo className="w-3 h-3 rotate-180" />
                   Redo
                 </button>
-                <button
-                  onClick={() => setPinnedPathNodes(new Set())}
-                  disabled={pinnedPathNodes.size === 0}
-                  className="flex items-center gap-1 px-2 py-1 bg-yellow-500 hover:bg-yellow-600 disabled:bg-gray-600 text-xs rounded"
-                >
-                  Clear Pins
+               <button onClick={() => setPinnedPathNodes(new Set())} disabled={pinnedPathNodes.size === 0} className="flex items-center gap-1 px-2 py-1 bg-yellow-500 hover:bg-yellow-600 disabled:bg-gray-600 text-xs rounded">Clear Pins</button>
+                <button onClick={handleUnisolate} disabled={!isolatedNodeId} className="flex items-center gap-1 px-2 py-1 bg-orange-600 hover:bg-orange-700 disabled:bg-gray-600 text-xs rounded">
+                  Un-isolate
                 </button>
-                <button
-                  onClick={() => setMiniMapVisible(!miniMapVisible)}
-                  className="flex items-center gap-1 px-2 py-1 bg-teal-600 hover:bg-teal-700 text-xs rounded"
-                >
+                <button onClick={() => setMiniMapVisible(!miniMapVisible)} className="flex items-center gap-1 px-2 py-1 bg-teal-600 hover:bg-teal-700 text-xs rounded">
                   <Maximize2 className="w-3 h-3" />
                   {miniMapVisible ? "Hide" : "Show"} Map
                 </button>
@@ -941,12 +1005,13 @@ const FlowDiagramNew = () => {
                   {Object.keys(nodesByLayer).length}
                 </span>
               </div>
-              <div className="flex justify-between">
-                <span className="text-gray-700">Pinned Paths</span>
-                <span className="font-semibold  text-gray-500">
-                  {pinnedPathNodes.size}
-                </span>
-              </div>
+<div className="flex justify-between"><span className="text-gray-700">Pinned Paths</span><span className="font-semibold text-amber-600">{pinnedPathNodes.size}</span></div>
+              {isolatedNodeId && (
+                <div className="flex justify-between bg-orange-100 -mx-3 px-3 py-1 mt-2">
+                  <span className="text-gray-700 font-semibold">🔍 Isolated</span>
+                  <span className="font-semibold text-orange-600">{nodeMap[isolatedNodeId]?.data?.label || "Node"}</span>
+                </div>
+              )}
             </div>
           </div>
         )}
@@ -1812,37 +1877,17 @@ const FlowDiagramNew = () => {
         </div>
       )}
 
-      {contextMenu && (
-        <div
-          className="fixed z-50 bg-white text-gray-900 rounded-lg shadow-xl border border-gray-300"
-          style={{ top: contextMenu.y, left: contextMenu.x }}
-          onClick={(e) => e.stopPropagation()}
-        >
-          <button
-            className="block px-4 py-2 hover:bg-gray-100 text-sm w-full text-left"
-            onClick={() => {
-              setPinnedPathNodes((prev) => {
-                const next = new Set(prev);
-                if (next.has(contextMenu.nodeId)) {
-                  next.delete(contextMenu.nodeId);
-                } else {
-                  next.add(contextMenu.nodeId);
-                }
-                return next;
-              });
-              setContextMenu(null);
-            }}
-          >
-            {pinnedPathNodes.has(contextMenu.nodeId)
-              ? "Unpin This Path"
-              : "Pin This Path"}
+{contextMenu && (
+        <div className="fixed z-50 bg-white text-gray-900 rounded-lg shadow-xl border border-gray-300" style={{ top: contextMenu.y, left: contextMenu.x }} onClick={(e) => e.stopPropagation()}>
+          <button className="block px-4 py-2 hover:bg-gray-100 text-sm w-full text-left" onClick={() => { setPinnedPathNodes((prev) => { const next = new Set(prev); if (next.has(contextMenu.nodeId)) { next.delete(contextMenu.nodeId); } else { next.add(contextMenu.nodeId); } return next; }); setContextMenu(null); }}>
+            {pinnedPathNodes.has(contextMenu.nodeId) ? "Unpin This Path" : "Pin This Path"}
           </button>
-          <button
-            className="block px-4 py-2 hover:bg-gray-100 text-sm w-full text-left text-red-600"
-            onClick={() => setContextMenu(null)}
-          >
-            Cancel
+          <div className="border-t border-gray-200"></div>
+          <button className="block px-4 py-2 hover:bg-gray-100 text-sm w-full text-left text-orange-600 font-medium" onClick={() => { handleIsolateNode(contextMenu.nodeId); setContextMenu(null); }}>
+            {isolatedNodeId === contextMenu.nodeId ? "✓ Un-isolate This Node" : "Isolate This Node"}
           </button>
+          <div className="border-t border-gray-200"></div>
+          <button className="block px-4 py-2 hover:bg-gray-100 text-sm w-full text-left text-red-600" onClick={() => setContextMenu(null)}>Cancel</button>
         </div>
       )}
     </div>
