@@ -1882,12 +1882,18 @@ const FlowDiagramNew = () => {
 
       {/* MINI-MAP NAVIGATOR */}
       {miniMapVisible && (
-        <div
-          ref={miniMapRef}
-          className="fixed bottom-6 right-6 bg-white border-2 border-gray-300 rounded-lg shadow-2xl overflow-hidden select-none"
-          style={{ width: "280px", height: "200px", zIndex: 40 }}
-          onWheel={handleMiniMapWheel}
-        >
+<div
+  ref={miniMapRef}
+  className="fixed bottom-6 bg-white border-2 border-gray-300 rounded-lg shadow-2xl overflow-hidden select-none transition-all duration-300"
+  style={{
+    width: "280px",
+    height: "200px",
+    left: sidebarOpen ? "300px" : "60px", // moves based on sidebar width
+    zIndex: 40,
+  }}
+  onWheel={handleMiniMapWheel}
+>
+
           {/* Mini-map header */}
           <div className="bg-gray-100 border-b border-gray-300 px-3 py-2 flex items-center justify-between">
             <span className="text-xs font-semibold text-gray-700">Navigator</span>
