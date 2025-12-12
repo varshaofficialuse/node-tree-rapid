@@ -34,7 +34,18 @@ const FlowDiagramNew = () => {
   const [miniMapVisible, setMiniMapVisible] = useState(true);
   const [miniMapHoveredNode, setMiniMapHoveredNode] = useState(null);
   const [isolatedNodeId, setIsolatedNodeId] = useState(null);
-const [preIsolateState, setPreIsolateState] = useState(null);
+  const [preIsolateState, setPreIsolateState] = useState(null);
+  const [isDraggingViewport, setIsDraggingViewport] = useState(false);
+  const [dragStartPos, setDragStartPos] = useState(null);
+
+  const miniMapRef = useRef(null);
+  const viewportDragRef = useRef({
+    isDragging: false,
+    startX: 0,
+    startY: 0,
+    startScrollX: 0,
+    startScrollY: 0,
+  });
 
   const historyRef = useRef([]);
   const [currentHistoryIndex, setCurrentHistoryIndex] = useState(0);
@@ -83,19 +94,19 @@ const [preIsolateState, setPreIsolateState] = useState(null);
   useEffect(() => {
     if (!rootNode) return;
 
-   const snapshot = {
-  expandedNodes: Array.from(expandedNodes),
-  activeNode,
-  currentPath: [...currentPath],
-  hiddenNodes: Array.from(hiddenNodes),
-  selectedToHide: Array.from(selectedToHide),
-  showSelectedMode,
-  zoom,
-  searchTerm,
-  showAllGraph,
-  pinnedPathNodes: Array.from(pinnedPathNodes),
-  isolatedNodeId,
-};
+    const snapshot = {
+      expandedNodes: Array.from(expandedNodes),
+      activeNode,
+      currentPath: [...currentPath],
+      hiddenNodes: Array.from(hiddenNodes),
+      selectedToHide: Array.from(selectedToHide),
+      showSelectedMode,
+      zoom,
+      searchTerm,
+      showAllGraph,
+      pinnedPathNodes: Array.from(pinnedPathNodes),
+      isolatedNodeId,
+    };
 
     if (!hasInitializedHistoryRef.current) {
       historyRef.current = [snapshot];
@@ -153,7 +164,11 @@ const [preIsolateState, setPreIsolateState] = useState(null);
       setSearchTerm(previousState.searchTerm ?? "");
       setShowAllGraph(!!previousState.showAllGraph);
       setPinnedPathNodes(new Set(previousState.pinnedPathNodes || []));
-setIsolatedNodeId(previousState.isolatedNodeId !== undefined ? previousState.isolatedNodeId : null);
+      setIsolatedNodeId(
+        previousState.isolatedNodeId !== undefined
+          ? previousState.isolatedNodeId
+          : null
+      );
 
       setCurrentHistoryIndex(newIndex);
     }
@@ -180,11 +195,32 @@ setIsolatedNodeId(previousState.isolatedNodeId !== undefined ? previousState.iso
       setSearchTerm(nextState.searchTerm ?? "");
       setShowAllGraph(!!nextState.showAllGraph);
       setPinnedPathNodes(new Set(nextState.pinnedPathNodes || []));
-setIsolatedNodeId(nextState.isolatedNodeId !== undefined ? nextState.isolatedNodeId : null);
+      setIsolatedNodeId(
+        nextState.isolatedNodeId !== undefined ? nextState.isolatedNodeId : null
+      );
 
       setCurrentHistoryIndex(newIndex);
     }
   }, [currentHistoryIndex]);
+
+  // Sync minimap viewport rectangle when main canvas scrolls or zooms
+  useEffect(() => {
+    if (!containerRef.current || !miniMapVisible) return;
+
+    const container = containerRef.current;
+
+    const handleScroll = () => {
+      // Force re-render to update viewport rectangle
+      // This is efficient as it only updates the minimap viewport, not the whole tree
+      setMiniMapHoveredNode((prev) => prev); // Trigger minimal re-render
+    };
+
+    container.addEventListener("scroll", handleScroll);
+
+    return () => {
+      container.removeEventListener("scroll", handleScroll);
+    };
+  }, [miniMapVisible, zoom]);
 
   useEffect(() => {
     const handleKeyDown = (e) => {
@@ -474,9 +510,7 @@ setIsolatedNodeId(nextState.isolatedNodeId !== undefined ? nextState.isolatedNod
     if (searchResults.length === 0) return;
 
     const prevIndex =
-      currentSearchIndex === 0
-        ? searchResults.length - 1
-        : currentSearchIndex - 1;
+      currentSearchIndex === 0 ? searchResults.length - 1 : currentSearchIndex - 1;
     setCurrentSearchIndex(prevIndex);
 
     const matchedNode = searchResults[prevIndex];
@@ -521,7 +555,7 @@ setIsolatedNodeId(nextState.isolatedNodeId !== undefined ? nextState.isolatedNod
     setShowAllSearchResults(false);
   };
 
- const handleReset = () => {
+  const handleReset = () => {
     setHiddenNodes(new Set());
     setSelectedToHide(new Set());
     setShowSelectedMode(false);
@@ -561,12 +595,13 @@ setIsolatedNodeId(nextState.isolatedNodeId !== undefined ? nextState.isolatedNod
     });
   };
 
-  const handleMiniMapClick = (nodeId) => {
-    setActiveNode(nodeId);
-    setCurrentPath(getPathToNode(nodeId));
-    scrollToNode(nodeId);
-  };
-const handleIsolateNode = (nodeId) => {
+  // const handleMiniMapClick = (nodeId) => {
+  //   setActiveNode(nodeId);
+  //   setCurrentPath(getPathToNode(nodeId));
+  //   scrollToNode(nodeId);
+  // };
+
+  const handleIsolateNode = (nodeId) => {
     if (isolatedNodeId === nodeId) {
       // Un-isolate: restore previous state
       handleUnisolate();
@@ -587,10 +622,10 @@ const handleIsolateNode = (nodeId) => {
     const nodesToKeep = new Set([nodeId, ...descendants]);
 
     // TRUE ISOLATION: Hide ALL other nodes (including ancestors, siblings, etc.)
-    const allNodeIds = new Set(graphData.nodes.map(n => n.id));
+    const allNodeIds = new Set(graphData.nodes.map((n) => n.id));
     const nodesToHide = new Set();
 
-    allNodeIds.forEach(id => {
+    allNodeIds.forEach((id) => {
       if (!nodesToKeep.has(id)) {
         nodesToHide.add(id);
       }
@@ -598,7 +633,7 @@ const handleIsolateNode = (nodeId) => {
 
     // Expand the isolated node and its descendants
     const newExpanded = new Set();
-    nodesToKeep.forEach(id => newExpanded.add(id));
+    nodesToKeep.forEach((id) => newExpanded.add(id));
 
     setHiddenNodes(nodesToHide);
     setExpandedNodes(newExpanded);
@@ -612,7 +647,25 @@ const handleIsolateNode = (nodeId) => {
     setTimeout(() => scrollToNode(nodeId), 100);
   };
 
-const handleUnisolate = () => {
+  // ============ VISIBLE NODE/LAYER CALCS ============
+  const visibleNodeIds = Array.from(expandedNodes).filter(
+    (id) => !hiddenNodes.has(id)
+  );
+
+  const calculateLayerPositions = () => {
+    const layers = {};
+    visibleNodeIds.forEach((nodeId) => {
+      const path = getPathToNode(nodeId);
+      const layer = path.length - 1;
+      if (!layers[layer]) layers[layer] = [];
+      layers[layer].push(nodeId);
+    });
+    return layers;
+  };
+
+  const nodesByLayer = calculateLayerPositions();
+
+  const handleUnisolate = () => {
     if (!preIsolateState) {
       // Fallback: just clear hidden nodes
       setHiddenNodes(new Set());
@@ -630,23 +683,66 @@ const handleUnisolate = () => {
     setIsolatedNodeId(null);
     setPreIsolateState(null);
   };
-  const visibleNodeIds = Array.from(expandedNodes).filter(
-    (id) => !hiddenNodes.has(id)
+
+  // ========== IMPORTANT: layout constants (moved up to avoid TDZ errors) ==========
+  const nodeHeight = 70;
+  const nodeWidth = 140;
+  const collapsedNodeWidth = 30;
+  const nodeSpacing = 40;
+  const expandedLayerWidth = 300;
+
+  const pathString = currentPath
+    .map((id) => nodeMap[id]?.data?.label || "")
+    .filter(Boolean)
+    .join(" → ");
+
+  const maxNodesInLayer = Math.max(
+    ...Object.values(nodesByLayer).map((arr) => arr.length),
+    1
   );
+
+  // Build layer X positions BEFORE computing canvas width
+  const layerXPositions = {};
+  let cumulativeX = 50;
+
+  const sortedLayers = Object.keys(nodesByLayer)
+    .map(Number)
+    .sort((a, b) => a - b);
+
+  sortedLayers.forEach((layerNum) => {
+    layerXPositions[layerNum] = cumulativeX;
+    cumulativeX += expandedLayerWidth;
+  });
+
+  // NOW these are safe (cumulativeX is defined above)
+  const canvasWidth = cumulativeX + 400;
+  const canvasHeight =
+    maxNodesInLayer * (nodeHeight + nodeSpacing) + 400;
+
+  // Attach global mouse move and up handlers for viewport dragging
+  useEffect(() => {
+    const handleMouseMove = (e) => {
+      if (viewportDragRef.current.isDragging) {
+        handleViewportDragMove(e);
+      }
+    };
+
+    const handleMouseUp = () => {
+      if (viewportDragRef.current.isDragging) {
+        handleViewportDragEnd();
+      }
+    };
+
+    window.addEventListener("mousemove", handleMouseMove);
+    window.addEventListener("mouseup", handleMouseUp);
+
+    return () => {
+      window.removeEventListener("mousemove", handleMouseMove);
+      window.removeEventListener("mouseup", handleMouseUp);
+    };
+  }, [zoom, canvasWidth, canvasHeight]);
+
   const visibleNodes = visibleNodeIds.map((id) => nodeMap[id]).filter(Boolean);
-
-  const calculateLayerPositions = () => {
-    const layers = {};
-    visibleNodeIds.forEach((nodeId) => {
-      const path = getPathToNode(nodeId);
-      const layer = path.length - 1;
-      if (!layers[layer]) layers[layer] = [];
-      layers[layer].push(nodeId);
-    });
-    return layers;
-  };
-
-  const nodesByLayer = calculateLayerPositions();
 
   const getTotalLayersInFullGraph = () => {
     const allLayers = graphData.nodes.map((node) => {
@@ -657,12 +753,6 @@ const handleUnisolate = () => {
   };
 
   const totalLayers = getTotalLayersInFullGraph();
-
-  const nodeHeight = 70;
-  const nodeWidth = 140;
-  const collapsedNodeWidth = 30;
-  const nodeSpacing = 40;
-  const expandedLayerWidth = 300;
 
   const collapsedLayers = new Set();
   const rootLayer = 0;
@@ -690,17 +780,7 @@ const handleUnisolate = () => {
     }
   });
 
-  const layerXPositions = {};
-  let cumulativeX = 50;
-  const sortedLayers = Object.keys(nodesByLayer)
-    .map(Number)
-    .sort((a, b) => a - b);
-
-  sortedLayers.forEach((layerNum) => {
-    layerXPositions[layerNum] = cumulativeX;
-    cumulativeX += expandedLayerWidth;
-  });
-
+  // nodePositions depends on layerXPositions (already computed)
   const nodePositions = {};
 
   Object.entries(nodesByLayer).forEach(([layer, nodeIds]) => {
@@ -773,17 +853,122 @@ const handleUnisolate = () => {
     return colors[depth % colors.length];
   };
 
-  const pathString = currentPath
-    .map((id) => nodeMap[id]?.data?.label || "")
-    .filter(Boolean)
-    .join(" → ");
+  // ============ MINIMAP SYNC FUNCTIONS ============
+  const getMiniMapScale = () => {
+    if (!miniMapRef.current) return 1;
+    const miniMapWidth = 280;
+    const miniMapHeight = 164;
+    const scaleX = miniMapWidth / canvasWidth;
+    const scaleY = miniMapHeight / canvasHeight;
+    return Math.min(scaleX, scaleY);
+  };
 
-  const maxNodesInLayer = Math.max(
-    ...Object.values(nodesByLayer).map((arr) => arr.length),
-    1
-  );
-  const canvasWidth = cumulativeX + 400;
-  const canvasHeight = maxNodesInLayer * (nodeHeight + nodeSpacing) + 400;
+  const miniMapToMainCoords = (miniMapX, miniMapY) => {
+    const scale = getMiniMapScale();
+    return {
+      x: miniMapX / scale,
+      y: miniMapY / scale,
+    };
+  };
+
+  const getViewportRect = () => {
+    if (!containerRef.current) return { x: 0, y: 0, width: 0, height: 0 };
+    const container = containerRef.current;
+    const scaleFactor = zoom / 100;
+    return {
+      x: container.scrollLeft / scaleFactor,
+      y: container.scrollTop / scaleFactor,
+      width: container.clientWidth / scaleFactor,
+      height: container.clientHeight / scaleFactor,
+    };
+  };
+
+  const syncZoomFromMiniMapToMain = (delta, miniMapX, miniMapY) => {
+    const zoomSpeed = 0.1;
+    const zoomFactor = delta > 0 ? 1 - zoomSpeed : 1 + zoomSpeed;
+    const newZoom = Math.max(25, Math.min(200, zoom * zoomFactor));
+
+    if (newZoom !== zoom && containerRef.current) {
+      const container = containerRef.current;
+      const newZoomFactor = newZoom / 100;
+      const { x: mainX, y: mainY } = miniMapToMainCoords(miniMapX, miniMapY);
+      const newScrollX = mainX * newZoomFactor - container.clientWidth / 2;
+      const newScrollY = mainY * newZoomFactor - container.clientHeight / 2;
+
+      setZoom(newZoom);
+      setTimeout(() => {
+        container.scrollLeft = Math.max(0, newScrollX);
+        container.scrollTop = Math.max(0, newScrollY);
+      }, 0);
+    }
+  };
+
+  const syncPanFromMiniMapToMain = (miniMapX, miniMapY) => {
+    if (!containerRef.current) return;
+    const container = containerRef.current;
+    const scaleFactor = zoom / 100;
+    const { x: mainX, y: mainY } = miniMapToMainCoords(miniMapX, miniMapY);
+    const newScrollX = mainX * scaleFactor - container.clientWidth / 2;
+    const newScrollY = mainY * scaleFactor - container.clientHeight / 2;
+
+    container.scrollTo({
+      left: Math.max(0, newScrollX),
+      top: Math.max(0, newScrollY),
+      behavior: "smooth",
+    });
+  };
+
+  const handleMiniMapWheel = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!miniMapRef.current) return;
+    const rect = miniMapRef.current.getBoundingClientRect();
+    const miniMapX = e.clientX - rect.left;
+    const miniMapY = e.clientY - rect.top - 36;
+    syncZoomFromMiniMapToMain(e.deltaY, miniMapX, miniMapY);
+  };
+
+  const handleMiniMapClick = (e) => {
+    if (viewportDragRef.current.isDragging) return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    const miniMapX = e.clientX - rect.left;
+    const miniMapY = e.clientY - rect.top;
+    syncPanFromMiniMapToMain(miniMapX, miniMapY);
+  };
+
+  const handleViewportDragStart = (e) => {
+    e.stopPropagation();
+    if (!containerRef.current) return;
+    const container = containerRef.current;
+    viewportDragRef.current = {
+      isDragging: true,
+      startX: e.clientX,
+      startY: e.clientY,
+      startScrollX: container.scrollLeft,
+      startScrollY: container.scrollTop,
+    };
+    setIsDraggingViewport(true);
+  };
+
+  const handleViewportDragMove = (e) => {
+    if (!viewportDragRef.current.isDragging || !containerRef.current) return;
+    e.preventDefault();
+    const container = containerRef.current;
+    const miniMapScale = getMiniMapScale();
+    const scaleFactor = zoom / 100;
+    const deltaX = e.clientX - viewportDragRef.current.startX;
+    const deltaY = e.clientY - viewportDragRef.current.startY;
+    const mainDeltaX = (deltaX / miniMapScale) * scaleFactor;
+    const mainDeltaY = (deltaY / miniMapScale) * scaleFactor;
+    container.scrollLeft = viewportDragRef.current.startScrollX + mainDeltaX;
+    container.scrollTop = viewportDragRef.current.startScrollY + mainDeltaY;
+  };
+
+  const handleViewportDragEnd = () => {
+    viewportDragRef.current.isDragging = false;
+    setIsDraggingViewport(false);
+  };
+
   return (
     <div
       className="min-h-screen flex bg-gray-100"
@@ -969,11 +1154,24 @@ const handleUnisolate = () => {
                   <Undo className="w-3 h-3 rotate-180" />
                   Redo
                 </button>
-               <button onClick={() => setPinnedPathNodes(new Set())} disabled={pinnedPathNodes.size === 0} className="flex items-center gap-1 px-2 py-1 bg-yellow-500 hover:bg-yellow-600 disabled:bg-gray-600 text-xs rounded">Clear Pins</button>
-                <button onClick={handleUnisolate} disabled={!isolatedNodeId} className="flex items-center gap-1 px-2 py-1 bg-orange-600 hover:bg-orange-700 disabled:bg-gray-600 text-xs rounded">
+                <button
+                  onClick={() => setPinnedPathNodes(new Set())}
+                  disabled={pinnedPathNodes.size === 0}
+                  className="flex items-center gap-1 px-2 py-1 bg-yellow-500 hover:bg-yellow-600 disabled:bg-gray-600 text-xs rounded"
+                >
+                  Clear Pins
+                </button>
+                <button
+                  onClick={handleUnisolate}
+                  disabled={!isolatedNodeId}
+                  className="flex items-center gap-1 px-2 py-1 bg-orange-600 hover:bg-orange-700 disabled:bg-gray-600 text-xs rounded"
+                >
                   Un-isolate
                 </button>
-                <button onClick={() => setMiniMapVisible(!miniMapVisible)} className="flex items-center gap-1 px-2 py-1 bg-teal-600 hover:bg-teal-700 text-xs rounded">
+                <button
+                  onClick={() => setMiniMapVisible(!miniMapVisible)}
+                  className="flex items-center gap-1 px-2 py-1 bg-teal-600 hover:bg-teal-700 text-xs rounded"
+                >
                   <Maximize2 className="w-3 h-3" />
                   {miniMapVisible ? "Hide" : "Show"} Map
                 </button>
@@ -1005,11 +1203,18 @@ const handleUnisolate = () => {
                   {Object.keys(nodesByLayer).length}
                 </span>
               </div>
-<div className="flex justify-between"><span className="text-gray-700">Pinned Paths</span><span className="font-semibold text-amber-600">{pinnedPathNodes.size}</span></div>
+              <div className="flex justify-between">
+                <span className="text-gray-700">Pinned Paths</span>
+                <span className="font-semibold text-amber-600">
+                  {pinnedPathNodes.size}
+                </span>
+              </div>
               {isolatedNodeId && (
                 <div className="flex justify-between bg-orange-100 -mx-3 px-3 py-1 mt-2">
                   <span className="text-gray-700 font-semibold">🔍 Isolated</span>
-                  <span className="font-semibold text-orange-600">{nodeMap[isolatedNodeId]?.data?.label || "Node"}</span>
+                  <span className="font-semibold text-orange-600">
+                    {nodeMap[isolatedNodeId]?.data?.label || "Node"}
+                  </span>
                 </div>
               )}
             </div>
@@ -1149,7 +1354,8 @@ const handleUnisolate = () => {
                     const color = getNodeColor(node.id);
                     const isActive = activeNode === node.id;
                     const isInPath = currentPath.includes(node.id);
-                    const hasChildren = (childrenMap[node.id] || []).length > 0;
+                    const hasChildren = (childrenMap[node.id] || []).length >
+                      0;
                     const isExpanded = hasExpandedDescendants(node.id);
                     const isSearchResult = searchResults.some(
                       (result) => result.id === node.id
@@ -1399,7 +1605,8 @@ const handleUnisolate = () => {
                     const color = getNodeColor(node.id);
                     const isActive = activeNode === node.id;
                     const isInPath = currentPath.includes(node.id);
-                    const hasChildren = (childrenMap[node.id] || []).length > 0;
+                    const hasChildren = (childrenMap[node.id] || []).length >
+                      0;
                     const isExpanded = hasExpandedDescendants(node.id);
                     const isSearchResult = searchResults.some(
                       (result) => result.id === node.id
@@ -1676,14 +1883,14 @@ const handleUnisolate = () => {
       {/* MINI-MAP NAVIGATOR */}
       {miniMapVisible && (
         <div
-          className="fixed bottom-6 right-6 bg-white border-2 border-gray-300 rounded-lg shadow-2xl overflow-hidden"
+          ref={miniMapRef}
+          className="fixed bottom-6 right-6 bg-white border-2 border-gray-300 rounded-lg shadow-2xl overflow-hidden select-none"
           style={{ width: "280px", height: "200px", zIndex: 40 }}
+          onWheel={handleMiniMapWheel}
         >
           {/* Mini-map header */}
           <div className="bg-gray-100 border-b border-gray-300 px-3 py-2 flex items-center justify-between">
-            <span className="text-xs font-semibold text-gray-700">
-              Navigator
-            </span>
+            <span className="text-xs font-semibold text-gray-700">Navigator</span>
             <button
               onClick={() => setMiniMapVisible(false)}
               className="text-gray-500 hover:text-gray-700"
@@ -1702,7 +1909,8 @@ const handleUnisolate = () => {
               height="100%"
               viewBox={`0 0 ${canvasWidth} ${canvasHeight}`}
               preserveAspectRatio="xMidYMid meet"
-              className="cursor-pointer"
+              className={isDraggingViewport ? "cursor-grabbing" : "cursor-pointer"}
+              onClick={handleMiniMapClick}
             >
               {/* Mini-map edges */}
               <g className="mini-edges" opacity="0.3">
@@ -1721,13 +1929,7 @@ const handleUnisolate = () => {
                   const path = `M ${startX} ${startY} C ${midX} ${startY}, ${midX} ${endY}, ${endX} ${endY}`;
 
                   return (
-                    <path
-                      key={edge.id}
-                      d={path}
-                      fill="none"
-                      stroke={color}
-                      strokeWidth="3"
-                    />
+                    <path key={edge.id} d={path} fill="none" stroke={color} strokeWidth="3" />
                   );
                 })}
               </g>
@@ -1748,7 +1950,12 @@ const handleUnisolate = () => {
                     <g
                       key={node.id}
                       transform={`translate(${pos.x}, ${pos.y})`}
-                      onClick={() => handleMiniMapClick(node.id)}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setActiveNode(node.id);
+                        setCurrentPath(getPathToNode(node.id));
+                        scrollToNode(node.id);
+                      }}
                       onMouseEnter={() => setMiniMapHoveredNode(node.id)}
                       onMouseLeave={() => setMiniMapHoveredNode(null)}
                       className="cursor-pointer"
@@ -1774,13 +1981,7 @@ const handleUnisolate = () => {
                         rx="4"
                         fill={color}
                         stroke={
-                          isActive
-                            ? "#FBBF24"
-                            : isInPath
-                            ? "#FB923C"
-                            : isPinned
-                            ? "#FACC15"
-                            : "white"
+                          isActive ? "#FBBF24" : isInPath ? "#FB923C" : isPinned ? "#FACC15" : "white"
                         }
                         strokeWidth={isActive ? 4 : isInPath ? 3 : 2}
                         opacity={isMiniHovered ? 1 : 0.9}
@@ -1788,48 +1989,17 @@ const handleUnisolate = () => {
 
                       {/* Pin indicator */}
                       {isPinned && (
-                        <circle
-                          cx={nodeWidth - 8}
-                          cy={8}
-                          r="5"
-                          fill="#FACC15"
-                          stroke="white"
-                          strokeWidth="1"
-                        />
+                        <circle cx={nodeWidth - 8} cy={8} r="5" fill="#FACC15" stroke="white" strokeWidth="1" />
                       )}
 
                       {/* Active indicator */}
-                      {isActive && (
-                        <circle
-                          cx={nodeWidth / 2}
-                          cy={nodeHeight / 2}
-                          r="6"
-                          fill="#FBBF24"
-                          opacity="0.8"
-                        />
-                      )}
+                      {isActive && <circle cx={nodeWidth / 2} cy={nodeHeight / 2} r="6" fill="#FBBF24" opacity="0.8" />}
 
                       {/* Mini tooltip on hover */}
                       {isMiniHovered && (
                         <g>
-                          <rect
-                            x={nodeWidth + 5}
-                            y={-5}
-                            width="100"
-                            height="30"
-                            rx="3"
-                            fill="rgba(0, 0, 0, 0.9)"
-                            stroke="white"
-                            strokeWidth="1"
-                          />
-                          <text
-                            x={nodeWidth + 10}
-                            y="10"
-                            fill="white"
-                            fontSize="10"
-                            fontWeight="500"
-                            className="pointer-events-none"
-                          >
+                          <rect x={nodeWidth + 5} y={-5} width="100" height="30" rx="3" fill="rgba(0, 0, 0, 0.9)" stroke="white" strokeWidth="1" />
+                          <text x={nodeWidth + 10} y="10" fill="white" fontSize="10" fontWeight="500" className="pointer-events-none">
                             {node.data?.label || "N/A"}
                           </text>
                         </g>
@@ -1839,55 +2009,98 @@ const handleUnisolate = () => {
                 })}
               </g>
 
-              {/* Viewport indicator */}
+              {/* Viewport indicator - Draggable */}
               {containerRef.current &&
                 (() => {
-                  const container = containerRef.current;
-                  const scaleFactor = zoom / 100;
-                  const viewportX = container.scrollLeft / scaleFactor;
-                  const viewportY = container.scrollTop / scaleFactor;
-                  const viewportWidth = container.clientWidth / scaleFactor;
-                  const viewportHeight = container.clientHeight / scaleFactor;
+                  const viewport = getViewportRect();
 
                   return (
-                    <rect
-                      x={viewportX}
-                      y={viewportY}
-                      width={viewportWidth}
-                      height={viewportHeight}
-                      fill="none"
-                      stroke="#3B82F6"
-                      strokeWidth="4"
-                      strokeDasharray="10 5"
-                      opacity="0.6"
-                      pointerEvents="none"
-                    />
+                    <g>
+                      {/* Semi-transparent overlay outside viewport */}
+                      <rect x="0" y="0" width={canvasWidth} height={canvasHeight} fill="black" opacity="0.1" pointerEvents="none" />
+                      <rect x={viewport.x} y={viewport.y} width={viewport.width} height={viewport.height} fill="white" opacity="0.01" pointerEvents="none" />
+
+                      {/* Draggable viewport rectangle */}
+                      <rect
+                        x={viewport.x}
+                        y={viewport.y}
+                        width={viewport.width}
+                        height={viewport.height}
+                        fill="rgba(59, 130, 246, 0.1)"
+                        stroke="#3B82F6"
+                        strokeWidth="4"
+                        strokeDasharray="10 5"
+                        opacity="0.8"
+                        className={isDraggingViewport ? "cursor-grabbing" : "cursor-grab"}
+                        onMouseDown={handleViewportDragStart}
+                        style={{ transition: isDraggingViewport ? "none" : "all 0.1s ease" }}
+                      />
+
+                      {/* Corner resize indicators */}
+                      <circle
+                        cx={viewport.x + viewport.width}
+                        cy={viewport.y + viewport.height}
+                        r="6"
+                        fill="#3B82F6"
+                        stroke="white"
+                        strokeWidth="2"
+                        opacity="0.8"
+                        pointerEvents="none"
+                      />
+                    </g>
                   );
                 })()}
             </svg>
           </div>
 
-          {/* Mini-map footer with stats */}
-          <div className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/60 to-transparent px-2 py-1">
-            <div className="flex justify-between text-xs text-white">
+          {/* Mini-map footer with stats and instructions */}
+          <div className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/70 to-transparent px-2 py-1.5">
+            <div className="flex justify-between text-xs text-white mb-0.5">
               <span>Nodes: {visibleNodes.length}</span>
               <span>Zoom: {zoom}%</span>
             </div>
+            <div className="text-[10px] text-white/80 text-center">Scroll to zoom • Drag viewport to pan • Click to jump</div>
           </div>
         </div>
       )}
 
-{contextMenu && (
-        <div className="fixed z-50 bg-white text-gray-900 rounded-lg shadow-xl border border-gray-300" style={{ top: contextMenu.y, left: contextMenu.x }} onClick={(e) => e.stopPropagation()}>
-          <button className="block px-4 py-2 hover:bg-gray-100 text-sm w-full text-left" onClick={() => { setPinnedPathNodes((prev) => { const next = new Set(prev); if (next.has(contextMenu.nodeId)) { next.delete(contextMenu.nodeId); } else { next.add(contextMenu.nodeId); } return next; }); setContextMenu(null); }}>
+      {contextMenu && (
+        <div
+          className="fixed z-50 bg-white text-gray-900 rounded-lg shadow-xl border border-gray-300"
+          style={{ top: contextMenu.y, left: contextMenu.x }}
+          onClick={(e) => e.stopPropagation()}
+        >
+          <button
+            className="block px-4 py-2 hover:bg-gray-100 text-sm w-full text-left"
+            onClick={() => {
+              setPinnedPathNodes((prev) => {
+                const next = new Set(prev);
+                if (next.has(contextMenu.nodeId)) {
+                  next.delete(contextMenu.nodeId);
+                } else {
+                  next.add(contextMenu.nodeId);
+                }
+                return next;
+              });
+              setContextMenu(null);
+            }}
+          >
             {pinnedPathNodes.has(contextMenu.nodeId) ? "Unpin This Path" : "Pin This Path"}
           </button>
           <div className="border-t border-gray-200"></div>
-          <button className="block px-4 py-2 hover:bg-gray-100 text-sm w-full text-left text-orange-600 font-medium" onClick={() => { handleIsolateNode(contextMenu.nodeId); setContextMenu(null); }}>
+          <button
+            className="block px-4 py-2 hover:bg-gray-100 text-sm w-full text-left text-orange-600 font-medium"
+            onClick={() => {
+              handleIsolateNode(contextMenu.nodeId);
+              setContextMenu(null);
+            }}
+          >
             {isolatedNodeId === contextMenu.nodeId ? "✓ Un-isolate This Node" : "Isolate This Node"}
           </button>
           <div className="border-t border-gray-200"></div>
-          <button className="block px-4 py-2 hover:bg-gray-100 text-sm w-full text-left text-red-600" onClick={() => setContextMenu(null)}>Cancel</button>
+          <button className="block px-4 py-2 hover:bg-gray-100 text-sm w-full text-left text-red-600" onClick={() => setContextMenu(null)}>
+            Cancel
+          </button>
         </div>
       )}
     </div>
