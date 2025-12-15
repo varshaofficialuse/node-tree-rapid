@@ -36,8 +36,8 @@ const FlowDiagramNew = () => {
   const [isolatedNodeId, setIsolatedNodeId] = useState(null);
   const [preIsolateState, setPreIsolateState] = useState(null);
   const [isDraggingViewport, setIsDraggingViewport] = useState(false);
-  const [dragStartPos, setDragStartPos] = useState(null);
-
+ const [showPreviousLayersNode, setShowPreviousLayersNode] = useState(null);
+const [prePreviousLayersState, setPrePreviousLayersState] = useState(null);
   const miniMapRef = useRef(null);
   const viewportDragRef = useRef({
     isDragging: false,
@@ -106,6 +106,8 @@ const FlowDiagramNew = () => {
       showAllGraph,
       pinnedPathNodes: Array.from(pinnedPathNodes),
       isolatedNodeId,
+        showPreviousLayersNode,
+
     };
 
     if (!hasInitializedHistoryRef.current) {
@@ -169,6 +171,7 @@ const FlowDiagramNew = () => {
           ? previousState.isolatedNodeId
           : null
       );
+      setShowPreviousLayersNode(previousState.showPreviousLayersNode !== undefined ? previousState.showPreviousLayersNode : null);
 
       setCurrentHistoryIndex(newIndex);
     }
@@ -198,6 +201,7 @@ const FlowDiagramNew = () => {
       setIsolatedNodeId(
         nextState.isolatedNodeId !== undefined ? nextState.isolatedNodeId : null
       );
+      setShowPreviousLayersNode(nextState.showPreviousLayersNode !== undefined ? nextState.showPreviousLayersNode : null);
 
       setCurrentHistoryIndex(newIndex);
     }
@@ -555,7 +559,7 @@ const FlowDiagramNew = () => {
     setShowAllSearchResults(false);
   };
 
-  const handleReset = () => {
+ const handleReset = () => {
     setHiddenNodes(new Set());
     setSelectedToHide(new Set());
     setShowSelectedMode(false);
@@ -568,8 +572,9 @@ const FlowDiagramNew = () => {
     setPinnedPathNodes(new Set());
     setIsolatedNodeId(null);
     setPreIsolateState(null);
+    setShowPreviousLayersNode(null);
+    setPrePreviousLayersState(null);
   };
-
   const scrollToNode = (nodeId) => {
     const pos = nodePositions[nodeId];
     if (!pos || !containerRef.current) return;
@@ -683,7 +688,58 @@ const FlowDiagramNew = () => {
     setIsolatedNodeId(null);
     setPreIsolateState(null);
   };
+// Show/Hide Previous Layers functionality
+// Show/Hide Previous Layers functionality
+// Show/Hide Previous Layers functionality
+  const handleShowPreviousLayers = (nodeId) => {
+    if (showPreviousLayersNode === nodeId) {
+      // Toggle off: restore previous state
+      handleHidePreviousLayers();
+      return;
+    }
 
+    // Save current state
+    setPrePreviousLayersState({
+      pinnedPathNodes: new Set(pinnedPathNodes),
+    });
+
+    // Get the layer number of the clicked node
+    const nodePath = getPathToNode(nodeId);
+    const clickedNodeLayer = nodePath.length - 1;
+
+    // Get ALL nodes from root layer up to (but NOT including) the clicked node's layer
+    const nodesToPin = new Set(pinnedPathNodes); // Keep existing pins
+    
+    graphData.nodes.forEach((node) => {
+      const path = getPathToNode(node.id);
+      const layer = path.length - 1;
+      
+      // Pin all nodes in layers BEFORE the clicked node's layer
+      if (layer < clickedNodeLayer) {
+        nodesToPin.add(node.id);
+      }
+    });
+
+    // Update pinned nodes to force previous layers to stay open
+    setPinnedPathNodes(nodesToPin);
+    setShowPreviousLayersNode(nodeId);
+    
+    // Scroll to the node
+    setTimeout(() => scrollToNode(nodeId), 100);
+  };
+
+  const handleHidePreviousLayers = () => {
+    if (!prePreviousLayersState) {
+      // Fallback: just clear the flag
+      setShowPreviousLayersNode(null);
+      return;
+    }
+
+    // Restore the previous pinned state (shrink back)
+    setPinnedPathNodes(prePreviousLayersState.pinnedPathNodes);
+    setShowPreviousLayersNode(null);
+    setPrePreviousLayersState(null);
+  };
   // ========== IMPORTANT: layout constants (moved up to avoid TDZ errors) ==========
   const nodeHeight = 70;
   const nodeWidth = 140;
@@ -1168,6 +1224,9 @@ const FlowDiagramNew = () => {
                 >
                   Un-isolate
                 </button>
+                                <button onClick={handleHidePreviousLayers} disabled={!showPreviousLayersNode} className="flex items-center gap-1 px-2 py-1 bg-purple-600 hover:bg-purple-700 disabled:bg-gray-600 text-xs rounded">
+                  Shrink Prev Layers
+                </button>
                 <button
                   onClick={() => setMiniMapVisible(!miniMapVisible)}
                   className="flex items-center gap-1 px-2 py-1 bg-teal-600 hover:bg-teal-700 text-xs rounded"
@@ -1211,12 +1270,18 @@ const FlowDiagramNew = () => {
               </div>
               {isolatedNodeId && (
                 <div className="flex justify-between bg-orange-100 -mx-3 px-3 py-1 mt-2">
-                  <span className="text-gray-700 font-semibold">🔍 Isolated</span>
+                  <span className="text-gray-700 font-semibold">Isolated</span>
                   <span className="font-semibold text-orange-600">
                     {nodeMap[isolatedNodeId]?.data?.label || "Node"}
                   </span>
                 </div>
               )}
+                         {/* {showPreviousLayersNode && (
+                <div className="flex justify-between bg-purple-100 -mx-3 px-3 py-1 mt-2">
+                  <span className="text-gray-700 font-semibold">Prev Layers</span>
+                  <span className="font-semibold text-purple-600">{nodeMap[showPreviousLayersNode]?.data?.label || "Node"}</span>
+                </div>
+              )} */}
             </div>
           </div>
         )}
@@ -1397,24 +1462,23 @@ const FlowDiagramNew = () => {
                         style={{ transition: "all 0.3s ease" }}
                       >
                         {/* All the node rendering code WITHOUT the tooltip */}
-                        {isPinnedNode && (
-                          <g
-                            transform={`translate(${
-                              currentWidth - 30
-                            }, ${-14})`}
-                          >
-                            <circle r="9" fill="#FACC15" />
-                            <text
-                              y="4"
-                              textAnchor="middle"
-                              fontSize="12"
-                              fontWeight="bold"
-                              fill="black"
-                            >
-                              📌
-                            </text>
-                          </g>
-                        )}
+{(() => {
+  // Check if this node is manually pinned (not just from Show Previous Layers)
+  const isManuallyPinned = isPinnedNode && (!showPreviousLayersNode || !(() => {
+    const nodePath = getPathToNode(node.id);
+    const nodeLayer = nodePath.length - 1;
+    const clickedPath = getPathToNode(showPreviousLayersNode);
+    const clickedLayer = clickedPath.length - 1;
+    return nodeLayer < clickedLayer; // It's in a previous layer
+  })());
+  
+  return isManuallyPinned && (
+    <g transform={`translate(${currentWidth - 30}, ${-14})`}>
+      <circle r="9" fill="#FACC15" />
+      <text y="4" textAnchor="middle" fontSize="12" fontWeight="bold" fill="black">📌</text>
+    </g>
+  );
+})()}
 
                         <g
                           onClick={(e) => {
@@ -2070,43 +2134,21 @@ const FlowDiagramNew = () => {
         </div>
       )}
 
-      {contextMenu && (
-        <div
-          className="fixed z-50 bg-white text-gray-900 rounded-lg shadow-xl border border-gray-300"
-          style={{ top: contextMenu.y, left: contextMenu.x }}
-          onClick={(e) => e.stopPropagation()}
-        >
-          <button
-            className="block px-4 py-2 hover:bg-gray-100 text-sm w-full text-left"
-            onClick={() => {
-              setPinnedPathNodes((prev) => {
-                const next = new Set(prev);
-                if (next.has(contextMenu.nodeId)) {
-                  next.delete(contextMenu.nodeId);
-                } else {
-                  next.add(contextMenu.nodeId);
-                }
-                return next;
-              });
-              setContextMenu(null);
-            }}
-          >
+{contextMenu && (
+        <div className="fixed z-50 bg-white text-gray-900 rounded-lg shadow-xl border border-gray-300" style={{ top: contextMenu.y, left: contextMenu.x }} onClick={(e) => e.stopPropagation()}>
+          <button className="block px-4 py-2 hover:bg-gray-100 text-sm w-full text-left" onClick={() => { setPinnedPathNodes((prev) => { const next = new Set(prev); if (next.has(contextMenu.nodeId)) { next.delete(contextMenu.nodeId); } else { next.add(contextMenu.nodeId); } return next; }); setContextMenu(null); }}>
             {pinnedPathNodes.has(contextMenu.nodeId) ? "Unpin This Path" : "Pin This Path"}
           </button>
           <div className="border-t border-gray-200"></div>
-          <button
-            className="block px-4 py-2 hover:bg-gray-100 text-sm w-full text-left text-orange-600 font-medium"
-            onClick={() => {
-              handleIsolateNode(contextMenu.nodeId);
-              setContextMenu(null);
-            }}
-          >
+          <button className="block px-4 py-2 hover:bg-gray-100 text-sm w-full text-left text-orange-600 font-medium" onClick={() => { handleIsolateNode(contextMenu.nodeId); setContextMenu(null); }}>
             {isolatedNodeId === contextMenu.nodeId ? "✓ Un-isolate This Node" : "Isolate This Node"}
           </button>
           <div className="border-t border-gray-200"></div>
-          <button className="block px-4 py-2 hover:bg-gray-100 text-sm w-full text-left text-red-600" onClick={() => setContextMenu(null)}>
-            Cancel
+          <button className="block px-4 py-2 hover:bg-gray-100 text-sm w-full text-left text-purple-600 font-medium" onClick={() => { handleShowPreviousLayers(contextMenu.nodeId); setContextMenu(null); }}>
+            {showPreviousLayersNode === contextMenu.nodeId ? "✓ Hide Previous Layers" : "Open Previous Layers"}
           </button>
+          <div className="border-t border-gray-200"></div>
+          <button className="block px-4 py-2 hover:bg-gray-100 text-sm w-full text-left text-red-600" onClick={() => setContextMenu(null)}>Cancel</button>
         </div>
       )}
     </div>
