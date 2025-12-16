@@ -40,6 +40,8 @@ const FlowDiagramNew = () => {
 const [prePreviousLayersState, setPrePreviousLayersState] = useState(null);
 const [miniMapPosition, setMiniMapPosition] = useState({ x: window.innerWidth - 300, y: window.innerHeight - 220 });
 const [isDraggingMiniMap, setIsDraggingMiniMap] = useState(false);
+const [pinnedLayers, setPinnedLayers] = useState(new Set());
+
   const miniMapRef = useRef(null);
   const viewportDragRef = useRef({
     isDragging: false,
@@ -96,21 +98,21 @@ const miniMapDragRef = useRef({ isDragging: false, startX: 0, startY: 0, startPo
   useEffect(() => {
     if (!rootNode) return;
 
-    const snapshot = {
-      expandedNodes: Array.from(expandedNodes),
-      activeNode,
-      currentPath: [...currentPath],
-      hiddenNodes: Array.from(hiddenNodes),
-      selectedToHide: Array.from(selectedToHide),
-      showSelectedMode,
-      zoom,
-      searchTerm,
-      showAllGraph,
-      pinnedPathNodes: Array.from(pinnedPathNodes),
-      isolatedNodeId,
-        showPreviousLayersNode,
-
-    };
+   const snapshot = {
+  expandedNodes: Array.from(expandedNodes),
+  activeNode,
+  currentPath: [...currentPath],
+  hiddenNodes: Array.from(hiddenNodes),
+  selectedToHide: Array.from(selectedToHide),
+  showSelectedMode,
+  zoom,
+  searchTerm,
+  showAllGraph,
+  pinnedPathNodes: Array.from(pinnedPathNodes),
+  isolatedNodeId,
+  showPreviousLayersNode,
+  pinnedLayers: Array.from(pinnedLayers),
+};
 
     if (!hasInitializedHistoryRef.current) {
       historyRef.current = [snapshot];
@@ -174,6 +176,7 @@ const miniMapDragRef = useRef({ isDragging: false, startX: 0, startY: 0, startPo
           : null
       );
       setShowPreviousLayersNode(previousState.showPreviousLayersNode !== undefined ? previousState.showPreviousLayersNode : null);
+      setPinnedLayers(new Set(previousState.pinnedLayers || []));
 
       setCurrentHistoryIndex(newIndex);
     }
@@ -204,6 +207,7 @@ const miniMapDragRef = useRef({ isDragging: false, startX: 0, startY: 0, startPo
         nextState.isolatedNodeId !== undefined ? nextState.isolatedNodeId : null
       );
       setShowPreviousLayersNode(nextState.showPreviousLayersNode !== undefined ? nextState.showPreviousLayersNode : null);
+      setPinnedLayers(new Set(nextState.pinnedLayers || []));
 
       setCurrentHistoryIndex(newIndex);
     }
@@ -576,6 +580,7 @@ const miniMapDragRef = useRef({ isDragging: false, startX: 0, startY: 0, startPo
     setPreIsolateState(null);
     setShowPreviousLayersNode(null);
     setPrePreviousLayersState(null);
+    setPinnedLayers(new Set());
   };
   const scrollToNode = (nodeId) => {
     const pos = nodePositions[nodeId];
@@ -730,6 +735,25 @@ const miniMapDragRef = useRef({ isDragging: false, startX: 0, startY: 0, startPo
     setTimeout(() => scrollToNode(nodeId), 100);
   };
 
+      // Pin/Unpin entire layer
+  const handleTogglePinLayer = (nodeId) => {
+    // Get the layer number of the clicked node
+    const nodePath = getPathToNode(nodeId);
+    const layerNumber = nodePath.length - 1;
+
+    setPinnedLayers((prev) => {
+      const next = new Set(prev);
+      if (next.has(layerNumber)) {
+        // Unpin the layer
+        next.delete(layerNumber);
+      } else {
+        // Pin the layer
+        next.add(layerNumber);
+      }
+      return next;
+    });
+  };
+
   const handleHidePreviousLayers = () => {
     if (!prePreviousLayersState) {
       // Fallback: just clear the flag
@@ -830,15 +854,12 @@ const miniMapDragRef = useRef({ isDragging: false, startX: 0, startY: 0, startPo
 
   const leafLayer = getMaxLayer();
 
-  Object.entries(nodesByLayer).forEach(([layer, nodeIds]) => {
+ Object.entries(nodesByLayer).forEach(([layer, nodeIds]) => {
     const layerNum = parseInt(layer);
     const isLayerHovered = nodeIds.some((nodeId) => hoveredNode === nodeId);
+    const isLayerPinned = pinnedLayers.has(layerNum);
 
-    const shouldCollapseThisLayer =
-      (!showAllGraph || (showAllGraph && collapseAllVisual)) &&
-      !isLayerHovered &&
-      layerNum !== rootLayer &&
-      layerNum !== leafLayer;
+    const shouldCollapseThisLayer = (!showAllGraph || (showAllGraph && collapseAllVisual)) && !isLayerHovered && !isLayerPinned && layerNum !== rootLayer && layerNum !== leafLayer;
 
     if (shouldCollapseThisLayer) {
       collapsedLayers.add(layerNum);
@@ -1269,7 +1290,7 @@ const handleMiniMapDragEnd = () => {
                   disabled={pinnedPathNodes.size === 0}
                   className="flex items-center gap-1 px-2 py-1 bg-yellow-500 hover:bg-yellow-600 disabled:bg-gray-600 text-xs rounded"
                 >
-                  Clear Pins
+                  Clear Pined Paths
                 </button>
                 <button
                   onClick={handleUnisolate}
@@ -2193,6 +2214,14 @@ const handleMiniMapDragEnd = () => {
           <button className="block px-4 py-2 hover:bg-gray-100 text-sm w-full text-left" onClick={() => { setPinnedPathNodes((prev) => { const next = new Set(prev); if (next.has(contextMenu.nodeId)) { next.delete(contextMenu.nodeId); } else { next.add(contextMenu.nodeId); } return next; }); setContextMenu(null); }}>
             {pinnedPathNodes.has(contextMenu.nodeId) ? "Unpin This Path" : "Pin This Path"}
           </button>
+             <div className="border-t border-gray-200"></div>
+          <button className="block px-4 py-2 hover:bg-gray-100 text-sm w-full text-left text-cyan-600 font-medium" onClick={() => { handleTogglePinLayer(contextMenu.nodeId); setContextMenu(null); }}>
+            {(() => {
+              const nodePath = getPathToNode(contextMenu.nodeId);
+              const layerNum = nodePath.length - 1;
+              return pinnedLayers.has(layerNum) ? "✓ Unpin This Layer" : "📍 Pin This Layer";
+            })()}
+          </button>
           <div className="border-t border-gray-200"></div>
           <button className="block px-4 py-2 hover:bg-gray-100 text-sm w-full text-left text-orange-600 font-medium" onClick={() => { handleIsolateNode(contextMenu.nodeId); setContextMenu(null); }}>
             {isolatedNodeId === contextMenu.nodeId ? "✓ Un-isolate This Node" : "Isolate This Node"}
@@ -2201,6 +2230,10 @@ const handleMiniMapDragEnd = () => {
           <button className="block px-4 py-2 hover:bg-gray-100 text-sm w-full text-left text-purple-600 font-medium" onClick={() => { handleShowPreviousLayers(contextMenu.nodeId); setContextMenu(null); }}>
             {showPreviousLayersNode === contextMenu.nodeId ? "✓ Hide Previous Layers" : "Open Previous Layers"}
           </button>
+          <div className="border-t border-gray-200"></div>
+          <button onClick={() => setPinnedLayers(new Set())} disabled={pinnedLayers.size === 0} className="flex items-center gap-1 px-2 py-1 bg-cyan-600 hover:bg-cyan-700 disabled:bg-gray-600 text-xs rounded">
+                  Unpin Layers ({pinnedLayers.size})
+                </button>
           <div className="border-t border-gray-200"></div>
           <button className="block px-4 py-2 hover:bg-gray-100 text-sm w-full text-left text-red-600" onClick={() => setContextMenu(null)}>Cancel</button>
         </div>
