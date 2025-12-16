@@ -697,7 +697,6 @@ const miniMapDragRef = useRef({ isDragging: false, startX: 0, startY: 0, startPo
   };
 // Show/Hide Previous Layers functionality
 // Show/Hide Previous Layers functionality
-// Show/Hide Previous Layers functionality
   const handleShowPreviousLayers = (nodeId) => {
     if (showPreviousLayersNode === nodeId) {
       // Toggle off: restore previous state
@@ -707,35 +706,44 @@ const miniMapDragRef = useRef({ isDragging: false, startX: 0, startY: 0, startPo
 
     // Save current state
     setPrePreviousLayersState({
-      pinnedPathNodes: new Set(pinnedPathNodes),
+      pinnedLayers: new Set(pinnedLayers),
     });
 
     // Get the layer number of the clicked node
     const nodePath = getPathToNode(nodeId);
     const clickedNodeLayer = nodePath.length - 1;
 
-    // Get ALL nodes from root layer up to (but NOT including) the clicked node's layer
-    const nodesToPin = new Set(pinnedPathNodes); // Keep existing pins
+    // Pin all layers BEFORE the clicked node's layer
+    const layersToPin = new Set(pinnedLayers); // Keep existing pinned layers
     
-    graphData.nodes.forEach((node) => {
-      const path = getPathToNode(node.id);
-      const layer = path.length - 1;
-      
-      // Pin all nodes in layers BEFORE the clicked node's layer
-      if (layer < clickedNodeLayer) {
-        nodesToPin.add(node.id);
-      }
-    });
+    for (let layer = 0; layer < clickedNodeLayer; layer++) {
+      layersToPin.add(layer);
+    }
 
-    // Update pinned nodes to force previous layers to stay open
-    setPinnedPathNodes(nodesToPin);
+    // Update pinned layers to force previous layers to stay open
+    setPinnedLayers(layersToPin);
     setShowPreviousLayersNode(nodeId);
+    setActiveNode(nodeId);
+    setCurrentPath(getPathToNode(nodeId));
     
     // Scroll to the node
     setTimeout(() => scrollToNode(nodeId), 100);
   };
 
-      // Pin/Unpin entire layer
+  const handleHidePreviousLayers = () => {
+    if (!prePreviousLayersState) {
+      // Fallback: just clear the flag
+      setShowPreviousLayersNode(null);
+      return;
+    }
+
+    // Restore the previous pinned layers state (shrink back)
+    setPinnedLayers(prePreviousLayersState.pinnedLayers);
+    setShowPreviousLayersNode(null);
+    setPrePreviousLayersState(null);
+  };
+
+        // Pin/Unpin entire layer
   const handleTogglePinLayer = (nodeId) => {
     // Get the layer number of the clicked node
     const nodePath = getPathToNode(nodeId);
@@ -752,19 +760,6 @@ const miniMapDragRef = useRef({ isDragging: false, startX: 0, startY: 0, startPo
       }
       return next;
     });
-  };
-
-  const handleHidePreviousLayers = () => {
-    if (!prePreviousLayersState) {
-      // Fallback: just clear the flag
-      setShowPreviousLayersNode(null);
-      return;
-    }
-
-    // Restore the previous pinned state (shrink back)
-    setPinnedPathNodes(prePreviousLayersState.pinnedPathNodes);
-    setShowPreviousLayersNode(null);
-    setPrePreviousLayersState(null);
   };
   // ========== IMPORTANT: layout constants (moved up to avoid TDZ errors) ==========
   const nodeHeight = 70;
@@ -1285,23 +1280,17 @@ const handleMiniMapDragEnd = () => {
                   <Undo className="w-3 h-3 rotate-180" />
                   Redo
                 </button>
-                <button
-                  onClick={() => setPinnedPathNodes(new Set())}
-                  disabled={pinnedPathNodes.size === 0}
-                  className="flex items-center gap-1 px-2 py-1 bg-yellow-500 hover:bg-yellow-600 disabled:bg-gray-600 text-xs rounded"
-                >
-                  Clear Pined Paths
-                </button>
-                <button
-                  onClick={handleUnisolate}
-                  disabled={!isolatedNodeId}
-                  className="flex items-center gap-1 px-2 py-1 bg-orange-600 hover:bg-orange-700 disabled:bg-gray-600 text-xs rounded"
-                >
+                {!showPreviousLayersNode && (
+                  <button onClick={() => setPinnedPathNodes(new Set())} disabled={pinnedPathNodes.size === 0} className="flex items-center gap-1 px-2 py-1 bg-yellow-500 hover:bg-yellow-600 disabled:bg-gray-600 text-xs rounded">Clear Pined Paths</button>
+                )}
+                <button onClick={handleUnisolate} disabled={!isolatedNodeId} className="flex items-center gap-1 px-2 py-1 bg-orange-600 hover:bg-orange-700 disabled:bg-gray-600 text-xs rounded">
                   Un-isolate
                 </button>
-                                <button onClick={handleHidePreviousLayers} disabled={!showPreviousLayersNode} className="flex items-center gap-1 px-2 py-1 bg-purple-600 hover:bg-purple-700 disabled:bg-gray-600 text-xs rounded">
-                  Shrink Prev Layers
-                </button>
+                {showPreviousLayersNode && (
+                  <button onClick={handleHidePreviousLayers} className="flex items-center gap-1 px-2 py-1 bg-purple-600 hover:bg-purple-700 text-xs rounded">
+                    Shrink Prev Layers
+                  </button>
+                )}
                 <button
                   onClick={() => setMiniMapVisible(!miniMapVisible)}
                   className="flex items-center gap-1 px-2 py-1 bg-teal-600 hover:bg-teal-700 text-xs rounded"
@@ -1446,10 +1435,8 @@ const handleMiniMapDragEnd = () => {
                   const isInPath =
                     currentPath.includes(edge.source) &&
                     currentPath.includes(edge.target);
-                  const isInPinnedPath = isEdgeInPinnedPath(
-                    edge.source,
-                    edge.target
-                  );
+                  const isInPinnedPath = showPreviousLayersNode ? false : isEdgeInPinnedPath(edge.source, edge.target);
+
 
                   const sourcePath = getPathToNode(edge.source);
                   const sourceLayer = sourcePath.length - 1;
@@ -1510,7 +1497,7 @@ const handleMiniMapDragEnd = () => {
                     const isLayerCollapsed = collapsedLayers.has(nodeLayer);
 
                     const isNodeInCurrentPath = currentPath.includes(node.id);
-                    const isPinnedNode = pinnedPathNodes.has(node.id);
+    const isPinnedNode = showPreviousLayersNode ? false : pinnedPathNodes.has(node.id);
 
                     const forceFullSizeForThisNode =
                       (hoveredNode === activeNode && isNodeInCurrentPath) ||
@@ -1760,7 +1747,7 @@ const handleMiniMapDragEnd = () => {
                     const isLayerCollapsed = collapsedLayers.has(nodeLayer);
 
                     const isNodeInCurrentPath = currentPath.includes(node.id);
-                    const isPinnedNode = pinnedPathNodes.has(node.id);
+    const isPinnedNode = showPreviousLayersNode ? false : pinnedPathNodes.has(node.id);
 
                     const forceFullSizeForThisNode =
                       (hoveredNode === activeNode && isNodeInCurrentPath) ||
