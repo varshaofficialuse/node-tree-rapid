@@ -38,6 +38,8 @@ const FlowDiagramNew = () => {
   const [isDraggingViewport, setIsDraggingViewport] = useState(false);
  const [showPreviousLayersNode, setShowPreviousLayersNode] = useState(null);
 const [prePreviousLayersState, setPrePreviousLayersState] = useState(null);
+const [miniMapPosition, setMiniMapPosition] = useState({ x: window.innerWidth - 300, y: window.innerHeight - 220 });
+const [isDraggingMiniMap, setIsDraggingMiniMap] = useState(false);
   const miniMapRef = useRef(null);
   const viewportDragRef = useRef({
     isDragging: false,
@@ -46,7 +48,7 @@ const [prePreviousLayersState, setPrePreviousLayersState] = useState(null);
     startScrollX: 0,
     startScrollY: 0,
   });
-
+const miniMapDragRef = useRef({ isDragging: false, startX: 0, startY: 0, startPosX: 0, startPosY: 0 });
   const historyRef = useRef([]);
   const [currentHistoryIndex, setCurrentHistoryIndex] = useState(0);
   const isRestoringRef = useRef(false);
@@ -776,10 +778,14 @@ const [prePreviousLayersState, setPrePreviousLayersState] = useState(null);
     maxNodesInLayer * (nodeHeight + nodeSpacing) + 400;
 
   // Attach global mouse move and up handlers for viewport dragging
+ // Attach global mouse move and up handlers for viewport dragging
   useEffect(() => {
     const handleMouseMove = (e) => {
       if (viewportDragRef.current.isDragging) {
         handleViewportDragMove(e);
+      }
+      if (miniMapDragRef.current.isDragging) {
+        handleMiniMapDragMove(e);
       }
     };
 
@@ -787,16 +793,19 @@ const [prePreviousLayersState, setPrePreviousLayersState] = useState(null);
       if (viewportDragRef.current.isDragging) {
         handleViewportDragEnd();
       }
+      if (miniMapDragRef.current.isDragging) {
+        handleMiniMapDragEnd();
+      }
     };
 
-    window.addEventListener("mousemove", handleMouseMove);
-    window.addEventListener("mouseup", handleMouseUp);
+    window.addEventListener('mousemove', handleMouseMove);
+    window.addEventListener('mouseup', handleMouseUp);
 
     return () => {
-      window.removeEventListener("mousemove", handleMouseMove);
-      window.removeEventListener("mouseup", handleMouseUp);
+      window.removeEventListener('mousemove', handleMouseMove);
+      window.removeEventListener('mouseup', handleMouseUp);
     };
-  }, [zoom, canvasWidth, canvasHeight]);
+  }, [zoom, canvasWidth, canvasHeight, miniMapPosition]);
 
   const visibleNodes = visibleNodeIds.map((id) => nodeMap[id]).filter(Boolean);
 
@@ -1024,7 +1033,52 @@ const [prePreviousLayersState, setPrePreviousLayersState] = useState(null);
     viewportDragRef.current.isDragging = false;
     setIsDraggingViewport(false);
   };
+// Handle minimap window drag
+const handleMiniMapDragStart = (e) => {
+  // Only start drag if clicking on header
+  if (!e.target.closest('.minimap-header')) return;
+  
+  e.preventDefault();
+  e.stopPropagation();
+  
+  miniMapDragRef.current = {
+    isDragging: true,
+    startX: e.clientX,
+    startY: e.clientY,
+    startPosX: miniMapPosition.x,
+    startPosY: miniMapPosition.y
+  };
+  
+  setIsDraggingMiniMap(true);
+};
 
+const handleMiniMapDragMove = (e) => {
+  if (!miniMapDragRef.current.isDragging) return;
+  
+  e.preventDefault();
+  
+  const deltaX = e.clientX - miniMapDragRef.current.startX;
+  const deltaY = e.clientY - miniMapDragRef.current.startY;
+  
+  const newX = miniMapDragRef.current.startPosX + deltaX;
+  const newY = miniMapDragRef.current.startPosY + deltaY;
+  
+  // Keep minimap within viewport bounds
+  const minX = 0;
+  const minY = 0;
+  const maxX = window.innerWidth - 280;
+  const maxY = window.innerHeight - 200;
+  
+  setMiniMapPosition({
+    x: Math.max(minX, Math.min(maxX, newX)),
+    y: Math.max(minY, Math.min(maxY, newY))
+  });
+};
+
+const handleMiniMapDragEnd = () => {
+  miniMapDragRef.current.isDragging = false;
+  setIsDraggingMiniMap(false);
+};
   return (
     <div
       className="min-h-screen flex bg-gray-100"
@@ -1945,29 +1999,29 @@ const [prePreviousLayersState, setPrePreviousLayersState] = useState(null);
       </div>
 
       {/* MINI-MAP NAVIGATOR */}
-      {miniMapVisible && (
-<div
-  ref={miniMapRef}
-  className="fixed bottom-6 bg-white border-2 border-gray-300 rounded-lg shadow-2xl overflow-hidden select-none transition-all duration-300"
-  style={{
-    width: "280px",
-    height: "200px",
-    left: sidebarOpen ? "300px" : "60px", // moves based on sidebar width
-    zIndex: 40,
-  }}
-  onWheel={handleMiniMapWheel}
->
-
-          {/* Mini-map header */}
-          <div className="bg-gray-100 border-b border-gray-300 px-3 py-2 flex items-center justify-between">
-            <span className="text-xs font-semibold text-gray-700">Navigator</span>
-            <button
-              onClick={() => setMiniMapVisible(false)}
-              className="text-gray-500 hover:text-gray-700"
-            >
-              <span className="text-lg leading-none">×</span>
-            </button>
-          </div>
+{/* MINI-MAP NAVIGATOR */}
+{miniMapVisible && (
+  <div 
+    ref={miniMapRef}
+    className="fixed bg-white border-2 border-gray-300 rounded-lg shadow-2xl overflow-hidden select-none" 
+    style={{ 
+      width: '280px', 
+      height: '200px', 
+      zIndex: 40,
+      left: `${miniMapPosition.x}px`,
+      top: `${miniMapPosition.y}px`,
+      cursor: isDraggingMiniMap ? 'grabbing' : 'default'
+    }}
+    onWheel={handleMiniMapWheel}
+    onMouseDown={handleMiniMapDragStart}
+  >
+    {/* Mini-map header */}
+    <div className="minimap-header bg-gray-100 border-b border-gray-300 px-3 py-2 flex items-center justify-between cursor-grab active:cursor-grabbing">
+      <span className="text-xs font-semibold text-gray-700">📍 Navigator (Drag to Move)</span>
+      <button onClick={(e) => { e.stopPropagation(); setMiniMapVisible(false); }} className="text-gray-500 hover:text-gray-700">
+        <span className="text-lg leading-none">×</span>
+      </button>
+    </div>
 
           {/* Mini-map canvas */}
           <div
