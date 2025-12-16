@@ -1101,7 +1101,7 @@ const [prePreviousLayersState, setPrePreviousLayersState] = useState(null);
                       ? handleShowSingleSearchResult()
                       : handleShowAllSearchResults()
                   }
-                  className="mt-1 text-xs text-teal-200 hover:text-teal-100"
+                  className="mt-1 text-xs text-gary hover:text-teal-100"
                 >
                   {showAllSearchResults
                     ? "Show current only"
