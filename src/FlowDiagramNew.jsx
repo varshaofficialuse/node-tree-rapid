@@ -88,12 +88,14 @@ const miniMapDragRef = useRef({ isDragging: false, startX: 0, startY: 0, startPo
   };
 
   const rootNode = findRootNode();
-
-  useEffect(() => {
-    if (rootNode && expandedNodes.size === 0 && !showAllGraph) {
-      setExpandedNodes(new Set([rootNode.id]));
+// Effective root: use isolated node as root when isolation is active
+const effectiveRoot = isolatedNodeId ? nodeMap[isolatedNodeId] : rootNode;
+const effectiveRootId = effectiveRoot?.id;
+useEffect(() => {
+    if (effectiveRootId && expandedNodes.size === 0 && !showAllGraph) {
+      setExpandedNodes(new Set([effectiveRootId]));
     }
-  }, [rootNode, expandedNodes.size, showAllGraph]);
+  }, [effectiveRootId, expandedNodes.size, showAllGraph, isolatedNodeId]);
 
   useEffect(() => {
     if (!rootNode) return;
@@ -404,12 +406,13 @@ const miniMapDragRef = useRef({ isDragging: false, startX: 0, startY: 0, startPo
     }
   };
 
-  const addMoreLayers = () => {
-    if (!activeNode) return;
+const addMoreLayers = () => {
+    const baseNode = isolatedNodeId || activeNode;
+    if (!baseNode) return;
 
     const newExpanded = new Set(expandedNodes);
     const visibleDescendants = [];
-    const queue = [activeNode];
+    const queue = [baseNode];
     const visited = new Set();
 
     while (queue.length > 0) {
@@ -439,17 +442,26 @@ const miniMapDragRef = useRef({ isDragging: false, startX: 0, startY: 0, startPo
     setExpandedNodes(newExpanded);
   };
 
-  const toggleShowAll = () => {
+const toggleShowAll = () => {
     setHiddenNodes(new Set());
     setSelectedToHide(new Set());
     setShowSelectedMode(false);
 
-    const allNodes = new Set(graphData.nodes.map((n) => n.id));
-
     if (!showAllGraph) {
-      setExpandedNodes(allNodes);
-      setActiveNode(rootNode?.id || null);
-      setCurrentPath(rootNode ? [rootNode.id] : []);
+      // When isolated, show all only within isolated subtree
+      if (isolatedNodeId) {
+        const descendants = getAllDescendants(isolatedNodeId);
+        const allInSubtree = new Set([isolatedNodeId, ...descendants]);
+        setExpandedNodes(allInSubtree);
+        setActiveNode(isolatedNodeId);
+        setCurrentPath([isolatedNodeId]);
+      } else {
+        // Normal: show all nodes
+        const allNodes = new Set(graphData.nodes.map((n) => n.id));
+        setExpandedNodes(allNodes);
+        setActiveNode(effectiveRootId);
+        setCurrentPath(effectiveRootId ? [effectiveRootId] : []);
+      }
       setShowAllGraph(true);
       setCollapseAllVisual(false);
     } else if (!collapseAllVisual) {
@@ -486,9 +498,15 @@ const miniMapDragRef = useRef({ isDragging: false, startX: 0, startY: 0, startPo
     setSearchResults(matchedNodes);
     setCurrentSearchIndex(0);
 
-    if (!showAllSearchResults) {
+if (!showAllSearchResults) {
       const firstMatch = matchedNodes[0];
       const path = getPathToNode(firstMatch.id);
+      
+      // If isolated, ignore results outside isolated subtree
+      if (isolatedNodeId && !path.includes(isolatedNodeId)) {
+        return;
+      }
+      
       const newExpanded = new Set(path);
       setExpandedNodes(newExpanded);
       setActiveNode(firstMatch.id);
@@ -498,7 +516,7 @@ const miniMapDragRef = useRef({ isDragging: false, startX: 0, startY: 0, startPo
     }
   };
 
-  const handleNextSearchResult = () => {
+ const handleNextSearchResult = () => {
     if (searchResults.length === 0) return;
 
     const nextIndex = (currentSearchIndex + 1) % searchResults.length;
@@ -506,31 +524,42 @@ const miniMapDragRef = useRef({ isDragging: false, startX: 0, startY: 0, startPo
 
     const matchedNode = searchResults[nextIndex];
     const path = getPathToNode(matchedNode.id);
+    
+    // If isolated, ignore results outside isolated subtree
+    if (isolatedNodeId && !path.includes(isolatedNodeId)) {
+      return;
+    }
+    
     const newExpanded = new Set(path);
 
     setExpandedNodes(newExpanded);
     setActiveNode(matchedNode.id);
     setCurrentPath(path);
-
+    
     // Auto-scroll to the search result
     setTimeout(() => scrollToNode(matchedNode.id), 100);
   };
 
-  const handlePreviousSearchResult = () => {
+ const handlePreviousSearchResult = () => {
     if (searchResults.length === 0) return;
 
-    const prevIndex =
-      currentSearchIndex === 0 ? searchResults.length - 1 : currentSearchIndex - 1;
+    const prevIndex = currentSearchIndex === 0 ? searchResults.length - 1 : currentSearchIndex - 1;
     setCurrentSearchIndex(prevIndex);
 
     const matchedNode = searchResults[prevIndex];
     const path = getPathToNode(matchedNode.id);
+    
+    // If isolated, ignore results outside isolated subtree
+    if (isolatedNodeId && !path.includes(isolatedNodeId)) {
+      return;
+    }
+    
     const newExpanded = new Set(path);
 
     setExpandedNodes(newExpanded);
     setActiveNode(matchedNode.id);
     setCurrentPath(path);
-
+    
     // Auto-scroll to the search result
     setTimeout(() => scrollToNode(matchedNode.id), 100);
   };
@@ -557,6 +586,12 @@ const miniMapDragRef = useRef({ isDragging: false, startX: 0, startY: 0, startPo
 
     const matchedNode = searchResults[currentSearchIndex];
     const path = getPathToNode(matchedNode.id);
+    
+    // If isolated, ignore results outside isolated subtree
+    if (isolatedNodeId && !path.includes(isolatedNodeId)) {
+      return;
+    }
+    
     const newExpanded = new Set(path);
 
     setExpandedNodes(newExpanded);
@@ -569,15 +604,14 @@ const miniMapDragRef = useRef({ isDragging: false, startX: 0, startY: 0, startPo
     setHiddenNodes(new Set());
     setSelectedToHide(new Set());
     setShowSelectedMode(false);
-    setExpandedNodes(new Set([rootNode.id]));
-    setActiveNode(null);
-    setCurrentPath([]);
+    setExpandedNodes(new Set([effectiveRootId]));
+    setActiveNode(isolatedNodeId || null);
+    setCurrentPath(isolatedNodeId ? [isolatedNodeId] : []);
     setSearchTerm("");
     setShowAllGraph(false);
     setZoom(100);
     setPinnedPathNodes(new Set());
-    setIsolatedNodeId(null);
-    setPreIsolateState(null);
+    // Don't clear isolation on reset - keep it active
     setShowPreviousLayersNode(null);
     setPrePreviousLayersState(null);
     setPinnedLayers(new Set());
