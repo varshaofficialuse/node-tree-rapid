@@ -234,7 +234,7 @@ useEffect(() => {
     };
   }, [miniMapVisible, zoom]);
 
-  useEffect(() => {
+useEffect(() => {
     const handleKeyDown = (e) => {
       if ((e.ctrlKey || e.metaKey) && e.key === "z" && !e.shiftKey) {
         e.preventDefault();
@@ -245,12 +245,16 @@ useEffect(() => {
         e.preventDefault();
         handleRedo();
       }
+
+      // Close context menu on Escape
+      if (e.key === "Escape" && contextMenu) {
+        setContextMenu(null);
+      }
     };
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [handleUndo, handleRedo]);
-
+  }, [handleUndo, handleRedo, contextMenu]);
   const getPathToNode = (nodeId) => {
     const path = [];
     let current = nodeId;
@@ -360,26 +364,17 @@ useEffect(() => {
     setSelectedToHide(new Set());
   };
 
-  const handleNodeRightClick = (e, nodeId) => {
+const handleNodeRightClick = (e, nodeId) => {
     e.preventDefault();
+    e.stopPropagation();
 
-    if (nodeId === activeNode) {
-      setContextMenu({
-        x: e.clientX,
-        y: e.clientY,
-        nodeId,
-      });
-      return;
-    }
-
-    setSelectedToHide((prev) => {
-      const next = new Set(prev);
-      if (next.has(nodeId)) next.delete(nodeId);
-      else next.add(nodeId);
-      return next;
+    // Always show context menu on right-click
+    setContextMenu({
+      x: e.clientX,
+      y: e.clientY,
+      nodeId,
     });
   };
-
   const toggleSelectNode = (nodeId) => {
     setSelectedToHide((prev) => {
       const next = new Set(prev);
@@ -1547,16 +1542,16 @@ const handleMiniMapDragEnd = () => {
                         : nodeWidth;
 
                     return (
-                      <g
-                        key={node.id}
-                        transform={`translate(${pos.x}, ${pos.y})`}
-                        onClick={() => handleNodeClick(node.id)}
-                        onContextMenu={(e) => handleNodeRightClick(e, node.id)}
-                        onMouseEnter={() => setHoveredNode(node.id)}
-                        onMouseLeave={() => setHoveredNode(null)}
-                        className="cursor-pointer"
-                        style={{ transition: "all 0.3s ease" }}
-                      >
+<g 
+  key={node.id} 
+  transform={`translate(${pos.x}, ${pos.y})`} 
+  onClick={() => handleNodeClick(node.id)} 
+  onContextMenu={(e) => handleNodeRightClick(e, node.id)} 
+  onMouseEnter={() => setHoveredNode(node.id)} 
+  onMouseLeave={() => setHoveredNode(null)} 
+  className="cursor-pointer" 
+  style={{ transition: "all 0.2s ease-out" }}
+>
                         {/* All the node rendering code WITHOUT the tooltip */}
 {(() => {
   // Check if this node is manually pinned (not just from Show Previous Layers)
@@ -1576,32 +1571,15 @@ const handleMiniMapDragEnd = () => {
   );
 })()}
 
-                        <g
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            toggleSelectNode(node.id);
-                          }}
-                        >
-                          <circle
-                            cx={currentWidth - 10}
-                            cy={10}
-                            r={8}
-                            fill={isSelectedToHide ? "#22C55E" : "#1F2937"}
-                            stroke="#22C55E"
-                            strokeWidth="2"
-                          />
-                          <text
-                            x={currentWidth - 10}
-                            y={14}
-                            textAnchor="middle"
-                            fontSize="10"
-                            fill="white"
-                            fontWeight="bold"
-                            className="pointer-events-none"
-                          >
-                            {isSelectedToHide ? "✓" : "+"}
-                          </text>
-                        </g>
+<g 
+  onClick={(e) => { e.stopPropagation(); toggleSelectNode(node.id); }}
+  onContextMenu={(e) => { e.stopPropagation(); }}
+  className="cursor-pointer"
+  style={{ pointerEvents: 'all' }}
+>
+  <circle cx={currentWidth - 10} cy={10} r={10} fill={isSelectedToHide ? "#22C55E" : "#374151"} stroke={isSelectedToHide ? "#16A34A" : "#6B7280"} strokeWidth="2" opacity={isSelectedToHide ? 1 : 0.7} />
+  <text x={currentWidth - 10} y={14} textAnchor="middle" fontSize="11" fill="white" fontWeight="bold" className="pointer-events-none">{isSelectedToHide ? "✓" : "+"}</text>
+</g>
 
                         {isSelectedToHide && (
                           <rect
@@ -1661,29 +1639,17 @@ const handleMiniMapDragEnd = () => {
                           </>
                         )}
 
-                        <rect
-                          width={currentWidth}
-                          height={nodeHeight}
-                          rx="6"
-                          fill={color}
-                          stroke={
-                            isInPath
-                              ? "#FBBF24"
-                              : isPinnedNode
-                              ? "#FACC15"
-                              : "white"
-                          }
-                          strokeWidth={isInPath ? 3 : 2}
-                          className="drop-shadow-lg"
-                          filter={
-                            isSearchResult
-                              ? "url(#greenGlow)"
-                              : isPinnedNode
-                              ? "url(#greenGlow)"
-                              : "none"
-                          }
-                          style={{ transition: "all 0.3s ease" }}
-                        />
+                     <rect 
+  width={currentWidth} 
+  height={nodeHeight} 
+  rx="6" 
+  fill={color} 
+  stroke={isInPath ? "#FBBF24" : isPinnedNode ? "#FACC15" : "white"} 
+  strokeWidth={isInPath ? 3 : 2} 
+  className="drop-shadow-lg" 
+  filter={isSearchResult ? "url(#greenGlow)" : isPinnedNode ? "url(#greenGlow)" : "none"} 
+  style={{ transition: "all 0.2s ease-out", opacity: isHovered ? 1 : 0.95 }} 
+/>
 
                         {currentWidth === nodeWidth && (
                           <text
@@ -1853,19 +1819,12 @@ const handleMiniMapDragEnd = () => {
                           </text>
                         </g>
 
-                        {isSelectedToHide && (
-                          <rect
-                            x="-6"
-                            y="-6"
-                            width={currentWidth + 12}
-                            height={nodeHeight + 12}
-                            rx="8"
-                            fill="none"
-                            stroke="#22C55E"
-                            strokeWidth="3"
-                            strokeDasharray="5 3"
-                          />
-                        )}
+{isSelectedToHide && (
+  <>
+    <rect x="-8" y="-8" width={currentWidth + 16} height={nodeHeight + 16} rx="10" fill="rgba(34, 197, 94, 0.1)" />
+    <rect x="-6" y="-6" width={currentWidth + 12} height={nodeHeight + 12} rx="8" fill="none" stroke="#22C55E" strokeWidth="3" strokeDasharray="8 4" className="animate-pulse" />
+  </>
+)}
 
                         {(isActive || isInPath) && !isSearchResult && (
                           <rect
@@ -1911,29 +1870,17 @@ const handleMiniMapDragEnd = () => {
                           </>
                         )}
 
-                        <rect
-                          width={currentWidth}
-                          height={nodeHeight}
-                          rx="6"
-                          fill={color}
-                          stroke={
-                            isInPath
-                              ? "#FBBF24"
-                              : isPinnedNode
-                              ? "#FACC15"
-                              : "white"
-                          }
-                          strokeWidth={isInPath ? 3 : 2}
-                          className="drop-shadow-lg"
-                          filter={
-                            isSearchResult
-                              ? "url(#greenGlow)"
-                              : isPinnedNode
-                              ? "url(#greenGlow)"
-                              : "none"
-                          }
-                          style={{ transition: "all 0.3s ease" }}
-                        />
+                   <rect 
+  width={currentWidth} 
+  height={nodeHeight} 
+  rx="6" 
+  fill={color} 
+  stroke={isInPath ? "#FBBF24" : isPinnedNode ? "#FACC15" : "white"} 
+  strokeWidth={isInPath ? 3 : 2} 
+  className="drop-shadow-lg" 
+  filter={isSearchResult ? "url(#greenGlow)" : isPinnedNode ? "url(#greenGlow)" : "none"} 
+  style={{ transition: "all 0.2s ease-out", opacity: isHovered ? 1 : 0.95 }} 
+/>
 
                         {currentWidth === nodeWidth && (
                           <text
@@ -2230,10 +2177,21 @@ const handleMiniMapDragEnd = () => {
         </div>
       )}
 
-{contextMenu && (
-        <div className="fixed z-50 bg-white text-gray-900 rounded-lg shadow-xl border border-gray-300" style={{ top: contextMenu.y, left: contextMenu.x }} onClick={(e) => e.stopPropagation()}>
+{contextMenu && (() => {
+  // Ensure context menu stays within viewport
+  const menuWidth = 240;
+  const menuHeight = 280;
+  const x = contextMenu.x + menuWidth > window.innerWidth ? window.innerWidth - menuWidth - 10 : contextMenu.x;
+  const y = contextMenu.y + menuHeight > window.innerHeight ? window.innerHeight - menuHeight - 10 : contextMenu.y;
+  
+  return (
+        <div className="fixed z-50 bg-white text-gray-900 rounded-lg shadow-xl border border-gray-300" style={{ top: y, left: x, minWidth: '220px' }} onClick={(e) => e.stopPropagation()}>
+          <button className="block px-4 py-2 hover:bg-gray-100 text-sm w-full text-left" onClick={() => { toggleSelectNode(contextMenu.nodeId); setContextMenu(null); }}>
+            {selectedToHide.has(contextMenu.nodeId) ? "✓ Deselect for Hide/Show" : "Select for Hide/Show"}
+          </button>
+          <div className="border-t border-gray-200"></div>
           <button className="block px-4 py-2 hover:bg-gray-100 text-sm w-full text-left" onClick={() => { setPinnedPathNodes((prev) => { const next = new Set(prev); if (next.has(contextMenu.nodeId)) { next.delete(contextMenu.nodeId); } else { next.add(contextMenu.nodeId); } return next; }); setContextMenu(null); }}>
-            {pinnedPathNodes.has(contextMenu.nodeId) ? "Unpin This Path" : "Pin This Path"}
+            {pinnedPathNodes.has(contextMenu.nodeId) ? "📌 Unpin This Path" : "📌 Pin This Path"}
           </button>
              <div className="border-t border-gray-200"></div>
           <button className="block px-4 py-2 hover:bg-gray-100 text-sm w-full text-left text-cyan-600 font-medium" onClick={() => { handleTogglePinLayer(contextMenu.nodeId); setContextMenu(null); }}>
@@ -2256,9 +2214,10 @@ const handleMiniMapDragEnd = () => {
                   Unpin Layers ({pinnedLayers.size})
                 </button>
           <div className="border-t border-gray-200"></div>
-          <button className="block px-4 py-2 hover:bg-gray-100 text-sm w-full text-left text-red-600" onClick={() => setContextMenu(null)}>Cancel</button>
+<button className="block px-4 py-2 hover:bg-gray-100 text-sm w-full text-left text-red-600" onClick={() => setContextMenu(null)}>Cancel</button>
         </div>
-      )}
+  );
+})()}
     </div>
   );
 };
