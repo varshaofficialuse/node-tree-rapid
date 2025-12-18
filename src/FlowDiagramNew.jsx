@@ -320,7 +320,7 @@ useEffect(() => {
     setSelectedToHide(new Set());
   };
 
-  const handleShowSelected = () => {
+const handleShowSelected = () => {
     if (selectedToHide.size === 0) return;
 
     const nodesToKeep = new Set(selectedToHide);
@@ -362,6 +362,10 @@ useEffect(() => {
     setHiddenNodes(nodesToHide);
     setShowSelectedMode(true);
     setSelectedToHide(new Set());
+    
+    // Turn off Show All mode if active, since we're now in filtered view
+    setShowAllGraph(false);
+    setCollapseAllVisual(false);
   };
 
 const handleNodeRightClick = (e, nodeId) => {
@@ -438,7 +442,7 @@ const addMoreLayers = () => {
   };
 
 const toggleShowAll = () => {
-    setHiddenNodes(new Set());
+    // Don't clear hidden nodes - respect user's hide choices
     setSelectedToHide(new Set());
     setShowSelectedMode(false);
 
@@ -447,13 +451,36 @@ const toggleShowAll = () => {
       if (isolatedNodeId) {
         const descendants = getAllDescendants(isolatedNodeId);
         const allInSubtree = new Set([isolatedNodeId, ...descendants]);
-        setExpandedNodes(allInSubtree);
+        
+        // Exclude hidden nodes and their descendants
+        const visibleNodes = new Set();
+        allInSubtree.forEach(nodeId => {
+          if (!hiddenNodes.has(nodeId)) {
+            visibleNodes.add(nodeId);
+          }
+        });
+        
+        setExpandedNodes(visibleNodes);
         setActiveNode(isolatedNodeId);
         setCurrentPath([isolatedNodeId]);
       } else {
-        // Normal: show all nodes
+        // Normal: show all nodes except hidden ones
         const allNodes = new Set(graphData.nodes.map((n) => n.id));
-        setExpandedNodes(allNodes);
+        
+        // Remove hidden nodes and their descendants
+        const visibleNodes = new Set();
+        allNodes.forEach(nodeId => {
+          if (!hiddenNodes.has(nodeId)) {
+            // Also check if any ancestor is hidden
+            const path = getPathToNode(nodeId);
+            const hasHiddenAncestor = path.some(ancestorId => hiddenNodes.has(ancestorId));
+            if (!hasHiddenAncestor) {
+              visibleNodes.add(nodeId);
+            }
+          }
+        });
+        
+        setExpandedNodes(visibleNodes);
         setActiveNode(effectiveRootId);
         setCurrentPath(effectiveRootId ? [effectiveRootId] : []);
       }
@@ -596,20 +623,27 @@ if (!showAllSearchResults) {
   };
 
  const handleReset = () => {
+    // Hard reset to initial page load state
     setHiddenNodes(new Set());
     setSelectedToHide(new Set());
     setShowSelectedMode(false);
-    setExpandedNodes(new Set([effectiveRootId]));
-    setActiveNode(isolatedNodeId || null);
-    setCurrentPath(isolatedNodeId ? [isolatedNodeId] : []);
+    setExpandedNodes(new Set([rootNode?.id])); // Always reset to original root
+    setActiveNode(null);
+    setCurrentPath([]);
     setSearchTerm("");
+    setSearchResults([]);
+    setCurrentSearchIndex(0);
+    setShowAllSearchResults(false);
     setShowAllGraph(false);
+    setCollapseAllVisual(false);
     setZoom(100);
     setPinnedPathNodes(new Set());
-    // Don't clear isolation on reset - keep it active
+    setIsolatedNodeId(null); // Clear isolation
+    setPreIsolateState(null);
     setShowPreviousLayersNode(null);
     setPrePreviousLayersState(null);
     setPinnedLayers(new Set());
+    setHoveredNode(null);
   };
   const scrollToNode = (nodeId) => {
     const pos = nodePositions[nodeId];
@@ -1320,6 +1354,9 @@ const handleMiniMapDragEnd = () => {
                     Shrink Prev Layers
                   </button>
                 )}
+                   {pinnedLayers.size > 0 && (<button onClick={() => setPinnedLayers(new Set())} disabled={pinnedLayers.size === 0} className="flex items-center gap-1 px-2 py-1 bg-cyan-600 hover:bg-cyan-700 disabled:bg-gray-600 text-xs rounded">
+                  Unpin Layers ({pinnedLayers.size})
+                </button>)}
                 <button
                   onClick={() => setMiniMapVisible(!miniMapVisible)}
                   className="flex items-center gap-1 px-2 py-1 bg-teal-600 hover:bg-teal-700 text-xs rounded"
@@ -2198,7 +2235,7 @@ const handleMiniMapDragEnd = () => {
             {(() => {
               const nodePath = getPathToNode(contextMenu.nodeId);
               const layerNum = nodePath.length - 1;
-              return pinnedLayers.has(layerNum) ? "✓ Unpin This Layer" : "📍 Pin This Layer";
+              return pinnedLayers.has(layerNum) ? "📌  Unpin This Layer" : " 📌 Pin This Layer";
             })()}
           </button>
           <div className="border-t border-gray-200"></div>
@@ -2209,10 +2246,7 @@ const handleMiniMapDragEnd = () => {
           <button className="block px-4 py-2 hover:bg-gray-100 text-sm w-full text-left text-purple-600 font-medium" onClick={() => { handleShowPreviousLayers(contextMenu.nodeId); setContextMenu(null); }}>
             {showPreviousLayersNode === contextMenu.nodeId ? "✓ Hide Previous Layers" : "Open Previous Layers"}
           </button>
-          <div className="border-t border-gray-200"></div>
-          <button onClick={() => setPinnedLayers(new Set())} disabled={pinnedLayers.size === 0} className="flex items-center gap-1 px-2 py-1 bg-cyan-600 hover:bg-cyan-700 disabled:bg-gray-600 text-xs rounded">
-                  Unpin Layers ({pinnedLayers.size})
-                </button>
+         
           <div className="border-t border-gray-200"></div>
 <button className="block px-4 py-2 hover:bg-gray-100 text-sm w-full text-left text-red-600" onClick={() => setContextMenu(null)}>Cancel</button>
         </div>
