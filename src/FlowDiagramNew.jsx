@@ -93,10 +93,10 @@ const miniMapDragRef = useRef({ isDragging: false, startX: 0, startY: 0, startPo
 const effectiveRoot = isolatedNodeId ? nodeMap[isolatedNodeId] : rootNode;
 const effectiveRootId = effectiveRoot?.id;
 useEffect(() => {
-    if (effectiveRootId && expandedNodes.size === 0 && !showAllGraph) {
+    if (effectiveRootId && expandedNodes.size === 0) {
       setExpandedNodes(new Set([effectiveRootId]));
     }
-  }, [effectiveRootId, expandedNodes.size, showAllGraph, isolatedNodeId]);
+  }, [effectiveRootId, expandedNodes.size, isolatedNodeId]);
 
   useEffect(() => {
     if (!rootNode) return;
@@ -110,7 +110,6 @@ const snapshot = {
   showSelectedMode,
   zoom,
   searchTerm,
-  showAllGraph,
   pinnedPathNodes: Array.from(pinnedPathNodes),
   isolatedNodeId,
   showPreviousLayersNode,
@@ -172,7 +171,6 @@ const snapshot = {
       setShowSelectedMode(!!previousState.showSelectedMode);
       setZoom(previousState.zoom ?? 100);
       setSearchTerm(previousState.searchTerm ?? "");
-      setShowAllGraph(!!previousState.showAllGraph);
       setPinnedPathNodes(new Set(previousState.pinnedPathNodes || []));
       setIsolatedNodeId(
         previousState.isolatedNodeId !== undefined
@@ -205,7 +203,6 @@ const snapshot = {
       setShowSelectedMode(!!nextState.showSelectedMode);
       setZoom(nextState.zoom ?? 100);
       setSearchTerm(nextState.searchTerm ?? "");
-      setShowAllGraph(!!nextState.showAllGraph);
       setPinnedPathNodes(new Set(nextState.pinnedPathNodes || []));
       setIsolatedNodeId(
         nextState.isolatedNodeId !== undefined ? nextState.isolatedNodeId : null
@@ -367,9 +364,7 @@ const handleShowSelected = () => {
     setShowSelectedMode(true);
     setSelectedToHide(new Set());
     
-    // Turn off Show All mode if active, since we're now in filtered view
-    setShowAllGraph(false);
-    setCollapseAllVisual(false);
+
   };
 
 const handleNodeRightClick = (e, nodeId) => {
@@ -445,57 +440,19 @@ const addMoreLayers = () => {
     setExpandedNodes(newExpanded);
   };
 
-const toggleShowAll = () => {
-    // Don't clear hidden nodes - respect user's hide choices
-    setSelectedToHide(new Set());
-    setShowSelectedMode(false);
+const toggleShowAllLabels = () => {
+  // Only take nodes that are already visible (expanded + not hidden)
+  const currentlyVisibleNodes = Array.from(expandedNodes).filter(
+    id => !hiddenNodes.has(id)
+  );
 
-    if (!showAllGraph) {
-      // When isolated, show all only within isolated subtree
-      if (isolatedNodeId) {
-        const descendants = getAllDescendants(isolatedNodeId);
-        const allInSubtree = new Set([isolatedNodeId, ...descendants]);
-        
-        // Exclude hidden nodes and their descendants
-        const visibleNodes = new Set();
-        allInSubtree.forEach(nodeId => {
-          if (!hiddenNodes.has(nodeId)) {
-            visibleNodes.add(nodeId);
-          }
-        });
-        
-        setExpandedNodes(visibleNodes);
-        setActiveNode(isolatedNodeId);
-        setCurrentPath([isolatedNodeId]);
-      } else {
-        // Normal: show all nodes except hidden ones
-        const allNodes = new Set(graphData.nodes.map((n) => n.id));
-        
-        // Remove hidden nodes and their descendants
-        const visibleNodes = new Set();
-        allNodes.forEach(nodeId => {
-          if (!hiddenNodes.has(nodeId)) {
-            // Also check if any ancestor is hidden
-            const path = getPathToNode(nodeId);
-            const hasHiddenAncestor = path.some(ancestorId => hiddenNodes.has(ancestorId));
-            if (!hasHiddenAncestor) {
-              visibleNodes.add(nodeId);
-            }
-          }
-        });
-        
-        setExpandedNodes(visibleNodes);
-        setActiveNode(effectiveRootId);
-        setCurrentPath(effectiveRootId ? [effectiveRootId] : []);
-      }
-      setShowAllGraph(true);
-      setCollapseAllVisual(false);
-    } else if (!collapseAllVisual) {
-      setCollapseAllVisual(true);
-    } else {
-      setCollapseAllVisual(false);
-    }
-  };
+  // Only enlarge full labels for visible nodes
+  const nodesToShowFull = new Set(fullSizeNodes);
+
+  currentlyVisibleNodes.forEach(id => nodesToShowFull.add(id));
+
+  setFullSizeNodes(nodesToShowFull);
+};
 
   const handleSearch = (term) => {
     const search = term.toLowerCase().trim();
@@ -638,8 +595,7 @@ if (!showAllSearchResults) {
     setSearchResults([]);
     setCurrentSearchIndex(0);
     setShowAllSearchResults(false);
-    setShowAllGraph(false);
-    setCollapseAllVisual(false);
+  
     setZoom(100);
     setPinnedPathNodes(new Set());
     setIsolatedNodeId(null); // Clear isolation
@@ -1003,7 +959,7 @@ if (!showAllSearchResults) {
     const isLayerHovered = nodeIds.some((nodeId) => hoveredNode === nodeId);
     const isLayerPinned = pinnedLayers.has(layerNum);
 
-    const shouldCollapseThisLayer = (!showAllGraph || (showAllGraph && collapseAllVisual)) && !isLayerHovered && !isLayerPinned && layerNum !== rootLayer && layerNum !== leafLayer;
+    const shouldCollapseThisLayer = !isLayerHovered && !isLayerPinned && layerNum !== rootLayer && layerNum !== leafLayer;
 
     if (shouldCollapseThisLayer) {
       collapsedLayers.add(layerNum);
@@ -1370,13 +1326,13 @@ const handleMiniMapDragEnd = () => {
                   <Layers className="w-3 h-3" />
                   Levels
                 </button>
-                <button
-                  onClick={toggleShowAll}
-                  className="flex items-center gap-1 px-3 py-1 bg-purple-600 hover:bg-purple-700 text-xs rounded"
-                >
-                  <Maximize2 className="w-3 h-3" />
-                  {!showAllGraph || collapseAllVisual ? "Show All Labels" : "Collapse All Labels"}
-                </button>
+               <button
+  onClick={toggleShowAllLabels}
+  className="flex items-center gap-1 px-3 py-1 bg-purple-600 hover:bg-purple-700 text-xs rounded"
+>
+  <Maximize2 className="w-3 h-3" />
+  Show All Labels
+</button>
                 <button
                   onClick={handleReset}
                   className="flex items-center gap-1 px-2 py-1 bg-red-600 hover:bg-red-700 text-xs rounded"
@@ -1444,7 +1400,7 @@ const handleMiniMapDragEnd = () => {
                   Unpin Layers ({pinnedLayers.size})
                 </button>)}
                 <button onClick={() => setFullSizeNodes(new Set())} disabled={fullSizeNodes.size === 0} className="flex items-center gap-1 px-2 py-1 bg-indigo-600 hover:bg-indigo-700 disabled:bg-gray-600 text-xs rounded">
-  Collapse All Labels ({fullSizeNodes.size})
+  Collapse All Labels 
 </button>
                 <button
                   onClick={() => setMiniMapVisible(!miniMapVisible)}
