@@ -41,6 +41,7 @@ const [prePreviousLayersState, setPrePreviousLayersState] = useState(null);
 const [miniMapPosition, setMiniMapPosition] = useState({ x: window.innerWidth - 300, y: window.innerHeight - 220 });
 const [isDraggingMiniMap, setIsDraggingMiniMap] = useState(false);
 const [pinnedLayers, setPinnedLayers] = useState(new Set());
+const [fullSizeNodes, setFullSizeNodes] = useState(new Set());
 
   const miniMapRef = useRef(null);
   const viewportDragRef = useRef({
@@ -100,7 +101,7 @@ useEffect(() => {
   useEffect(() => {
     if (!rootNode) return;
 
-   const snapshot = {
+const snapshot = {
   expandedNodes: Array.from(expandedNodes),
   activeNode,
   currentPath: [...currentPath],
@@ -114,6 +115,7 @@ useEffect(() => {
   isolatedNodeId,
   showPreviousLayersNode,
   pinnedLayers: Array.from(pinnedLayers),
+  fullSizeNodes: Array.from(fullSizeNodes),
 };
 
     if (!hasInitializedHistoryRef.current) {
@@ -179,7 +181,7 @@ useEffect(() => {
       );
       setShowPreviousLayersNode(previousState.showPreviousLayersNode !== undefined ? previousState.showPreviousLayersNode : null);
       setPinnedLayers(new Set(previousState.pinnedLayers || []));
-
+      setFullSizeNodes(new Set(previousState.fullSizeNodes || []));
       setCurrentHistoryIndex(newIndex);
     }
   }, [currentHistoryIndex]);
@@ -210,6 +212,8 @@ useEffect(() => {
       );
       setShowPreviousLayersNode(nextState.showPreviousLayersNode !== undefined ? nextState.showPreviousLayersNode : null);
       setPinnedLayers(new Set(nextState.pinnedLayers || []));
+      setFullSizeNodes(new Set(nextState.fullSizeNodes || []));
+
 
       setCurrentHistoryIndex(newIndex);
     }
@@ -643,6 +647,8 @@ if (!showAllSearchResults) {
     setShowPreviousLayersNode(null);
     setPrePreviousLayersState(null);
     setPinnedLayers(new Set());
+    setFullSizeNodes(new Set());
+
     setHoveredNode(null);
   };
   const scrollToNode = (nodeId) => {
@@ -824,6 +830,86 @@ if (!showAllSearchResults) {
       return next;
     });
   };
+
+  // Show all descendants of a specific node
+  const handleShowAllDescendants = (nodeId) => {
+    // Get all descendants
+    const descendants = getAllDescendants(nodeId);
+    
+    // Add the node itself and all its descendants to expanded nodes
+    const newExpanded = new Set(expandedNodes);
+    newExpanded.add(nodeId);
+    descendants.forEach(id => {
+      // Don't expand hidden nodes
+      if (!hiddenNodes.has(id)) {
+        newExpanded.add(id);
+      }
+    });
+    
+    setExpandedNodes(newExpanded);
+    setActiveNode(nodeId);
+    setCurrentPath(getPathToNode(nodeId));
+    
+    // Scroll to the node
+    setTimeout(() => scrollToNode(nodeId), 100);
+  };
+
+  // Collapse all descendants of a specific node
+  const handleCollapseAllDescendants = (nodeId) => {
+    // Get all descendants
+    const descendants = getAllDescendants(nodeId);
+    
+    // Remove all descendants from expanded nodes, but keep the node itself
+    const newExpanded = new Set(expandedNodes);
+    descendants.forEach(id => newExpanded.delete(id));
+    
+    setExpandedNodes(newExpanded);
+    setActiveNode(nodeId);
+    setCurrentPath(getPathToNode(nodeId));
+    
+    // Scroll to the node
+    setTimeout(() => scrollToNode(nodeId), 100);
+  };
+
+// Open all descendants of a node
+  const handleOpenDescendants = (nodeId) => {
+    const descendants = getAllDescendants(nodeId);
+    const newExpanded = new Set(expandedNodes);
+
+    descendants.forEach(id => newExpanded.add(id));
+    newExpanded.add(nodeId);
+
+    setExpandedNodes(newExpanded);
+    
+    // Auto-scroll to the node
+    setTimeout(() => scrollToNode(nodeId), 100);
+  };
+
+  // Toggle full size view for node and its descendants
+  const handleToggleFullSizeDescendants = (nodeId) => {
+    const descendants = getAllDescendants(nodeId);
+    const allNodes = new Set([nodeId, ...descendants]);
+    
+    setFullSizeNodes((prev) => {
+      const next = new Set(prev);
+      
+      // Check if any of these nodes are already full size
+      const anyFullSize = Array.from(allNodes).some(id => prev.has(id));
+      
+      if (anyFullSize) {
+        // Remove all from full size
+        allNodes.forEach(id => next.delete(id));
+      } else {
+        // Add all to full size
+        allNodes.forEach(id => next.add(id));
+      }
+      
+      return next;
+    });
+  };
+
+
+
   // ========== IMPORTANT: layout constants (moved up to avoid TDZ errors) ==========
   const nodeHeight = 70;
   const nodeWidth = 140;
@@ -1289,7 +1375,7 @@ const handleMiniMapDragEnd = () => {
                   className="flex items-center gap-1 px-3 py-1 bg-purple-600 hover:bg-purple-700 text-xs rounded"
                 >
                   <Maximize2 className="w-3 h-3" />
-                  {!showAllGraph || collapseAllVisual ? "Show All" : "Collapse"}
+                  {!showAllGraph || collapseAllVisual ? "Show All Labels" : "Collapse All Labels"}
                 </button>
                 <button
                   onClick={handleReset}
@@ -1357,6 +1443,9 @@ const handleMiniMapDragEnd = () => {
                    {pinnedLayers.size > 0 && (<button onClick={() => setPinnedLayers(new Set())} disabled={pinnedLayers.size === 0} className="flex items-center gap-1 px-2 py-1 bg-cyan-600 hover:bg-cyan-700 disabled:bg-gray-600 text-xs rounded">
                   Unpin Layers ({pinnedLayers.size})
                 </button>)}
+                <button onClick={() => setFullSizeNodes(new Set())} disabled={fullSizeNodes.size === 0} className="flex items-center gap-1 px-2 py-1 bg-indigo-600 hover:bg-indigo-700 disabled:bg-gray-600 text-xs rounded">
+  Collapse All Labels ({fullSizeNodes.size})
+</button>
                 <button
                   onClick={() => setMiniMapVisible(!miniMapVisible)}
                   className="flex items-center gap-1 px-2 py-1 bg-teal-600 hover:bg-teal-700 text-xs rounded"
@@ -1562,21 +1651,15 @@ const handleMiniMapDragEnd = () => {
                     const nodeLayer = nodePath.length - 1;
                     const isLayerCollapsed = collapsedLayers.has(nodeLayer);
 
-                    const isNodeInCurrentPath = currentPath.includes(node.id);
-    const isPinnedNode = showPreviousLayersNode ? false : pinnedPathNodes.has(node.id);
+const isNodeInCurrentPath = currentPath.includes(node.id);
+// When previous layers are shown, don't show pinned path highlights
+const isPinnedNode = showPreviousLayersNode ? false : pinnedPathNodes.has(node.id);
 
-                    const forceFullSizeForThisNode =
-                      (hoveredNode === activeNode && isNodeInCurrentPath) ||
-                      (pinnedPathNodes.size > 0 &&
-                        Array.from(pinnedPathNodes).some((pinnedNodeId) => {
-                          const pinnedPath = getPathToNode(pinnedNodeId);
-                          return pinnedPath.includes(node.id);
-                        }));
+const isFullSizeNode = fullSizeNodes.has(node.id);
 
-                    const currentWidth =
-                      isLayerCollapsed && !forceFullSizeForThisNode
-                        ? collapsedNodeWidth
-                        : nodeWidth;
+const forceFullSizeForThisNode = isFullSizeNode || (hoveredNode === activeNode && isNodeInCurrentPath) || (pinnedPathNodes.size > 0 && Array.from(pinnedPathNodes).some((pinnedNodeId) => { const pinnedPath = getPathToNode(pinnedNodeId); return pinnedPath.includes(node.id); }));
+
+const currentWidth = isLayerCollapsed && !forceFullSizeForThisNode ? collapsedNodeWidth : nodeWidth;
 
                     return (
 <g 
@@ -2242,6 +2325,20 @@ const handleMiniMapDragEnd = () => {
           <button className="block px-4 py-2 hover:bg-gray-100 text-sm w-full text-left text-orange-600 font-medium" onClick={() => { handleIsolateNode(contextMenu.nodeId); setContextMenu(null); }}>
             {isolatedNodeId === contextMenu.nodeId ? "✓ Un-isolate This Node" : "Isolate This Node"}
           </button>
+<div className="border-t border-gray-200"></div>
+<button className="block px-4 py-2 hover:bg-gray-100 text-sm w-full text-left text-blue-600 font-medium" onClick={() => { handleOpenDescendants(contextMenu.nodeId); setContextMenu(null); }}>
+  📂 Open All Descendants
+</button>
+<div className="border-t border-gray-200"></div>
+<button className="block px-4 py-2 hover:bg-gray-100 text-sm w-full text-left text-indigo-600 font-medium" onClick={() => { handleToggleFullSizeDescendants(contextMenu.nodeId); setContextMenu(null); }}>
+  {(() => {
+    const descendants = getAllDescendants(contextMenu.nodeId);
+    const allNodes = [contextMenu.nodeId, ...descendants];
+    const anyFullSize = allNodes.some(id => fullSizeNodes.has(id));
+    return anyFullSize ? "⬅️ Collapse Labels" : "➡️ Expand Labels Fully";
+  })()}
+</button>
+
           <div className="border-t border-gray-200"></div>
           <button className="block px-4 py-2 hover:bg-gray-100 text-sm w-full text-left text-purple-600 font-medium" onClick={() => { handleShowPreviousLayers(contextMenu.nodeId); setContextMenu(null); }}>
             {showPreviousLayersNode === contextMenu.nodeId ? "✓ Hide Previous Layers" : "Open Previous Layers"}
