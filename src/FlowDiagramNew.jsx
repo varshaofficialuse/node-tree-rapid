@@ -42,6 +42,15 @@ const [miniMapPosition, setMiniMapPosition] = useState({ x: window.innerWidth - 
 const [isDraggingMiniMap, setIsDraggingMiniMap] = useState(false);
 const [pinnedLayers, setPinnedLayers] = useState(new Set());
 const [fullSizeNodes, setFullSizeNodes] = useState(new Set());
+// 🚀 CANVAS PAN & ZOOM STATE
+  const [isDraggingCanvas, setIsDraggingCanvas] = useState(false);
+  const canvasDragRef = useRef({
+    isDragging: false,
+    startX: 0,
+    startY: 0,
+    startScrollX: 0,
+    startScrollY: 0,
+  });
 
   const miniMapRef = useRef(null);
   const viewportDragRef = useRef({
@@ -904,12 +913,15 @@ if (!showAllSearchResults) {
   // Attach global mouse move and up handlers for viewport dragging
  // Attach global mouse move and up handlers for viewport dragging
   useEffect(() => {
-    const handleMouseMove = (e) => {
+ const handleMouseMove = (e) => {
       if (viewportDragRef.current.isDragging) {
         handleViewportDragMove(e);
       }
       if (miniMapDragRef.current.isDragging) {
         handleMiniMapDragMove(e);
+      }
+      if (canvasDragRef.current.isDragging) {
+        handleCanvasDragMove(e);
       }
     };
 
@@ -919,6 +931,9 @@ if (!showAllSearchResults) {
       }
       if (miniMapDragRef.current.isDragging) {
         handleMiniMapDragEnd();
+      }
+      if (canvasDragRef.current.isDragging) {
+        handleCanvasDragEnd();
       }
     };
 
@@ -956,11 +971,11 @@ if (!showAllSearchResults) {
 
  Object.entries(nodesByLayer).forEach(([layer, nodeIds]) => {
     const layerNum = parseInt(layer);
-    const isLayerHovered = nodeIds.some((nodeId) => hoveredNode === nodeId);
+    // const isLayerHovered = nodeIds.some((nodeId) => hoveredNode === nodeId);
     const isLayerPinned = pinnedLayers.has(layerNum);
 
-    const shouldCollapseThisLayer = !isLayerHovered && !isLayerPinned && layerNum !== rootLayer && layerNum !== leafLayer;
-
+    // const shouldCollapseThisLayer = !isLayerHovered && !isLayerPinned && layerNum !== rootLayer && layerNum !== leafLayer;
+   const shouldCollapseThisLayer = !isLayerPinned && layerNum !== rootLayer && layerNum !== leafLayer;
     if (shouldCollapseThisLayer) {
       collapsedLayers.add(layerNum);
     }
@@ -1200,6 +1215,85 @@ const handleMiniMapDragEnd = () => {
   miniMapDragRef.current.isDragging = false;
   setIsDraggingMiniMap(false);
 };
+// 🚀 CANVAS PAN & ZOOM HANDLERS
+  const handleCanvasDragStart = (e) => {
+    // Only start dragging if:
+    // 1. Middle mouse button, OR
+    // 2. Left mouse button + Shift key held
+    const isMiddleClick = e.button === 1;
+    const isShiftPan = e.button === 0 && e.shiftKey;
+    
+    if (!isMiddleClick && !isShiftPan) return;
+    
+    e.preventDefault();
+    e.stopPropagation();
+    
+    if (!containerRef.current) return;
+    
+    const container = containerRef.current;
+    canvasDragRef.current = {
+      isDragging: true,
+      startX: e.clientX,
+      startY: e.clientY,
+      startScrollX: container.scrollLeft,
+      startScrollY: container.scrollTop,
+    };
+    setIsDraggingCanvas(true);
+  };
+
+  const handleCanvasDragMove = (e) => {
+    if (!canvasDragRef.current.isDragging || !containerRef.current) return;
+    
+    e.preventDefault();
+    
+    const container = containerRef.current;
+    const deltaX = canvasDragRef.current.startX - e.clientX;
+    const deltaY = canvasDragRef.current.startY - e.clientY;
+    
+    container.scrollLeft = canvasDragRef.current.startScrollX + deltaX;
+    container.scrollTop = canvasDragRef.current.startScrollY + deltaY;
+  };
+
+  const handleCanvasDragEnd = () => {
+    canvasDragRef.current.isDragging = false;
+    setIsDraggingCanvas(false);
+  };
+
+  const handleCanvasWheel = (e) => {
+    if (!e.ctrlKey && !e.metaKey) return; // Only zoom with Ctrl/Cmd held
+    
+    e.preventDefault();
+    e.stopPropagation();
+    
+    const delta = e.deltaY;
+    const zoomSpeed = 0.1;
+    const zoomFactor = delta > 0 ? 1 - zoomSpeed : 1 + zoomSpeed;
+    const newZoom = Math.max(25, Math.min(200, zoom * zoomFactor));
+    
+    if (newZoom !== zoom && containerRef.current) {
+      const container = containerRef.current;
+      const rect = container.getBoundingClientRect();
+      
+      // Zoom towards mouse position
+      const mouseX = e.clientX - rect.left;
+      const mouseY = e.clientY - rect.top;
+      
+      const oldZoomFactor = zoom / 100;
+      const newZoomFactor = newZoom / 100;
+      
+      // Calculate new scroll position to keep mouse position fixed
+      const scrollX = (container.scrollLeft + mouseX) / oldZoomFactor * newZoomFactor - mouseX;
+      const scrollY = (container.scrollTop + mouseY) / oldZoomFactor * newZoomFactor - mouseY;
+      
+      setZoom(newZoom);
+      
+      // Apply new scroll position after zoom
+      requestAnimationFrame(() => {
+        container.scrollLeft = scrollX;
+        container.scrollTop = scrollY;
+      });
+    }
+  };
   return (
     <div
       className="min-h-screen flex bg-gray-100"
@@ -1485,12 +1579,26 @@ const handleMiniMapDragEnd = () => {
           </div>
         )}
 
-        <div
+    <div
           ref={containerRef}
-          className="bg-white rounded-xl shadow-lg border border-gray-300 overflow-auto flex-1"
-          style={{ height: "calc(100vh - 140px)", width: "100%" }}
+          className="bg-white rounded-xl shadow-lg border border-gray-300 overflow-auto flex-1 relative"
+          style={{ 
+            height: "calc(100vh - 140px)", 
+            width: "100%",
+            cursor: isDraggingCanvas ? 'grabbing' : 'default'
+          }}
+          onWheel={handleCanvasWheel}
         >
-          <div
+          {/* 🚀 CANVAS PAN INSTRUCTIONS OVERLAY
+          <div className="absolute top-4 left-4 bg-black/75 text-white px-3 py-2 rounded-lg text-xs z-10 pointer-events-none">
+            <div className="font-semibold mb-1">🖱️ Canvas Controls:</div>
+            <div className="space-y-0.5 text-[10px] opacity-90">
+              <div>• <kbd className="bg-white/20 px-1 rounded">Ctrl</kbd> + <kbd className="bg-white/20 px-1 rounded">Scroll</kbd> = Zoom</div>
+              <div>• <kbd className="bg-white/20 px-1 rounded">Shift</kbd> + <kbd className="bg-white/20 px-1 rounded">Drag</kbd> = Pan</div>
+              <div>• <kbd className="bg-white/20 px-1 rounded">Middle Click</kbd> + Drag = Pan</div>
+            </div>
+          </div> */}
+     <div
             style={{
               transform: `scale(${zoom / 100})`,
               transformOrigin: "0 0",
@@ -1499,6 +1607,7 @@ const handleMiniMapDragEnd = () => {
               minHeight: canvasHeight,
               background: "transparent",
             }}
+            onMouseDown={handleCanvasDragStart}
           >
             <svg
               width={canvasWidth}
@@ -1613,8 +1722,14 @@ const isPinnedNode = showPreviousLayersNode ? false : pinnedPathNodes.has(node.i
 
 const isFullSizeNode = fullSizeNodes.has(node.id);
 
-const forceFullSizeForThisNode = isFullSizeNode || (hoveredNode === activeNode && isNodeInCurrentPath) || (pinnedPathNodes.size > 0 && Array.from(pinnedPathNodes).some((pinnedNodeId) => { const pinnedPath = getPathToNode(pinnedNodeId); return pinnedPath.includes(node.id); }));
-
+// const forceFullSizeForThisNode = isFullSizeNode || (hoveredNode === activeNode && isNodeInCurrentPath) || (pinnedPathNodes.size > 0 && Array.from(pinnedPathNodes).some((pinnedNodeId) => { const pinnedPath = getPathToNode(pinnedNodeId); return pinnedPath.includes(node.id); }));
+const forceFullSizeForThisNode =
+                      isFullSizeNode ||
+                      (pinnedPathNodes.size > 0 &&
+                        Array.from(pinnedPathNodes).some((pinnedNodeId) => {
+                          const pinnedPath = getPathToNode(pinnedNodeId);
+                          return pinnedPath.includes(node.id);
+                        }));
 const currentWidth = isLayerCollapsed && !forceFullSizeForThisNode ? collapsedNodeWidth : nodeWidth;
 
                     return (
@@ -1826,7 +1941,8 @@ const currentWidth = isLayerCollapsed && !forceFullSizeForThisNode ? collapsedNo
     const isPinnedNode = showPreviousLayersNode ? false : pinnedPathNodes.has(node.id);
 
                     const forceFullSizeForThisNode =
-                      (hoveredNode === activeNode && isNodeInCurrentPath) ||
+                      // (hoveredNode === activeNode && isNodeInCurrentPath) ||
+                        true || 
                       (pinnedPathNodes.size > 0 &&
                         Array.from(pinnedPathNodes).some((pinnedNodeId) => {
                           const pinnedPath = getPathToNode(pinnedNodeId);
