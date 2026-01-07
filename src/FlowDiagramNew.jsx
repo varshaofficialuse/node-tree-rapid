@@ -1490,7 +1490,7 @@ const handleMiniMapDragEnd = () => {
                     Shrink Prev Layers
                   </button>
                 )}
-                   {!showPreviousLayersNode && pinnedLayers.size > 0 && (<button onClick={() => setPinnedLayers(new Set())} disabled={pinnedLayers.size === 0} className="flex items-center gap-1 px-2 py-1 bg-cyan-600 hover:bg-cyan-700 disabled:bg-gray-600 text-xs rounded">
+                   {!showPreviousLayersNode && pinnedLayers.size > 0 && (<button onClick={() => setPinnedLayers(new Set())} disabled={pinnedLayers.size === 0|| showPreviousLayersNode !== null} className="flex items-center gap-1 px-2 py-1 bg-cyan-600 hover:bg-cyan-700 disabled:bg-gray-600 text-xs rounded">
                   Unpin Layers ({pinnedLayers.size})
                 </button>)}
                 <button onClick={() => setFullSizeNodes(new Set())} disabled={fullSizeNodes.size === 0} className="flex items-center gap-1 px-2 py-1 bg-indigo-600 hover:bg-indigo-700 disabled:bg-gray-600 text-xs rounded">
