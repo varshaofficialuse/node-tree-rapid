@@ -1,400 +1,1428 @@
-Thanks — this is a great, solvable-sounding problem. I read your C# port and the extractor code you included. I found two likely causes for the extra ~12.3k Variable nodes in the .NET service (compared to Python) and some clear opportunities to speed up parsing:
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Text.RegularExpressions;
 
-
-Root cause (very likely): the C# extract_constants_variables implementation builds a Dictionary<string, DataDefinitionJSON> using the raw matched term as the key, but matches are discovered against an UPPERCASED line while the substring is taken from the original line. Because dictionary key checks are case-sensitive by default, the same variable with different case (e.g. VAR, Var, var) can be inserted multiple times as separate keys. Python’s extractor normalizes keys (so duplicates are collapsed) — your C# version does not. This will produce many duplicate Variable entries (and therefore many extra Neo4j Variable nodes). Evidence in your uploaded file: the C# extractor uses upper_line = line.ToUpper(); var var_matches = variable_regex.Matches(upper_line); ... variable_dict.ContainsKey(variable) and variable = line.Substring(match.Index, match.Length). oldresp oldresp
-
-
-Secondary cause (performance): ConstantVariableExtractor is constructed per-parsed-file and re-reads the lexer grammar file + recompiles multiple regular expressions each time. Reading/parsing the grammar file and re-creating Regexes is expensive and will slow down the dotnet parser versus a Python implementation that either caches these or compiles regexes once. Evidence: ConstantVariableExtractor() calls read_keywords() in the constructor and creates many Regex objects as instance fields. oldresp
-
-
-Below I give a robust fix that addresses both issues without changing other node creation logic, plus concrete step-by-step edits and test steps you can apply immediately.
-
-Recommended changes (summary)
-
-
-Make variable-key lookup case-insensitive (collapse duplicates): either use a Dictionary<string,DataDefinitionJSON>(StringComparer.OrdinalIgnoreCase) or normalize keys with ToUpperInvariant() (or ToLowerInvariant()) before using them as keys. This will remove the extra duplicate Variable nodes.
-
-
-Cache / static-compile regexes and keywords so you do not read/parse the lexer grammar file or recompile regexes for every file. Use static readonly fields and RegexOptions.Compiled | RegexOptions.IgnoreCase where appropriate.
-
-
-Minor: if you still want variable Term to preserve original case, store the original matched substring in the DataDefinitionJSON.Term while still using a normalized key in the dictionary.
-
-
-Add a small diagnostic mode (one-off) to count duplicates and confirm the fix.
-
-
-These changes preserve the shape of the DataDefinitionJSON objects and the downstream CreateVariableEntityList code — you are only deduplicating and speeding up extraction.
-
-Exact code changes (patch-style) — edit ConstantVariableExtractor.cs
-
-File: ParserService/Grammar/LanguageParser/tsql/visitor/extractors/ConstantVariableExtractor.cs
-(I reference the methods and fields seen in your uploaded file.) oldresp
-
-1) Make fields static readonly and compile regexes
-Replace the instance fields:
-private HashSet<string> keywords = new HashSet<string>();
-private string negative_lookahead = "";
-private string variable_pattern = "";
-private Regex variable_regex = null;
-private Regex keywords_as_vars = null;
-private string string_constant = "";
-private Regex string_constant_regex = null;
-private Regex numeric_constant_regex = null;
-private string calc_pattern = "";
-private Regex calc_regex = null;
-private string pattern_resultant = "";
-
-with (near top of class, outside ctor):
-// static cache to avoid re-reading/compiling per-file
-private static readonly HashSet<string> keywords = new HashSet<string>();
-private static readonly object keywordsLock = new object();
-private static readonly string negative_lookahead;
-private static readonly string variable_pattern;
-private static readonly Regex variable_regex;
-private static readonly Regex keywords_as_vars;
-private static readonly Regex string_constant_regex;
-private static readonly Regex numeric_constant_regex;
-private static readonly Regex calc_regex;
-private static readonly string pattern_resultant;
-
-Then add a static constructor to initialize them once (after the field declarations in the same class):
-static ConstantVariableExtractor()
+namespace ParserService.Grammar.LanguageParser.tsql.visitor.extractors
 {
-    // ensure keywords are loaded once
-    try
+    /// <summary>
+    /// C# port of services/codeminer/tsql/visitor/extractors/constant_variable_extractor.ConstantVariableExtractor.
+    /// Extracts constants, variables, and mathematical calculations from T-SQL code snippets.
+    /// </summary>
+    public class ConstantVariableExtractor
     {
-        // read keywords once
-        var tempKeywords = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        // Static cache to avoid re-reading/compiling per-file
+        private static readonly HashSet<string> keywords = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private static readonly string negative_lookahead;
+        private static readonly string variable_pattern;
+        private static readonly Regex variable_regex;
+        private static readonly Regex keywords_as_vars;
+        private static readonly Regex string_constant_regex;
+        private static readonly Regex numeric_constant_regex;
+        private static readonly Regex calc_regex;
+        private static readonly string pattern_resultant;
+        private static readonly object keywordsLock = new object();
+        private static bool keywordsInitialized = false;
 
-        // Find the TSqlLexer.g4 the same way you did (assembly relative)
-        string currentDir = Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location);
-        string targetFilePath = Path.Combine(currentDir, "..", "..", "..", "grammer", "TSqlLexer.g4");
-        targetFilePath = Path.GetFullPath(targetFilePath);
-
-        string startMarker = "// Keywords Start Here";
-        string endMarker = "// Keywords End Here";
-        bool capture = false;
-
-        if (File.Exists(targetFilePath))
+        static ConstantVariableExtractor()
         {
-            foreach (string line in File.ReadLines(targetFilePath))
+            // Static constructor runs once per app domain
+            lock (keywordsLock)
             {
-                string trimmedLine = line.Trim();
-                if (trimmedLine == startMarker) { capture = true; continue; }
-                if (trimmedLine == endMarker) { capture = false; break; }
-
-                if (capture && !string.IsNullOrEmpty(trimmedLine) && !trimmedLine.StartsWith("//"))
+                if (!keywordsInitialized)
                 {
-                    Match colonMatch = Regex.Match(trimmedLine, @":(.*?);");
-                    if (colonMatch.Success)
-                    {
-                        string afterColon = colonMatch.Groups[1].Value;
-                        MatchCollection keywordMatches = Regex.Matches(afterColon, @"'[^']*'");
-                        foreach (Match keywordMatch in keywordMatches)
-                        {
-                            string keyword = keywordMatch.Value.Trim(" '".ToCharArray());
-                            tempKeywords.Add(keyword);
-                        }
-                    }
+                    LoadKeywordsAndCompileRegexes();
+                    keywordsInitialized = true;
                 }
             }
         }
 
-        foreach (var k in tempKeywords) keywords.Add(k);
+        private static void LoadKeywordsAndCompileRegexes()
+        {
+            try
+            {
+                // Read keywords from lexer file once
+                string currentDir = Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location);
+                string targetFilePath = Path.Combine(currentDir, "..", "..", "..", "grammer", "TSqlLexer.g4");
+                targetFilePath = Path.GetFullPath(targetFilePath);
 
-        // Build negative lookahead
-        negative_lookahead = string.Join("|", keywords.Select(k => Regex.Escape(k)));
+                string startMarker = "// Keywords Start Here";
+                string endMarker = "// Keywords End Here";
+                bool capture = false;
 
-        // Variable pattern and compiled regexes (Compiled for performance)
-        variable_pattern = $@"(?<!@)(?!(?:{negative_lookahead})(?=[\s(]|$))\b[A-Z]+(?:[-._][A-Z0-9]+)*\b";
-        variable_regex = new Regex(variable_pattern, RegexOptions.IgnoreCase | RegexOptions.Compiled);
+                if (File.Exists(targetFilePath))
+                {
+                    foreach (string line in File.ReadLines(targetFilePath))
+                    {
+                        string trimmedLine = line.Trim();
 
-        keywords_as_vars = new Regex($@"(?:(?<=\s)|(?<=^))(@[A-Z][A-Z0-9_]*)(?=[\s(]|$)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+                        if (trimmedLine == startMarker)
+                        {
+                            capture = true;
+                            continue;
+                        }
+                        else if (trimmedLine == endMarker)
+                        {
+                            capture = false;
+                            break;
+                        }
 
-        string_constant_regex = new Regex(@"'([^']*)'", RegexOptions.Compiled);
+                        if (capture && !string.IsNullOrEmpty(trimmedLine) && !trimmedLine.StartsWith("//"))
+                        {
+                            Match colonMatch = Regex.Match(trimmedLine, @":(.* ?);");
+                            if (colonMatch.Success)
+                            {
+                                string afterColon = colonMatch.Groups[1].Value;
+                                MatchCollection keywordMatches = Regex.Matches(afterColon, @"'[^']*'");
+                                foreach (Match keywordMatch in keywordMatches)
+                                {
+                                    string keyword = keywordMatch.Value.Trim(" '" .ToCharArray());
+                                    keywords.Add(keyword);
+                                }
+                            }
+                        }
+                    }
+                }
 
-        numeric_constant_regex = new Regex(@"(?<=\s)\d+(?=\s)|(?<=\s)\d+$", RegexOptions.Compiled);
+                // Build negative lookahead pattern
+                negative_lookahead = string.Join("|", keywords.Select(k => Regex.Escape(k)));
 
-        calc_regex = new Regex(
-            $@"(?!(?:T|CT|ECT|LECT|ELECT|{negative_lookahead})(?=\s|$))" +
-            $@"(?:(?:SET|SELECT)?\s*(@[\w]+)?\s*(?:=\s*)?)?\(*\s*@[\w.]+(?:\s*[+\-*/]\s*[@\w.()]+)+\s*\)*",
-            RegexOptions.IgnoreCase | RegexOptions.Compiled
-        );
+                // Compile all regexes once with RegexOptions.Compiled for performance
+                variable_pattern = $@"(?<!@)(?!(?:{negative_lookahead})(?=[\s(]|$))\b[A-Z]+(?:[-._][A-Z0-9]+)*\b";
+                variable_regex = new Regex(variable_pattern, RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
-        pattern_resultant = @"SET\s+(@\w+)\s+=";
+                keywords_as_vars = new Regex(
+                    $@"(?:(?<=\s)|(?<=^))(@[A-Z][A-Z0-9_]*)(?=[\s(]|$)",
+                    RegexOptions.IgnoreCase | RegexOptions.Compiled
+                );
+
+                string_constant_regex = new Regex(@"'([^']*)'", RegexOptions.Compiled);
+
+                numeric_constant_regex = new Regex(@"(?<=\s)\d+(?=\s)|(?<=\s)\d+$", RegexOptions.Compiled);
+
+                string calcPattern = (
+                    $@"(?!(?:T|CT|ECT|LECT|ELECT|{negative_lookahead})(?=\s|$))" +
+                    $@"(?:" +
+                    $@"(?:SET|SELECT)?\s*" +
+                    $@"(@[\w]+)?\s*" +
+                    $@"(?:=\s*)?" +
+                    $@")?" +
+                    $@"\(*\s*@[\w.]+(?:\s*[+\-*/]\s*[@\w.()]+)+\s*\)*"
+                );
+                calc_regex = new Regex(calcPattern, RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+                pattern_resultant = @"SET\s+(@\w+)\s+=";
+            }
+            catch
+            {
+                // Swallow exception - non-fatal
+            }
+        }
+
+        public ConstantVariableExtractor()
+        {
+            // Instance constructor now empty - all initialization done in static constructor
+        }
+
+        /// <summary>
+        /// Read keywords from T-SQL lexer grammar file (called once from static constructor)
+        /// </summary>
+        private void read_keywords()
+        {
+            // Now handled in static LoadKeywordsAndCompileRegexes method
+            // This method kept for backward compatibility but does nothing
+        }
+
+        /// <summary>
+        /// Extract mathematical calculations from code snippet
+        /// </summary>
+        public List<Dictionary<string, object>> extract_mathematical_calculations(string code_snippet)
+        {
+            var matched_list = new List<Dictionary<string, object>>();
+            try
+            {
+                foreach (Match match in calc_regex.Matches(code_snippet))
+                {
+                    var data_dict = new Dictionary<string, object>
+                    {
+                        { "match_group", match.Value },
+                        { "start", match.Index },
+                        { "end", match.Index + match.Length }
+                    };
+                    matched_list.Add(data_dict);
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("Error in extract_mathematical_calculations: " + ex.Message);
+            }
+            return matched_list;
+        }
+
+        /// <summary>
+        /// Extract mathematical calculations with start line numbers
+        /// </summary>
+        public List<Dictionary<string, object>> extract_mathematical_calculations_startline(string code_snippet)
+        {
+            var matched_list = new List<Dictionary<string, object>>();
+            string[] lines = code_snippet.Split('\n');  // Match Python: split('\n') after normalization
+            try
+            {
+                for (int i = 0; i < lines.Length; i++)
+                {
+                    string line = lines[i];
+                    foreach (Match match in calc_regex.Matches(line))
+                    {
+                        var data_dict = new Dictionary<string, object>
+                        {
+                            { "match_group", match.Value },
+                            { "start", i + 1 }  // 1-based line number
+                        };
+                        matched_list.Add(data_dict);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("Error in extract_mathematical_calculations: " + ex.Message);
+            }
+            return matched_list;
+        }
+
+        /// <summary>
+        /// Extract constants and variables from code snippet
+        /// </summary>
+        public List<DataDefinitionJSON> extract_constants_variables(string code_snippet, string file_path)
+        {
+            string[] lines = code_snippet.Split('\n');
+            var variable_details = new List<DataDefinitionJSON>();
+            // Use case-insensitive keys to collapse VAR/Var/var duplicates
+            var variable_dict = new Dictionary<string, DataDefinitionJSON>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (string line in lines)
+            {
+                // Skip commented lines
+                if (line.Trim().StartsWith("--"))
+                    continue;
+
+                // Extract string constants
+                MatchCollection string_matches = string_constant_regex.Matches(line);
+                foreach (Match match in string_matches)
+                {
+                    string constant = match.Groups[1].Value;
+                    string key = constant; // case-insensitive dict will normalize keys
+                    if (!variable_dict.ContainsKey(key) && constant.Trim('\'').Split(' ').Length == 1)
+                    {
+                        variable_dict[key] = new DataDefinitionJSON(
+                            type: "CONSTANT",
+                            term: constant,
+                            usage_context: new List<string> { line },
+                            file_path: file_path,
+                            meaning: ""
+                        );
+                    }
+                    else if (variable_dict.ContainsKey(key))
+                    {
+                        variable_dict[key].usage_context.Add(line);
+                    }
+                }
+
+                // Extract variables (uppercase identifiers) - use regex directly on line (IgnoreCase handles matching)
+                MatchCollection var_matches = variable_regex.Matches(line);
+                var variables = new List<string>();
+                foreach (Match match in var_matches)
+                {
+                    // Use the matched value exactly (preserves case), but dictionary is case-insensitive
+                    variables.Add(match.Value);
+                }
+
+                foreach (string variable in variables)
+                {
+                    string key = variable;
+                    if (!variable_dict.ContainsKey(key) && variable.Trim('\'').Split(' ').Length == 1)
+                    {
+                        variable_dict[key] = new DataDefinitionJSON(
+                            type: "DECLARATION",
+                            term: variable,
+                            usage_context: new List<string> { line },
+                            file_path: file_path,
+                            meaning: ""
+                        );
+                    }
+                    else if (variable_dict.ContainsKey(key))
+                    {
+                        variable_dict[key].usage_context.Add(line);
+                    }
+                }
+
+                // Extract keyword variables (@VAR_NAME) - use regex directly on line
+                MatchCollection keyword_var_matches = keywords_as_vars.Matches(line);
+                var keyword_vars = new List<string>();
+                foreach (Match match in keyword_var_matches)
+                {
+                    keyword_vars.Add(match.Value);
+                }
+
+                foreach (string key_var in keyword_vars)
+                {
+                    string key = key_var;
+                    if (!variable_dict.ContainsKey(key) && key_var.Trim('\'').Split(' ').Length == 1)
+                    {
+                        variable_dict[key] = new DataDefinitionJSON(
+                            type: "DECLARATION",
+                            term: key_var,
+                            usage_context: new List<string> { line },
+                            file_path: file_path,
+                            meaning: ""
+                        );
+                    }
+                    else if (variable_dict.ContainsKey(key))
+                    {
+                        variable_dict[key].usage_context.Add(line);
+                    }
+                }
+            }
+
+            variable_details.AddRange(variable_dict.Values);
+            return variable_details;
+        }
+
+        /// <summary>
+        /// Extract numeric constants from code snippet
+        /// </summary>
+        public List<DataDefinitionJSON> extract_numeric_constants(string code_snippet, string file_path)
+        {
+            string[] lines = code_snippet.Split('\n');
+            var variable_details = new List<DataDefinitionJSON>();
+            // Use case-insensitive keys
+            var variable_dict = new Dictionary<string, DataDefinitionJSON>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (string line in lines)
+            {
+                MatchCollection constant_matches = numeric_constant_regex.Matches(line);
+                foreach (Match match in constant_matches)
+                {
+                    string constant = match.Value;
+                    string key = constant;
+                    if (!variable_dict.ContainsKey(key) && constant.Trim('\'').Split(' ').Length == 1)
+                    {
+                        variable_dict[key] = new DataDefinitionJSON(
+                            type: "CONSTANT",
+                            term: constant,
+                            usage_context: new List<string> { line },
+                            file_path: file_path,
+                            meaning: ""
+                        );
+                    }
+                    else if (variable_dict.ContainsKey(key))
+                    {
+                        variable_dict[key].usage_context.Add(line);
+                    }
+                }
+            }
+
+            variable_details.AddRange(variable_dict.Values);
+            return variable_details;
+        }
+
+        // Legacy method names for backward compatibility
+        public List<Dictionary<string, object>> ExtractMathematicalCalculations(string codeSnippet)
+        {
+            return extract_mathematical_calculations(codeSnippet);
+        }
+
+        public List<Dictionary<string, object>> ExtractMathematicalCalculationsStartline(string codeSnippet)
+        {
+            return extract_mathematical_calculations_startline(codeSnippet);
+        }
+
+        public List<DataDefinitionJSON> ExtractConstantsVariables(string codeSnippet, string filePath)
+        {
+            return extract_constants_variables(codeSnippet, filePath);
+        }
+
+        public List<DataDefinitionJSON> ExtractNumericConstants(string codeSnippet, string filePath)
+        {
+            return extract_numeric_constants(codeSnippet, filePath);
+        }
     }
-    catch
+
+    /// <summary>
+    /// Data definition JSON schema for variables/constants
+    /// </summary>
+    public class DataDefinitionJSON
     {
-        // swallow — keep defaults (non-fatal)
+        public string Type { get; set; }
+        public string Term { get; set; }
+        public List<string> UsageContext { get; set; }
+        public string FilePath { get; set; }
+        public string Meaning { get; set; }
+
+        public DataDefinitionJSON(string type, string term, List<string> usage_context, string file_path, string meaning)
+        {
+            Type = type;
+            Term = term;
+            UsageContext = usage_context ?? new List<string>();
+            FilePath = file_path;
+            Meaning = meaning;
+        }
+
+        // Property accessors for compatibility (lowercase properties)
+        public string type
+        {
+            get => Type;
+            set => Type = value;
+        }
+
+        public string term
+        {
+            get => Term;
+            set => Term = value;
+        }
+
+        public List<string> usage_context
+        {
+            get => UsageContext;
+            set => UsageContext = value;
+        }
+
+        public string file_path
+        {
+            get => FilePath;
+            set => FilePath = value;
+        }
+
+        public string meaning
+        {
+            get => Meaning;
+            set => Meaning = value;
+        }
     }
 }
 
 
-Why: constructing these once and using RegexOptions.Compiled drastically reduces the per-file overhead of regex compilation and reading the grammar file.
 
-2) Make dictionary case-insensitive (or normalize keys)
-Inside extract_constants_variables method, replace:
-var variable_details = new List<DataDefinitionJSON>();
-var variable_dict = new Dictionary<string, DataDefinitionJSON>();
+ll value when exiting constructor. Consider adding the 'required' modifier or declaring the property 
+ as nullable. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\Parse 
+rService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\focus 
+\visitor\FocusVisitor.cs(488,23): warning CS8618: Non-nullable property 'FilePath' must contain a no 
+n-null value when exiting constructor. Consider adding the 'required' modifier or declaring the prop 
+erty as nullable. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\P 
+arserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\focus 
+\visitor\FocusVisitor.cs(489,23): warning CS8618: Non-nullable property 'FileName' must contain a no 
+n-null value when exiting constructor. Consider adding the 'required' modifier or declaring the prop 
+erty as nullable. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\P 
+arserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\focus 
+\visitor\FocusVisitor.cs(493,23): warning CS8618: Non-nullable property 'Query' must contain a non-n 
+ull value when exiting constructor. Consider adding the 'required' modifier or declaring the propert 
+y as nullable. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\Pars 
+erService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\focus 
+\visitor\FocusVisitor.cs(494,29): warning CS8618: Non-nullable property 'TableNames' must contain a  
+non-null value when exiting constructor. Consider adding the 'required' modifier or declaring the pr 
+operty as nullable. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar 
+\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\focus 
+\visitor\FocusVisitor.cs(495,29): warning CS8618: Non-nullable property 'FilterConditions' must cont 
+ain a non-null value when exiting constructor. Consider adding the 'required' modifier or declaring  
+the property as nullable. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.G 
+rammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\focus 
+\visitor\FocusVisitor.cs(496,23): warning CS8618: Non-nullable property 'OperationType' must contain 
+ a non-null value when exiting constructor. Consider adding the 'required' modifier or declaring the 
+ property as nullable. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Gram 
+mar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\focus 
+\visitor\FocusVisitor.cs(497,23): warning CS8618: Non-nullable property 'Snippet' must contain a non 
+-null value when exiting constructor. Consider adding the 'required' modifier or declaring the prope 
+rty as nullable. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\Pa 
+rserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\focus 
+\visitor\FocusVisitor.cs(498,23): warning CS8618: Non-nullable property 'Type' must contain a non-nu 
+ll value when exiting constructor. Consider adding the 'required' modifier or declaring the property 
+ as nullable. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\Parse 
+rService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\focus 
+\visitor\FocusVisitor.cs(499,29): warning CS8618: Non-nullable property 'Variable' must contain a no 
+n-null value when exiting constructor. Consider adding the 'required' modifier or declaring the prop 
+erty as nullable. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\P 
+arserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\focus 
+\visitor\FocusVisitor.cs(474,23): warning CS8618: Non-nullable property 'Snippet' must contain a non 
+-null value when exiting constructor. Consider adding the 'required' modifier or declaring the prope 
+rty as nullable. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\Pa 
+rserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\focus 
+\visitor\FocusVisitor.cs(475,23): warning CS8618: Non-nullable property 'FileName' must contain a no 
+n-null value when exiting constructor. Consider adding the 'required' modifier or declaring the prop 
+erty as nullable. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\P 
+arserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\focus 
+\visitor\FocusVisitor.cs(476,23): warning CS8618: Non-nullable property 'FilePath' must contain a no 
+n-null value when exiting constructor. Consider adding the 'required' modifier or declaring the prop 
+erty as nullable. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\P 
+arserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\focus 
+\visitor\FocusVisitor.cs(480,23): warning CS8618: Non-nullable property 'Name' must contain a non-nu 
+ll value when exiting constructor. Consider adding the 'required' modifier or declaring the property 
+ as nullable. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\Parse 
+rService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\focus 
+\visitor\FocusVisitor.cs(481,23): warning CS8618: Non-nullable property 'OperationType' must contain 
+ a non-null value when exiting constructor. Consider adding the 'required' modifier or declaring the 
+ property as nullable. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Gram 
+mar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\focus 
+\visitor\FocusVisitor.cs(482,29): warning CS8618: Non-nullable property 'Variable' must contain a no 
+n-null value when exiting constructor. Consider adding the 'required' modifier or declaring the prop 
+erty as nullable. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\P 
+arserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\c\vis 
+itors\HProgramParserVisitor.cs(73,24): warning CS8603: Possible null reference return. [C:\dotnetRap 
+idx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]    
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\java\ 
+visitor\JavaParserVisitor.cs(165,27): warning CS8601: Possible null reference assignment. [C:\dotnet 
+Rapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj] 
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\java\ 
+visitor\JavaParserVisitor.cs(154,16): warning CS8618: Non-nullable field '_folderName' must contain  
+a non-null value when exiting constructor. Consider adding the 'required' modifier or declaring the  
+field as nullable. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ 
+ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\focus 
+\visitor\FocusVisitor.cs(40,26): warning CS8601: Possible null reference assignment. [C:\dotnetRapid 
+x\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]      
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\focus 
+\visitor\FocusVisitor.cs(35,16): warning CS8618: Non-nullable property 'FolderName' must contain a n 
+on-null value when exiting constructor. Consider adding the 'required' modifier or declaring the pro 
+perty as nullable. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ 
+ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\cshar 
+p\visitor\CSharpProgramParserVisitor.cs(280,28): warning CS8619: Nullability of reference types in v 
+alue of type '(int, FunctionSnippetSchema?)' doesn't match target type '(int Index, FunctionSnippetS 
+chema Function)'. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\P 
+arserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\cshar 
+p\visitor\CSharpProgramParserVisitor.cs(291,28): warning CS8619: Nullability of reference types in v 
+alue of type '(int, FunctionSnippetSchema?)' doesn't match target type '(int Index, FunctionSnippetS 
+chema Function)'. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\P 
+arserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\cshar 
+p\visitor\CSharpProgramParserVisitor.cs(330,17): warning CS8602: Dereference of a possibly null refe 
+rence. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserServic 
+e.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\cshar 
+p\visitor\CSharpProgramParserVisitor.cs(354,24): warning CS8619: Nullability of reference types in v 
+alue of type '(int, FunctionSnippetSchema?)' doesn't match target type '(int Index, FunctionSnippetS 
+chema Function)'. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\P 
+arserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\Parsers\python\Pytho
+nCodeParser.cs(57,16): warning CS8618: Non-nullable field '_cachedPatterns' must contain a non-null  
+value when exiting constructor. Consider adding the 'required' modifier or declaring the field as nu 
+llable. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserServi 
+ce.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\plsql 
+\visitor\PlSqlVisitor.cs(460,20): warning CS8603: Possible null reference return. [C:\dotnetRapidx\a 
+pp-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\plsql 
+\visitor\PlSqlVisitor.cs(466,20): warning CS8603: Possible null reference return. [C:\dotnetRapidx\a 
+pp-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\plsql 
+\visitor\PlSqlVisitor.cs(472,20): warning CS8603: Possible null reference return. [C:\dotnetRapidx\a 
+pp-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\cshar 
+p\visitor\CSharpProgramParserVisitor.cs(403,44): warning CS8604: Possible null reference argument fo 
+r parameter 'context' in 'void CSharpProgramParserVisitor.CheckDecisionNodes(ParserRuleContext conte 
+xt, int index)'. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\Pa 
+rserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\cshar 
+p\visitor\CSharpProgramParserVisitor.cs(409,40): warning CS8604: Possible null reference argument fo 
+r parameter 'context' in 'void CSharpProgramParserVisitor.CheckLoopNodes(ParserRuleContext context,  
+int index)'. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\Parser 
+Service.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\cpp\v 
+isitor\CppProgramParserVisitor.cs(264,24): warning CS8619: Nullability of reference types in value o 
+f type '(int index, FunctionSnippetSchema?)' doesn't match target type '(int index, FunctionSnippetS 
+chema function)'. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\P 
+arserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\cpp\v 
+isitor\CppProgramParserVisitor.cs(269,24): warning CS8619: Nullability of reference types in value o 
+f type '(int index, FunctionSnippetSchema?)' doesn't match target type '(int index, FunctionSnippetS 
+chema function)'. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\P 
+arserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\c\vis 
+itors\CProgramParserVisitor.cs(282,24): warning CS8603: Possible null reference return. [C:\dotnetRa 
+pidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]   
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\c\vis 
+itors\CProgramParserVisitor.cs(314,20): warning CS8603: Possible null reference return. [C:\dotnetRa 
+pidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]   
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\focus 
+\visitor\FocusVisitor.cs(181,24): warning CS8603: Possible null reference return. [C:\dotnetRapidx\a 
+pp-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\c\vis 
+itors\CProgramParserVisitor.cs(321,24): warning CS8603: Possible null reference return. [C:\dotnetRa 
+pidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]   
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\c\vis 
+itors\CProgramParserVisitor.cs(336,20): warning CS8603: Possible null reference return. [C:\dotnetRa 
+pidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]   
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\cpp\v 
+isitor\CppProgramParserVisitor.cs(377,32): warning CS8600: Converting null literal or possible null  
+value to non-nullable type. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService 
+.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\cpp\v 
+isitor\CppProgramParserVisitor.cs(393,37): warning CS8600: Converting null literal or possible null  
+value to non-nullable type. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService 
+.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\cpp\v 
+isitor\CppProgramParserVisitor.cs(398,37): warning CS8600: Converting null literal or possible null  
+value to non-nullable type. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService 
+.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\cpp\v 
+isitor\CppProgramParserVisitor.cs(424,20): warning CS8603: Possible null reference return. [C:\dotne 
+tRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj 
+]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\Parsers\powerbuilder 
+\PowerBuilderCodeParser.cs(58,16): warning CS8618: Non-nullable field '_cachedPatterns' must contain 
+ a non-null value when exiting constructor. Consider adding the 'required' modifier or declaring the 
+ field as nullable. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar 
+\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\c\vis 
+itors\CProgramParserVisitor.cs(343,24): warning CS8603: Possible null reference return. [C:\dotnetRa 
+pidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]   
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\c\vis 
+itors\CProgramParserVisitor.cs(543,20): warning CS8603: Possible null reference return. [C:\dotnetRa 
+pidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]   
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\cpp\v 
+isitor\CppProgramParserVisitor.cs(543,30): warning CS8600: Converting null literal or possible null  
+value to non-nullable type. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService 
+.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\cpp\v 
+isitor\CppProgramParserVisitor.cs(544,35): warning CS8600: Converting null literal or possible null  
+value to non-nullable type. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService 
+.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\cpp\v 
+isitor\CppProgramParserVisitor.cs(566,69): warning CS8604: Possible null reference argument for para 
+meter 'objectVal' in 'string CppProgramParserVisitor.GetClassNameForCallee(string objectVal, string  
+functionName, int index)'. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService. 
+Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\delph 
+i\visitors\DelphiProgramParserVisitor.cs(300,36): warning CS8600: Converting null literal or possibl 
+e null value to non-nullable type. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\Parser 
+Service.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\delph 
+i\visitors\DelphiProgramParserVisitor.cs(336,45): warning CS8600: Converting null literal or possibl 
+e null value to non-nullable type. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\Parser 
+Service.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\delph 
+i\visitors\DelphiProgramParserVisitor.cs(364,45): warning CS8600: Converting null literal or possibl 
+e null value to non-nullable type. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\Parser 
+Service.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\Services\ParserServi 
+ce.cs(216,21): warning CS8604: Possible null reference argument for parameter 'tech' in 'Task<CodeCo 
+ntext> ICodeParser.ParseCodebaseAsync(int runId, int runFileId, string filePath, string tech, int pr 
+ojectId)'. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserSe 
+rvice.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\c\vis 
+itors\CProgramParserVisitor.cs(838,48): warning CS8600: Converting null literal or possible null val 
+ue to non-nullable type. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Gr 
+ammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\c\vis 
+itors\CProgramParserVisitor.cs(856,58): warning CS8600: Converting null literal or possible null val 
+ue to non-nullable type. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Gr 
+ammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\delph 
+i\visitors\DelphiProgramParserVisitor.cs(505,36): warning CS8600: Converting null literal or possibl 
+e null value to non-nullable type. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\Parser 
+Service.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\delph 
+i\visitors\DelphiProgramParserVisitor.cs(551,45): warning CS8600: Converting null literal or possibl 
+e null value to non-nullable type. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\Parser 
+Service.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\delph 
+i\visitors\DelphiProgramParserVisitor.cs(587,45): warning CS8600: Converting null literal or possibl 
+e null value to non-nullable type. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\Parser 
+Service.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\focus 
+\visitor\FocusVisitor.cs(281,24): warning CS8603: Possible null reference return. [C:\dotnetRapidx\a 
+pp-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\Services\NeoModelSer 
+vice.cs(132,55): warning CS8625: Cannot convert null literal to non-nullable reference type. [C:\dot 
+netRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.cspr 
+oj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\Services\NeoModelSer 
+vice.cs(142,55): warning CS8625: Cannot convert null literal to non-nullable reference type. [C:\dot 
+netRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.cspr 
+oj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\NaturalVisitor.cs(1854,30): warning CS8601: Possible null reference assignment. [C:\dotne 
+tRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj 
+]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\Services\NeoModelSer 
+vice.cs(211,48): warning CS8625: Cannot convert null literal to non-nullable reference type. [C:\dot 
+netRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.cspr 
+oj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\NaturalVisitor.cs(112,42): warning CS8600: Converting null literal or possible null value 
+ to non-nullable type. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Gram 
+mar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\NaturalVisitor.cs(117,42): warning CS8600: Converting null literal or possible null value 
+ to non-nullable type. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Gram 
+mar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\NaturalVisitor.cs(143,29): warning CS8600: Converting null literal or possible null value 
+ to non-nullable type. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Gram 
+mar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\NaturalVisitor.cs(153,34): warning CS8601: Possible null reference assignment. [C:\dotnet 
+Rapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj] 
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\NaturalVisitor.cs(162,29): warning CS8601: Possible null reference assignment. [C:\dotnet 
+Rapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj] 
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\Parsers\cobol\CobolP 
+arser.cs(313,60): warning CS8604: Possible null reference argument for parameter 'projectMetadata' i 
+n 'BMSMapVisitor.BMSMapVisitor(CodeComprehensionMetadata projectMetadata, string filePath)'. [C:\dot 
+netRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.cspr 
+oj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\c\vis 
+itors\CProgramParserVisitor.cs(1119,37): warning CS8601: Possible null reference assignment. [C:\dot 
+netRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.cspr 
+oj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\tsql\ 
+visitor\TsqlVisitor.cs(365,34): warning CS0168: The variable 'ex' is declared but never used [C:\dot 
+netRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.cspr 
+oj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\tsql\ 
+visitor\TsqlVisitor.cs(452,31): warning CS8601: Possible null reference assignment. [C:\dotnetRapidx 
+\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]       
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\plsql 
+\visitor\PlSqlVisitor.cs(494,48): warning CS8600: Converting null literal or possible null value to  
+non-nullable type. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ 
+ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\plsql 
+\visitor\PlSqlVisitor.cs(495,42): warning CS8602: Dereference of a possibly null reference. [C:\dotn 
+etRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.cspro 
+j]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\plsql 
+\visitor\PlSqlVisitor.cs(496,40): warning CS8602: Dereference of a possibly null reference. [C:\dotn 
+etRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.cspro 
+j]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\plsql 
+\visitor\PlSqlVisitor.cs(505,48): warning CS8600: Converting null literal or possible null value to  
+non-nullable type. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ 
+ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\NaturalVisitor.cs(290,33): warning CS8600: Converting null literal or possible null value 
+ to non-nullable type. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Gram 
+mar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\NaturalVisitor.cs(310,30): warning CS8601: Possible null reference assignment. [C:\dotnet 
+Rapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj] 
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\plsql
+\visitor\PlSqlVisitor.cs(562,28): warning CS8603: Possible null reference return. [C:\dotnetRapidx\a 
+pp-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\plsql 
+\visitor\PlSqlVisitor.cs(568,28): warning CS8603: Possible null reference return. [C:\dotnetRapidx\a 
+pp-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\tsql\ 
+visitor\extractors\ConstantVariableExtractor.cs(28,16): warning CS8618: Non-nullable field 'negative 
+_lookahead' must contain a non-null value when exiting constructor. Consider adding the 'required' m 
+odifier or declaring the field as nullable. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service- 
+v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\tsql\ 
+visitor\extractors\ConstantVariableExtractor.cs(28,16): warning CS8618: Non-nullable field 'variable 
+_pattern' must contain a non-null value when exiting constructor. Consider adding the 'required' mod 
+ifier or declaring the field as nullable. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2 
+\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\tsql\ 
+visitor\extractors\ConstantVariableExtractor.cs(28,16): warning CS8618: Non-nullable field 'variable 
+_regex' must contain a non-null value when exiting constructor. Consider adding the 'required' modif 
+ier or declaring the field as nullable. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\P 
+arserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\tsql\ 
+visitor\extractors\ConstantVariableExtractor.cs(28,16): warning CS8618: Non-nullable field 'keywords 
+_as_vars' must contain a non-null value when exiting constructor. Consider adding the 'required' mod 
+ifier or declaring the field as nullable. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2 
+\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\tsql\ 
+visitor\extractors\ConstantVariableExtractor.cs(28,16): warning CS8618: Non-nullable field 'string_c 
+onstant_regex' must contain a non-null value when exiting constructor. Consider adding the 'required 
+' modifier or declaring the field as nullable. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-servi 
+ce-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\tsql\ 
+visitor\extractors\ConstantVariableExtractor.cs(28,16): warning CS8618: Non-nullable field 'numeric_ 
+constant_regex' must contain a non-null value when exiting constructor. Consider adding the 'require 
+d' modifier or declaring the field as nullable. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-serv 
+ice-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\tsql\ 
+visitor\extractors\ConstantVariableExtractor.cs(28,16): warning CS8618: Non-nullable field 'calc_reg 
+ex' must contain a non-null value when exiting constructor. Consider adding the 'required' modifier  
+or declaring the field as nullable. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\Parse 
+rService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\tsql\ 
+visitor\extractors\ConstantVariableExtractor.cs(28,16): warning CS8618: Non-nullable field 'pattern_ 
+resultant' must contain a non-null value when exiting constructor. Consider adding the 'required' mo 
+difier or declaring the field as nullable. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v 
+2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\tsql\ 
+visitor\extractors\ConstantVariableExtractor.cs(46,37): warning CS8600: Converting null literal or p 
+ossible null value to non-nullable type. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ 
+ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\tsql\ 
+visitor\extractors\ConstantVariableExtractor.cs(47,54): warning CS8604: Possible null reference argu 
+ment for parameter 'paths' in 'string Path.Combine(params string[] paths)'. [C:\dotnetRapidx\app-cod 
+escout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\tsql\ 
+visitor\TsqlVisitor.cs(641,61): warning CS8600: Converting null literal or possible null value to no 
+n-nullable type. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\Pa 
+rserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\tsql\ 
+visitor\TsqlVisitor.cs(656,23): warning CS8600: Converting null literal or possible null value to no 
+n-nullable type. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\Pa 
+rserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\tsql\ 
+visitor\TsqlVisitor.cs(683,36): warning CS8600: Converting null literal or possible null value to no 
+n-nullable type. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\Pa 
+rserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\jcl\v 
+isitor\visitor_jcl_scheduler.cs(251,43): warning CS8602: Dereference of a possibly null reference. [ 
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Gramma 
+r.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\jcl\v 
+isitor\visitor_jcl_scheduler.cs(251,69): warning CS8602: Dereference of a possibly null reference. [ 
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Gramma 
+r.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\jcl\v 
+isitor\visitor_jcl_scheduler.cs(255,33): warning CS8602: Dereference of a possibly null reference. [ 
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Gramma 
+r.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\NaturalVisitor.cs(458,30): warning CS8601: Possible null reference assignment. [C:\dotnet 
+Rapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj] 
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\Services\NeoModelSer 
+vice.cs(409,30): warning CS8600: Converting null literal or possible null value to non-nullable type 
+. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Gra 
+mmar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\Services\NeoModelSer 
+vice.cs(435,24): warning CS8603: Possible null reference return. [C:\dotnetRapidx\app-codescout\Pars 
+er3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\Services\NeoModelSer 
+vice.cs(467,35): warning CS8601: Possible null reference assignment. [C:\dotnetRapidx\app-codescout\ 
+Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\Services\NeoModelSer 
+vice.cs(478,32): warning CS8601: Possible null reference assignment. [C:\dotnetRapidx\app-codescout\ 
+Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\plsql 
+\visitor\PlSqlVisitor.cs(655,33): warning CS8603: Possible null reference return. [C:\dotnetRapidx\a 
+pp-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\plsql 
+\visitor\PlSqlVisitor.cs(686,28): warning CS8603: Possible null reference return. [C:\dotnetRapidx\a 
+pp-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\plsql 
+\visitor\PlSqlVisitor.cs(724,20): warning CS8603: Possible null reference return. [C:\dotnetRapidx\a 
+pp-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\Services\NeoModelSer 
+vice.cs(502,24): warning CS8603: Possible null reference return. [C:\dotnetRapidx\app-codescout\Pars 
+er3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\Services\NeoModelSer 
+vice.cs(525,20): warning CS8603: Possible null reference return. [C:\dotnetRapidx\app-codescout\Pars 
+er3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\Parsers\natural\Natu 
+ralCodeParser.cs(82,101): warning CS8603: Possible null reference return. [C:\dotnetRapidx\app-codes 
+cout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\Parsers\natural\Natu 
+ralCodeParser.cs(85,26): warning CS8604: Possible null reference argument for parameter 'filePath' i 
+n 'bool NaturalCodeParser.CheckJcl(string filePath)'. [C:\dotnetRapidx\app-codescout\Parser3.0\parse 
+r-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\Parsers\natural\Natu 
+ralCodeParser.cs(128,58): warning CS8604: Possible null reference argument for parameter 'subroutine 
+s' in 'string NaturalCodeParser.RemoveSubsections(string content, IEnumerable<object> subroutines)'. 
+ [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Gram 
+mar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\Parsers\natural\Natu 
+ralCodeParser.cs(163,31): warning CS8601: Possible null reference assignment. [C:\dotnetRapidx\app-c 
+odescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\Parsers\natural\Natu 
+ralCodeParser.cs(179,72): warning CS8604: Possible null reference argument for parameter 'codeSnippe 
+t' in 'List<DataDefinitionJSON> ConstantVariableExtractor.ExtractConstantsVariables(string codeSnipp 
+et, string filePath)'. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Gram 
+mar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\Parsers\natural\Natu 
+ralCodeParser.cs(190,43): warning CS8604: Possible null reference argument for parameter 'snippet' i 
+n 'void NaturalAdabasVisitor.CreateDbAliasNode(string snippet)'. [C:\dotnetRapidx\app-codescout\Pars 
+er3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\NaturalVisitor.cs(558,37): warning CS8603: Possible null reference return. [C:\dotnetRapi 
+dx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]     
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\NaturalVisitor.cs(573,20): warning CS8603: Possible null reference return. [C:\dotnetRapi 
+dx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]     
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\cshar 
+p\visitor\CSharpProgramParserVisitor.cs(1029,20): warning CS8619: Nullability of reference types in  
+value of type '(string?, List<string>)' doesn't match target type '(string Resultant, List<string> O 
+perands)'. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserSe 
+rvice.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\cshar 
+p\visitor\CSharpProgramParserVisitor.cs(1034,41): warning CS8603: Possible null reference return. [C 
+:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar 
+.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\cshar 
+p\visitor\CSharpProgramParserVisitor.cs(1039,36): warning CS8600: Converting null literal or possibl 
+e null value to non-nullable type. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\Parser 
+Service.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\cshar 
+p\visitor\CSharpProgramParserVisitor.cs(1068,24): warning CS8603: Possible null reference return. [C 
+:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar 
+.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\cshar 
+p\visitor\CSharpProgramParserVisitor.cs(1073,24): warning CS8603: Possible null reference return. [C 
+:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar 
+.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\tsql\ 
+visitor\TsqlVisitor.cs(758,37): warning CS8600: Converting null literal or possible null value to no 
+n-nullable type. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\Pa 
+rserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\tsql\ 
+visitor\TsqlVisitor.cs(780,41): warning CS8600: Converting null literal or possible null value to no 
+n-nullable type. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\Pa 
+rserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\tsql\ 
+visitor\TsqlVisitor.cs(847,44): warning CS8601: Possible null reference assignment. [C:\dotnetRapidx 
+\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]       
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\tsql\ 
+visitor\TsqlVisitor.cs(860,20): warning CS8603: Possible null reference return. [C:\dotnetRapidx\app 
+-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\NaturalVisitor.cs(578,37): warning CS8603: Possible null reference return. [C:\dotnetRapi 
+dx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]     
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\NaturalVisitor.cs(593,20): warning CS8603: Possible null reference return. [C:\dotnetRapi 
+dx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]     
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\NaturalVisitor.cs(598,37): warning CS8603: Possible null reference return. [C:\dotnetRapi 
+dx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]     
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\NaturalVisitor.cs(615,20): warning CS8603: Possible null reference return. [C:\dotnetRapi 
+dx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]     
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\plsql 
+\visitor\PlSqlVisitor.cs(840,20): warning CS8603: Possible null reference return. [C:\dotnetRapidx\a 
+pp-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\plsql 
+\visitor\PlSqlVisitor.cs(846,34): warning CS8600: Converting null literal or possible null value to  
+non-nullable type. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ 
+ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\plsql 
+\visitor\PlSqlVisitor.cs(852,35): warning CS8600: Converting null literal or possible null value to  
+non-nullable type. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ 
+ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\plsql 
+\visitor\PlSqlVisitor.cs(859,122): warning CS8604: Possible null reference argument for parameter 'p 
+ackageName' in 'void PlSqlVisitor.HandleFunctionSnippetBody(ParserRuleContext body, string name, str 
+ing packageName, string bodyType)'. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\Parse 
+rService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\plsql 
+\visitor\PlSqlVisitor.cs(861,120): warning CS8604: Possible null reference argument for parameter 'p 
+ackageName' in 'void PlSqlVisitor.HandleFunctionSnippetBody(ParserRuleContext body, string name, str 
+ing packageName, string bodyType)'. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\Parse 
+rService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\plsql 
+\visitor\PlSqlVisitor.cs(865,20): warning CS8603: Possible null reference return. [C:\dotnetRapidx\a 
+pp-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\cshar 
+p\visitor\CSharpProgramParserVisitor.cs(1250,52): warning CS8602: Dereference of a possibly null ref 
+erence. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserServi 
+ce.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\cshar 
+p\visitor\CSharpProgramParserVisitor.cs(1257,52): warning CS8601: Possible null reference assignment 
+. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Gra 
+mmar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\tsql\ 
+visitor\TsqlVisitor.cs(1015,24): warning CS0219: The variable 'query' is assigned but its value is n 
+ever used [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserSer 
+vice.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\tsql\ 
+visitor\TsqlVisitor.cs(1034,20): warning CS8603: Possible null reference return. [C:\dotnetRapidx\ap 
+p-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\tsql\ 
+visitor\TsqlVisitor.cs(1040,20): warning CS8603: Possible null reference return. [C:\dotnetRapidx\ap 
+p-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\tsql\ 
+visitor\TsqlVisitor.cs(1046,20): warning CS8603: Possible null reference return. [C:\dotnetRapidx\ap 
+p-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\tsql\ 
+visitor\TsqlVisitor.cs(1052,20): warning CS8603: Possible null reference return. [C:\dotnetRapidx\ap 
+p-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\tsql\ 
+visitor\TsqlVisitor.cs(1075,20): warning CS8603: Possible null reference return. [C:\dotnetRapidx\ap 
+p-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\tsql\ 
+visitor\TsqlVisitor.cs(1098,20): warning CS8603: Possible null reference return. [C:\dotnetRapidx\ap 
+p-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\tsql\ 
+visitor\TsqlVisitor.cs(1105,20): warning CS8603: Possible null reference return. [C:\dotnetRapidx\ap 
+p-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\tsql\ 
+visitor\TsqlVisitor.cs(1110,28): warning CS8600: Converting null literal or possible null value to n 
+on-nullable type. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\P 
+arserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\tsql\ 
+visitor\TsqlVisitor.cs(1193,24): warning CS8603: Possible null reference return. [C:\dotnetRapidx\ap 
+p-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\tsql\ 
+visitor\TsqlVisitor.cs(1213,48): warning CS8604: Possible null reference argument for parameter 'que 
+ry' in 'DbCallDataEntity CustomTSqlParser.CreateDbCall(ParserRuleContext ctx, string query, List<str 
+ing> filterConditions, HashSet<string> aliases, HashSet<string> tables, DbCallDataEntity_TYPE operat 
+ionType)'. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserSe 
+rvice.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\tsql\ 
+visitor\TsqlVisitor.cs(1222,20): warning CS8603: Possible null reference return. [C:\dotnetRapidx\ap 
+p-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\tsql\ 
+visitor\TsqlVisitor.cs(1187,30): warning CS0168: The variable 'ex' is declared but never used [C:\do 
+tnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csp 
+roj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\tsql\ 
+visitor\TsqlVisitor.cs(1229,35): warning CS8600: Converting null literal or possible null value to n 
+on-nullable type. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\P 
+arserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\tsql\ 
+visitor\TsqlVisitor.cs(1248,63): warning CS8600: Converting null literal or possible null value to n 
+on-nullable type. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\P 
+arserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\tsql\ 
+visitor\TsqlVisitor.cs(1324,24): warning CS8603: Possible null reference return. [C:\dotnetRapidx\ap 
+p-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\tsql\ 
+visitor\TsqlVisitor.cs(1335,20): warning CS8603: Possible null reference return. [C:\dotnetRapidx\ap 
+p-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\tsql\ 
+visitor\TsqlVisitor.cs(1398,24): warning CS8603: Possible null reference return. [C:\dotnetRapidx\ap 
+p-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\tsql\ 
+visitor\TsqlVisitor.cs(1417,20): warning CS8603: Possible null reference return. [C:\dotnetRapidx\ap 
+p-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\NaturalVisitor.cs(620,37): warning CS8603: Possible null reference return. [C:\dotnetRapi 
+dx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]     
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\NaturalVisitor.cs(634,28): warning CS8603: Possible null reference return. [C:\dotnetRapi 
+dx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]     
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\NaturalVisitor.cs(746,51): warning CS8600: Converting null literal or possible null value 
+ to non-nullable type. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Gram 
+mar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\NaturalVisitor.cs(904,20): warning CS8603: Possible null reference return. [C:\dotnetRapi 
+dx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]     
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\NaturalVisitor.cs(911,20): warning CS8603: Possible null reference return. [C:\dotnetRapi 
+dx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]     
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\NaturalVisitor.cs(917,20): warning CS8603: Possible null reference return. [C:\dotnetRapi 
+dx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]     
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\NaturalVisitor.cs(923,20): warning CS8603: Possible null reference return. [C:\dotnetRapi 
+dx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]     
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\NaturalVisitor.cs(929,20): warning CS8603: Possible null reference return. [C:\dotnetRapi 
+dx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]     
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\tsql\ 
+visitor\TsqlVisitor.cs(1451,24): warning CS8603: Possible null reference return. [C:\dotnetRapidx\ap 
+p-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\tsql\ 
+visitor\TsqlVisitor.cs(1462,20): warning CS8603: Possible null reference return. [C:\dotnetRapidx\ap 
+p-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\tsql\ 
+visitor\TsqlVisitor.cs(1485,20): warning CS8603: Possible null reference return. [C:\dotnetRapidx\ap 
+p-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\tsql\ 
+visitor\TsqlVisitor.cs(1490,41): warning CS8600: Converting null literal or possible null value to n 
+on-nullable type. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\P 
+arserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\NaturalVisitor.cs(942,20): warning CS8603: Possible null reference return. [C:\dotnetRapi 
+dx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]     
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\NaturalVisitor.cs(955,20): warning CS8603: Possible null reference return. [C:\dotnetRapi 
+dx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]     
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\NaturalVisitor.cs(992,20): warning CS8603: Possible null reference return. [C:\dotnetRapi 
+dx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]     
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\NaturalVisitor.cs(1003,20): warning CS8603: Possible null reference return. [C:\dotnetRap 
+idx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]    
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\NaturalVisitor.cs(1013,20): warning CS8603: Possible null reference return. [C:\dotnetRap 
+idx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]    
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\NaturalVisitor.cs(1028,41): warning CS8601: Possible null reference assignment. [C:\dotne 
+tRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj 
+]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\NaturalVisitor.cs(1032,41): warning CS8601: Possible null reference assignment. [C:\dotne 
+tRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj 
+]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\delph 
+i\visitors\DelphiProgramParserVisitor.cs(1690,34): warning CS8600: Converting null literal or possib 
+le null value to non-nullable type. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\Parse 
+rService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\delph 
+i\visitors\DelphiProgramParserVisitor.cs(1721,31): warning CS8600: Converting null literal or possib 
+le null value to non-nullable type. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\Parse 
+rService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\delph 
+i\visitors\DelphiProgramParserVisitor.cs(1735,35): warning CS8601: Possible null reference assignmen 
+t. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Gr 
+ammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\NaturalVisitor.cs(1057,39): warning CS8600: Converting null literal or possible null valu 
+e to non-nullable type. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Gra 
+mmar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\plsql 
+\visitor\PlSqlVisitor.cs(1238,20): warning CS8603: Possible null reference return. [C:\dotnetRapidx\ 
+app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]        
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\plsql 
+\visitor\PlSqlVisitor.cs(1256,20): warning CS8603: Possible null reference return. [C:\dotnetRapidx\ 
+app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]        
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\plsql 
+\visitor\PlSqlVisitor.cs(1265,20): warning CS8603: Possible null reference return. [C:\dotnetRapidx\ 
+app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]        
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\NaturalVisitor.cs(1110,21): warning CS8602: Dereference of a possibly null reference. [C: 
+\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar. 
+csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\plsql 
+\visitor\PlSqlVisitor.cs(1279,20): warning CS8603: Possible null reference return. [C:\dotnetRapidx\ 
+app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]        
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\NaturalVisitor.cs(1181,28): warning CS8600: Converting null literal or possible null valu 
+e to non-nullable type. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Gra 
+mmar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\NaturalVisitor.cs(1265,20): warning CS8603: Possible null reference return. [C:\dotnetRap 
+idx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]    
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\NaturalVisitor.cs(1175,17): warning CS0219: The variable 'endBlockMissing' is assigned bu 
+t its value is never used [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.G 
+rammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\NaturalVisitor.cs(1276,28): warning CS8600: Converting null literal or possible null valu 
+e to non-nullable type. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Gra 
+mmar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\NaturalVisitor.cs(1338,20): warning CS8603: Possible null reference return. [C:\dotnetRap 
+idx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]    
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\NaturalVisitor.cs(1270,17): warning CS0219: The variable 'endBlockMissing' is assigned bu 
+t its value is never used [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.G 
+rammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\NaturalVisitor.cs(1344,20): warning CS8603: Possible null reference return. [C:\dotnetRap 
+idx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]    
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\NaturalVisitor.cs(1364,47): warning CS8600: Converting null literal or possible null valu 
+e to non-nullable type. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Gra 
+mmar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\NaturalVisitor.cs(1388,20): warning CS8603: Possible null reference return. [C:\dotnetRap 
+idx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]    
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\NaturalVisitor.cs(1408,47): warning CS8600: Converting null literal or possible null valu 
+e to non-nullable type. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Gra 
+mmar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\NaturalVisitor.cs(1431,20): warning CS8603: Possible null reference return. [C:\dotnetRap 
+idx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]    
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\NaturalVisitor.cs(1438,20): warning CS8603: Possible null reference return. [C:\dotnetRap 
+idx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]    
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\NaturalVisitor.cs(1444,20): warning CS8603: Possible null reference return. [C:\dotnetRap 
+idx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]    
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\NaturalVisitor.cs(1451,20): warning CS8603: Possible null reference return. [C:\dotnetRap 
+idx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]    
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\NaturalVisitor.cs(1457,20): warning CS8603: Possible null reference return. [C:\dotnetRap 
+idx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]    
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\NaturalVisitor.cs(1463,20): warning CS8603: Possible null reference return. [C:\dotnetRap 
+idx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]    
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\NaturalVisitor.cs(1470,20): warning CS8603: Possible null reference return. [C:\dotnetRap 
+idx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]    
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\NaturalVisitor.cs(1508,20): warning CS8603: Possible null reference return. [C:\dotnetRap 
+idx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]    
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\NaturalVisitor.cs(1562,20): warning CS8603: Possible null reference return. [C:\dotnetRap 
+idx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]    
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\NaturalVisitor.cs(1615,20): warning CS8603: Possible null reference return. [C:\dotnetRap 
+idx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]    
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\NaturalVisitor.cs(1628,32): warning CS8600: Converting null literal or possible null valu 
+e to non-nullable type. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Gra 
+mmar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\NaturalVisitor.cs(1681,29): warning CS8601: Possible null reference assignment. [C:\dotne 
+tRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj 
+]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\NaturalVisitor.cs(1696,24): warning CS8625: Cannot convert null literal to non-nullable r 
+eference type. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\Pars 
+erService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\NaturalVisitor.cs(1701,20): warning CS8603: Possible null reference return. [C:\dotnetRap 
+idx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]    
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\NaturalVisitor.cs(1706,20): warning CS8603: Possible null reference return. [C:\dotnetRap 
+idx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]    
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\NaturalVisitor.cs(1712,20): warning CS8603: Possible null reference return. [C:\dotnetRap 
+idx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]    
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\NaturalVisitor.cs(1718,20): warning CS8603: Possible null reference return. [C:\dotnetRap 
+idx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]    
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\NaturalVisitor.cs(1724,20): warning CS8603: Possible null reference return. [C:\dotnetRap 
+idx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]    
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\NaturalVisitor.cs(1730,20): warning CS8603: Possible null reference return. [C:\dotnetRap 
+idx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]    
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\NaturalVisitor.cs(1736,20): warning CS8603: Possible null reference return. [C:\dotnetRap 
+idx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]    
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\NaturalVisitor.cs(1742,20): warning CS8603: Possible null reference return. [C:\dotnetRap 
+idx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]    
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\NaturalVisitor.cs(1761,20): warning CS8603: Possible null reference return. [C:\dotnetRap 
+idx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]    
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\Services\NeoModelSer 
+vice.cs(697,32): warning CS8601: Possible null reference assignment. [C:\dotnetRapidx\app-codescout\ 
+Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\Services\NeoModelSer 
+vice.cs(707,36): warning CS8601: Possible null reference assignment. [C:\dotnetRapidx\app-codescout\ 
+Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\Services\NeoModelSer 
+vice.cs(708,36): warning CS8601: Possible null reference assignment. [C:\dotnetRapidx\app-codescout\ 
+Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\Services\NeoModelSer 
+vice.cs(712,38): warning CS8601: Possible null reference assignment. [C:\dotnetRapidx\app-codescout\ 
+Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\Services\NeoModelSer 
+vice.cs(993,40): warning CS8601: Possible null reference assignment. [C:\dotnetRapidx\app-codescout\ 
+Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\Services\NeoModelSer 
+vice.cs(1061,40): warning CS8601: Possible null reference assignment. [C:\dotnetRapidx\app-codescout 
+\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\Services\NeoModelSer 
+vice.cs(1062,44): warning CS8601: Possible null reference assignment. [C:\dotnetRapidx\app-codescout 
+\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\Services\NeoModelSer 
+vice.cs(1063,44): warning CS8601: Possible null reference assignment. [C:\dotnetRapidx\app-codescout 
+\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\Services\NeoModelSer 
+vice.cs(1064,46): warning CS8601: Possible null reference assignment. [C:\dotnetRapidx\app-codescout 
+\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\delph 
+i\visitors\DelphiProgramParserVisitor.cs(2288,33): warning CS8601: Possible null reference assignmen 
+t. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Gr 
+ammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\Services\NeoModelBat 
+chService.cs(466,44): warning CS8601: Possible null reference assignment. [C:\dotnetRapidx\app-codes 
+cout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\plsql 
+\visitor\PlSqlVisitor.cs(1654,20): warning CS8619: Nullability of reference types in value of type ' 
+(string?, string opClass)' doesn't match target type '(string operation_type, string op_class)'. [C: 
+\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar. 
+csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\delph 
+i\visitors\DelphiProgramParserVisitor.cs(3178,28): warning CS8600: Converting null literal or possib 
+le null value to non-nullable type. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\Parse 
+rService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\Services\NeoModelBat 
+chService.cs(744,131): warning CS8619: Nullability of reference types in value of type 'List<string> 
+' doesn't match target type 'List<string?>'. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service 
+-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\Services\NeoModelBat 
+chService.cs(771,29): warning CS8619: Nullability of reference types in value of type 'List<string?> 
+' doesn't match target type 'List<string>'. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service- 
+v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\jcl\v 
+isitor\visitor_jcl.cs(88,32): warning CS8602: Dereference of a possibly null reference. [C:\dotnetRa 
+pidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]   
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\jcl\v 
+isitor\visitor_jcl.cs(89,38): warning CS8602: Dereference of a possibly null reference. [C:\dotnetRa 
+pidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]   
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\jcl\v 
+isitor\visitor_jcl.cs(90,18): warning CS8602: Dereference of a possibly null reference. [C:\dotnetRa 
+pidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]   
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\jcl\v 
+isitor\visitor_jcl.cs(188,40): warning CS8601: Possible null reference assignment. [C:\dotnetRapidx\ 
+app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]        
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\jcl\v 
+isitor\visitor_jcl.cs(215,51): warning CS8602: Dereference of a possibly null reference. [C:\dotnetR 
+apidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]  
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\jcl\v 
+isitor\visitor_jcl.cs(217,43): warning CS8602: Dereference of a possibly null reference. [C:\dotnetR 
+apidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]  
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\jcl\v 
+isitor\visitor_jcl.cs(311,47): warning CS8602: Dereference of a possibly null reference. [C:\dotnetR 
+apidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]  
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\jcl\v 
+isitor\visitor_jcl.cs(313,39): warning CS8602: Dereference of a possibly null reference. [C:\dotnetR 
+apidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]  
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\jcl\v 
+isitor\visitor_jcl.cs(339,25): warning CS0219: The variable 'pattern' is assigned but its value is n 
+ever used [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserSer 
+vice.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\Parsers\delphi\Delph 
+iCodeParser.cs(59,16): warning CS8618: Non-nullable field '_cachedPatterns' must contain a non-null  
+value when exiting constructor. Consider adding the 'required' modifier or declaring the field as nu 
+llable. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserServi 
+ce.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\Parsers\java\JavaCod 
+eParser.cs(70,16): warning CS8618: Non-nullable field '_cachedPatterns' must contain a non-null valu 
+e when exiting constructor. Consider adding the 'required' modifier or declaring the field as nullab 
+le. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.G 
+rammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\Parsers\c\CCodeParse 
+r.cs(29,16): warning CS8618: Non-nullable field '_cachedPatterns' must contain a non-null value when 
+ exiting constructor. Consider adding the 'required' modifier or declaring the field as nullable. [C 
+:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar 
+.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\Parsers\csharp\CShar 
+pCodeParser.cs(58,16): warning CS8618: Non-nullable field '_cachedPatterns' must contain a non-null  
+value when exiting constructor. Consider adding the 'required' modifier or declaring the field as nu 
+llable. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserServi 
+ce.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\Parsers\cpp\CppCodeP 
+arser.cs(57,16): warning CS8618: Non-nullable field '_cachedPatterns' must contain a non-null value  
+when exiting constructor. Consider adding the 'required' modifier or declaring the field as nullable 
+. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Gra 
+mmar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\Parsers\c\CCodeParse 
+r.cs(81,21): warning CS8604: Possible null reference argument for parameter 'projectMetadata' in 'CP 
+rogramParserVisitor.CProgramParserVisitor(CodeComprehensionMetadata projectMetadata, string filePath 
+, string fileContent, IEnumerable<PatternBook> patterns)'. [C:\dotnetRapidx\app-codescout\Parser3.0\ 
+parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\Parsers\c\CCodeParse 
+r.cs(103,17): warning CS8604: Possible null reference argument for parameter 'projectMetadata' in 'C 
+ProgramParserVisitor.CProgramParserVisitor(CodeComprehensionMetadata projectMetadata, string filePat 
+h, string fileContent, IEnumerable<PatternBook> patterns)'. [C:\dotnetRapidx\app-codescout\Parser3.0 
+\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\Parsers\focus\FocusC 
+odeParser.cs(60,47): warning CS8604: Possible null reference argument for parameter 'tech' in 'List< 
+FunctionCallee> FocusCodeParser.ParseCallees(string[] lines, string tech, string moduleName)'. [C:\d 
+otnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.cs 
+proj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\Parsers\delphi\Delph 
+iCodeParser.cs(138,61): warning CS8604: Possible null reference argument for parameter 'encodingName 
+' in 'string DelphiCodeParser.SafeReadAllText(string filePath, string encodingName)'. [C:\dotnetRapi 
+dx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]     
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\Parsers\delphi\Delph 
+iCodeParser.cs(191,25): warning CS8604: Possible null reference argument for parameter 'projectMetad 
+ata' in 'DelphiProgramParserVisitor.DelphiProgramParserVisitor(CodeComprehensionMetadata projectMeta 
+data, string filePath, string originalCode, IEnumerable<PatternBook> patterns)'. [C:\dotnetRapidx\ap 
+p-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\cobol 
+\visitor\CobolProgramParserVisitor.cs(797,49): warning CS8604: Possible null reference argument for  
+parameter 'code' in '(List<string> Columns, List<string> DataTypes) CobolProgramParserVisitor.Extrac 
+tColumnNames(string code)'. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService 
+.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\cobol 
+\visitor\CobolProgramParserVisitor.cs(852,50): warning CS8604: Possible null reference argument for  
+parameter 'cobolCode' in 'List<string> CobolProgramParserVisitor.ExtractSqlStatements(string cobolCo 
+de)'. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService 
+.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\extractors\ConstantVariableExtractor.cs(67,51): warning CS8600: Converting null literal o 
+r possible null value to non-nullable type. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service- 
+v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\extractors\ConstantVariableExtractor.cs(96,20): warning CS8603: Possible null reference r 
+eturn. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserServic 
+e.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\natur 
+al\visitor\extractors\ConstantVariableExtractor.cs(207,32): warning CS8600: Converting null literal  
+or possible null value to non-nullable type. [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service 
+-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\jcl\v 
+isitor\visitor_jcl.cs(38,22): warning CS0169: The field 'CustomJclVisitor._isIfCondition' is never u 
+sed [C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.G 
+rammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\pytho 
+n\visitor\PythonProgramParserVisitor.cs(47,24): warning CS0414: The field 'PythonProgramParserVisito 
+r._resultant' is assigned but its value is never used [C:\dotnetRapidx\app-codescout\Parser3.0\parse 
+r-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\power 
+builder\visitor\PowerBuilderVisitor.cs(35,21): warning CS0414: The field 'PowerBuilderVisitor._dbCal 
+lExecutionOrder' is assigned but its value is never used [C:\dotnetRapidx\app-codescout\Parser3.0\pa 
+rser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\pytho 
+n\visitor\PythonProgramParserVisitor.cs(51,21): warning CS0414: The field 'PythonProgramParserVisito 
+r._insideDbCall' is assigned but its value is never used [C:\dotnetRapidx\app-codescout\Parser3.0\pa 
+rser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\power 
+builder\visitor\PowerBuilderVisitor.cs(32,21): warning CS0414: The field 'PowerBuilderVisitor._snipp 
+etExecutionOrder' is assigned but its value is never used [C:\dotnetRapidx\app-codescout\Parser3.0\p 
+arser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\pytho 
+n\visitor\PythonProgramParserVisitor.cs(52,22): warning CS0414: The field 'PythonProgramParserVisito 
+r._visitDict' is assigned but its value is never used [C:\dotnetRapidx\app-codescout\Parser3.0\parse 
+r-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\pytho 
+n\visitor\PythonProgramParserVisitor.cs(48,22): warning CS0414: The field 'PythonProgramParserVisito 
+r._isCalculationNode' is assigned but its value is never used [C:\dotnetRapidx\app-codescout\Parser3 
+.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\pytho 
+n\visitor\PythonProgramParserVisitor.cs(49,22): warning CS0414: The field 'PythonProgramParserVisito 
+r._visitChildren' is assigned but its value is never used [C:\dotnetRapidx\app-codescout\Parser3.0\p 
+arser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\java\ 
+visitor\JavaParserVisitor.cs(150,21): warning CS0414: The field 'JavaParserVisitor._calleeExecutionO 
+rder' is assigned but its value is never used [C:\dotnetRapidx\app-codescout\Parser3.0\parser-servic 
+e-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\tsql\ 
+visitor\extractors\ConstantVariableExtractor.cs(89,17): error CS0198: A static readonly field cannot 
+ be assigned to (except in a static constructor or a variable initializer) [C:\dotnetRapidx\app-code 
+scout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\tsql\ 
+visitor\extractors\ConstantVariableExtractor.cs(92,17): error CS0198: A static readonly field cannot 
+ be assigned to (except in a static constructor or a variable initializer) [C:\dotnetRapidx\app-code 
+scout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\tsql\ 
+visitor\extractors\ConstantVariableExtractor.cs(93,17): error CS0198: A static readonly field cannot 
+ be assigned to (except in a static constructor or a variable initializer) [C:\dotnetRapidx\app-code 
+scout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\tsql\ 
+visitor\extractors\ConstantVariableExtractor.cs(95,17): error CS0198: A static readonly field cannot 
+ be assigned to (except in a static constructor or a variable initializer) [C:\dotnetRapidx\app-code 
+scout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\tsql\ 
+visitor\extractors\ConstantVariableExtractor.cs(100,17): error CS0198: A static readonly field canno 
+t be assigned to (except in a static constructor or a variable initializer) [C:\dotnetRapidx\app-cod 
+escout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\tsql\ 
+visitor\extractors\ConstantVariableExtractor.cs(102,17): error CS0198: A static readonly field canno 
+t be assigned to (except in a static constructor or a variable initializer) [C:\dotnetRapidx\app-cod 
+escout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\tsql\ 
+visitor\extractors\ConstantVariableExtractor.cs(113,17): error CS0198: A static readonly field canno 
+t be assigned to (except in a static constructor or a variable initializer) [C:\dotnetRapidx\app-cod 
+escout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+C:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\tsql\ 
+visitor\extractors\ConstantVariableExtractor.cs(115,17): error CS0198: A static readonly field canno 
+t be assigned to (except in a static constructor or a variable initializer) [C:\dotnetRapidx\app-cod 
+escout\Parser3.0\parser-service-v2\ParserService.Grammar\ParserService.Grammar.csproj]
+    472 Warning(s)
+    8 Error(s)
+
+Time Elapsed 00:01:11.06
 
-foreach (string line in lines)
-{
-    // ...
-    foreach (Match match in string_matches) { string constant = match.Groups[1].Value;
-        if (!variable_dict.ContainsKey(constant) && ... )
-        {
-            variable_dict[constant] = new DataDefinitionJSON(...);
-        }
-        else if (variable_dict.ContainsKey(constant)) { variable_dict[constant].usage_context.Add(line); }
-    }
-    // ... variables extraction ...
-}
 
-with:
-var variable_details = new List<DataDefinitionJSON>();
-// use case-insensitive keys to collapse VAR/Var/var duplicates
-var variable_dict = new Dictionary<string, DataDefinitionJSON>(StringComparer.OrdinalIgnoreCase);
-
-foreach (string line in lines)
-{
-    // Skip commented lines
-    if (line.Trim().StartsWith("--"))
-        continue;
-
-    // Extract string constants
-    MatchCollection string_matches = string_constant_regex.Matches(line);
-    foreach (Match match in string_matches)
-    {
-        string constant = match.Groups[1].Value;
-        string key = constant; // case-insensitive dict will normalize keys
-        if (!variable_dict.ContainsKey(key) && constant.Trim('\'').Split(' ').Length == 1)
-        {
-            // store the original case in the DataDefinitionJSON.Term if you want to preserve it
-            variable_dict[key] = new DataDefinitionJSON(
-                type: "CONSTANT",
-                term: constant,
-                usage_context: new List<string> { line },
-                file_path: file_path,
-                meaning: ""
-            );
-        }
-        else if (variable_dict.ContainsKey(key))
-        {
-            variable_dict[key].usage_context.Add(line);
-        }
-    }
-
-    // Extract variables (uppercase identifiers) — note: variable_regex is compiled and case-insensitive
-    MatchCollection var_matches = variable_regex.Matches(line);
-    var variables = new List<string>();
-    foreach (Match match in var_matches)
-    {
-        // use the matched value exactly (preserves case), but dictionary is case-insensitive
-        string variable = match.Value;
-        variables.Add(variable);
-    }
-
-    foreach (string variable in variables)
-    {
-        string key = variable;
-        if (!variable_dict.ContainsKey(key) && variable.Trim('\'').Split(' ').Length == 1)
-        {
-            variable_dict[key] = new DataDefinitionJSON(
-                type: "DECLARATION",
-                term: variable,
-                usage_context: new List<string> { line },
-                file_path: file_path,
-                meaning: ""
-            );
-        }
-        else if (variable_dict.ContainsKey(key))
-        {
-            variable_dict[key].usage_context.Add(line);
-        }
-    }
-
-    // Extract keyword variables (@VAR_NAME)
-    MatchCollection keyword_var_matches = keywords_as_vars.Matches(line);
-    var keyword_vars = new List<string>();
-    foreach (Match match in keyword_var_matches)
-    {
-        keyword_vars.Add(match.Value);
-    }
-
-    foreach (string key_var in keyword_vars)
-    {
-        string key = key_var;
-        if (!variable_dict.ContainsKey(key) && key_var.Trim('\'').Split(' ').Length == 1)
-        {
-            variable_dict[key] = new DataDefinitionJSON(
-                type: "DECLARATION",
-                term: key_var,
-                usage_context: new List<string> { line },
-                file_path: file_path,
-                meaning: ""
-            );
-        }
-        else if (variable_dict.ContainsKey(key))
-        {
-            variable_dict[key].usage_context.Add(line);
-        }
-    }
-}
-
-
-Why: using StringComparer.OrdinalIgnoreCase will collapse identical logical variables differing only by case. If you prefer to normalize keys explicitly, you can use key = variable.ToUpperInvariant() (and keep dict comparer default); either is fine as long as consistent.
-
-3) (Optional) Change how you capture var_matches (current code uppercases line)
-You currently do upper_line = line.ToUpper(); var var_matches = variable_regex.Matches(upper_line); and then line.Substring(match.Index, match.Length) to get the original. That can be brittle (index differences if different encoding/newlines). Remove the ToUpper() step and run regex directly on line because your regex is already IgnoreCase/compiled. So replace:
-string upper_line = line.ToUpper();
-MatchCollection var_matches = variable_regex.Matches(upper_line);
-foreach (Match match in var_matches)
-{
-    variables.Add(line.Substring(match.Index, match.Length));
-}
-
-with:
-MatchCollection var_matches = variable_regex.Matches(line);
-foreach (Match match in var_matches)
-{
-    variables.Add(match.Value);
-}
-
-
-Why: this avoids potential index/culture differences and keeps behavior consistent.
-
-
-Performance / caching tweaks (summary)
-
-
-Make the ConstantVariableExtractor heavy objects (keyword list and compiled regexes) static as shown. This will stop reading TSqlLexer.g4 and recompiling regexes per file.
-
-
-Add RegexOptions.Compiled where regexes are used often (careful on startup time but good for long runs).
-
-
-If your application runs multi-threaded, the static initialization above is thread-safe because the CLR runs static constructors once.
-
-
-
-Verification steps — exactly what to run
-
-
-Apply code changes from above in ConstantVariableExtractor.cs.
-
-
-Rebuild the .NET parser project.
-
-
-Run a comparison test:
-
-
-Pick the same dataset you used to compare Python vs .NET before (the full run that produced the extra 12.3k Variables).
-
-
-Run the Python parsing and export the count of Variable nodes (or just count VariableEntity instances).
-
-
-Run the .NET parsing and export the same counts.
-
-
-Expectation: Variable counts should now match within noise (close to identical). Other node counts should remain the same.
-
-
-If counts still differ, add the small diagnostic logging: in ExtractConstantsVariables right before variable_details.AddRange(variable_dict.Values); add code to log (to a temp file in parser_debug) the variable_dict size and a sample of keys for a single file — compare to the Python extractor output for the same file. This will let you find a particular file where duplicates persist.
-
-
-Example quick diagnostic snippet (C#) to write counts per-file:
-try
-{
-    var debugDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory ?? ".", "parser_debug");
-    Directory.CreateDirectory(debugDir);
-    var name = Path.GetFileName(file_path) ?? "file";
-    File.WriteAllText(Path.Combine(debugDir, $"vars_{name}.txt"), $"uniqueVars:{variable_dict.Count}\n{string.Join('\n', variable_dict.Keys.Take(200))}");
-}
-catch { }
-
-
-
-Run timing measurement: with regex compiles moved to static, parse time per file should drop — compare VisitMs diagnostics (your existing parser already writes VisitMs in TsqlCodeParser.cs) before and after. You should see a significant drop in VisitMs for large runs. oldresp
-
-
-
-Why these changes are safe
-
-
-You are only changing how variables are detected and deduplicated inside the ConstantVariableExtractor. The rest of the pipeline still consumes DataDefinitionJSON and VariableEntity in the same shapes, so Neo4j node creation logic & other node types remain untouched. CreateVariableEntityList and CreateDatabaseEntity code do not change.
-
-
-Preserving DataDefinitionJSON.Term as the original matched term means any UI or consumers that display variable names will keep the full original case, while duplicates are no longer created in the graph.
-
-
-
-Quick checklist you can follow (copy-paste)
-
-
-Edit ConstantVariableExtractor.cs:
-
-
-Convert keyword loading and Regex fields to static readonly.
-
-
-Add static ConstantVariableExtractor() initializer with compiled regexes.
-
-
-Replace per-line ToUpper() matching with variable_regex.Matches(line).
-
-
-Use var variable_dict = new Dictionary<string, DataDefinitionJSON>(StringComparer.OrdinalIgnoreCase);
-
-
-
-
-Rebuild solution.
-
-
-Run parsing on a sample folder (the same dataset previously used).
-
-
-Compare:
-
-
-Python: Variable count
-
-
-.NET: Variable count
-
-
-VisitMs diagnostics (should be lower in .NET after the change)
-
-
-
-
-If mismatch remains, enable parser_debug/vars_<filename>.txt and compare a failing file between Python and .NET runs.
-
-
-
-Extra small suggestions (optional but helpful)
-
-
-If you have many parser processes concurrently, consider making the keywords collection persisted or shipped as an embedded resource so file IO is eliminated entirely.
-
-
-If the Python extractor normalized keys to UPPER-case, consider storing DataDefinitionJSON.Term as term.ToUpperInvariant() if you want full parity with Python (but only do this if other systems expect normalized case).
-
-
-Run a small unit test that parses 10 representative files and asserts the variable counts match Python. That will avoid surprises.
-
-
-
-If you want, I can:
-
-
-produce the exact C# patch file text (diff) you can paste into your repo (I can generate the full changed ConstantVariableExtractor.cs content),
-
-
-or generate a script to run a before/after comparison that prints counts and top-20 variable keys per file.
-
-
-Which of those would you like next? (I can produce the concrete patch right away.)Sources
