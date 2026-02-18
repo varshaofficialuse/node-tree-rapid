@@ -1,285 +1,1359 @@
-#nullable enable
-using System;
-using System.Collections.Generic;
-using System.IO;
-using System.Linq;
-using System.Text.RegularExpressions;
 
-namespace ParserService.Grammar.LanguageParser.tsql.visitor.extractors
-{
-    /// <summary>
-    /// Extracts constants, variables, and mathematical calculations from T-SQL code.
-    /// Optimized C# port with caching, case-insensitive deduplication, and safe null handling.
-    /// </summary>
-    public class ConstantVariableExtractor
-    {
-        // ---- Optional external error listener ----
-        public static Action<string, Exception>? ErrorListener { get; set; }
 
-        // ---- Static cached resources (initialized once) ----
-        private static readonly HashSet<string> keywords = new(StringComparer.OrdinalIgnoreCase);
-        private static string? negative_lookahead;
-        private static string? variable_pattern;
-        private static Regex? variable_regex;
-        private static Regex? keywords_as_vars;
-        private static Regex? string_constant_regex;
-        private static Regex? numeric_constant_regex;
-        private static Regex? calc_regex;
-        private static string? pattern_resultant;
-        private static readonly object keywordsLock = new();
-        private static bool initialized = false;
 
-        static ConstantVariableExtractor()
-        {
-            lock (keywordsLock)
-            {
-                if (!initialized)
-                {
-                    try
-                    {
-                        LoadKeywordsAndCompileRegexes();
-                        initialized = true;
-                    }
-                    catch (Exception ex)
-                    {
-                        ErrorListener?.Invoke("Static initialization failed", ex);
-                    }
-                }
-            }
-        }
 
-        private static void LoadKeywordsAndCompileRegexes()
-        {
-            try
-            {
-                // ---- Read lexer keywords once ----
-                string? currentDir = Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location);
-                string targetFilePath = Path.Combine(currentDir ?? ".", "..", "..", "..", "grammer", "TSqlLexer.g4");
-                targetFilePath = Path.GetFullPath(targetFilePath);
 
-                string startMarker = "// Keywords Start Here";
-                string endMarker = "// Keywords End Here";
-                bool capture = false;
+Select all
+Today
 
-                if (File.Exists(targetFilePath))
-                {
-                    foreach (string rawLine in File.ReadLines(targetFilePath))
-                    {
-                        string line = rawLine.Trim();
-                        if (line == startMarker) { capture = true; continue; }
-                        if (line == endMarker) { capture = false; break; }
+00:05
 
-                        if (capture && line.Length > 0 && !line.StartsWith("//"))
-                        {
-                            Match colonMatch = Regex.Match(line, @":(.*?);");
-                            if (colonMatch.Success)
-                            {
-                                string afterColon = colonMatch.Groups[1].Value;
-                                foreach (Match keywordMatch in Regex.Matches(afterColon, @"'[^']*'"))
-                                {
-                                    string keyword = keywordMatch.Value.Trim('\'', ' ');
-                                    if (!string.IsNullOrWhiteSpace(keyword))
-                                        keywords.Add(keyword);
-                                }
-                            }
-                        }
-                    }
-                }
+MATCH (v:Variable {run_id: 5273}) RETURN v.file_name AS file_name, count(v) AS variable_count ORDER BY variable_count DESC
 
-                // ---- Build and compile regex patterns ----
-                negative_lookahead = string.Join("|", keywords.Select(Regex.Escape));
-                variable_pattern = $@"(?<!@)(?!(?:{negative_lookahead})(?=[\s(]|$))\b[A-Z]+(?:[-._][A-Z0-9]+)*\b";
-                variable_regex = new Regex(variable_pattern, RegexOptions.IgnoreCase | RegexOptions.Compiled);
+00:05
 
-                keywords_as_vars = new Regex(@"(?:(?<=\s)|(?<=^))(@[A-Z][A-Z0-9_]*)(?=[\s(]|$)",
-                    RegexOptions.IgnoreCase | RegexOptions.Compiled);
+MATCH (v:Variable {run_id: 5381}) RETURN v.file_name AS file_name, count(v) AS variable_count ORDER BY variable_count DESC
 
-                string_constant_regex = new Regex(@"'([^']*)'", RegexOptions.Compiled);
-                numeric_constant_regex = new Regex(@"(?<=\s)\d+(?=\s)|(?<=\s)\d+$", RegexOptions.Compiled);
+00:04
 
-                string calcPattern =
-                    $@"(?!(?:T|CT|ECT|LECT|ELECT|{negative_lookahead})(?=\s|$))" +
-                    @"(?:(?:SET|SELECT)?\s*(@[\w]+)?\s*(?:=\s*)?)?\(*\s*@[\w.]+(?:\s*[+\-*/]\s*[@\w.()]+)+\s*\)*";
-                calc_regex = new Regex(calcPattern, RegexOptions.IgnoreCase | RegexOptions.Compiled);
+match (n:Variable) WHERE n.run_id=5273 return count(n)
 
-                pattern_resultant = @"SET\s+(@\w+)\s+=";
-            }
-            catch (Exception ex)
-            {
-                ErrorListener?.Invoke("LoadKeywordsAndCompileRegexes", ex);
-            }
-        }
+00:04
 
-        // ---- Extract mathematical calculations ----
-        public List<Dictionary<string, object>> extract_mathematical_calculations(string code_snippet)
-        {
-            var list = new List<Dictionary<string, object>>();
-            try
-            {
-                foreach (Match match in calc_regex!.Matches(code_snippet))
-                {
-                    list.Add(new Dictionary<string, object>
-                    {
-                        { "match_group", match.Value },
-                        { "start", match.Index },
-                        { "end", match.Index + match.Length }
-                    });
-                }
-            }
-            catch (Exception ex)
-            {
-                ErrorListener?.Invoke(nameof(extract_mathematical_calculations), ex);
-            }
-            return list;
-        }
+match (n:Variable) WHERE n.run_id=5381 return count(n)
 
-        // ---- Extract calculations with line numbers ----
-        public List<Dictionary<string, object>> extract_mathematical_calculations_startline(string code_snippet)
-        {
-            var list = new List<Dictionary<string, object>>();
-            try
-            {
-                string[] lines = code_snippet.Split('\n');
-                for (int i = 0; i < lines.Length; i++)
-                {
-                    foreach (Match match in calc_regex!.Matches(lines[i]))
-                    {
-                        list.Add(new Dictionary<string, object>
-                        {
-                            { "match_group", match.Value },
-                            { "start", i + 1 }
-                        });
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                ErrorListener?.Invoke(nameof(extract_mathematical_calculations_startline), ex);
-            }
-            return list;
-        }
+00:04
 
-        // ---- Extract constants & variables ----
-        public List<DataDefinitionJSON> extract_constants_variables(string code_snippet, string file_path)
-        {
-            var result = new List<DataDefinitionJSON>();
-            var dict = new Dictionary<string, DataDefinitionJSON>(StringComparer.OrdinalIgnoreCase);
+MATCH (v:Variable {run_id: 5381}) RETURN v.file_name AS file_name, count(v) AS variable_count ORDER BY variable_count DESC
 
-            try
-            {
-                foreach (string rawLine in code_snippet.Split('\n'))
-                {
-                    string line = rawLine ?? string.Empty;
-                    if (line.TrimStart().StartsWith("--")) continue;
+00:03
 
-                    // string constants
-                    foreach (Match match in string_constant_regex!.Matches(line))
-                    {
-                        string constant = match.Groups[1].Value;
-                        if (constant.Trim('\'').Split(' ').Length == 1)
-                            AddOrAppend(dict, constant, "CONSTANT", file_path, line);
-                    }
+MATCH (v:Variable {run_id: 5381}) RETURN v.file_name AS file_name, count(v) AS variable_count ORDER BY variable_count DESC
 
-                    // variables
-                    foreach (Match match in variable_regex!.Matches(line))
-                    {
-                        string variable = match.Value;
-                        if (variable.Trim('\'').Split(' ').Length == 1)
-                            AddOrAppend(dict, variable, "DECLARATION", file_path, line);
-                    }
+00:03
 
-                    // keyword variables (@var)
-                    foreach (Match match in keywords_as_vars!.Matches(line))
-                    {
-                        string varName = match.Value;
-                        if (varName.Trim('\'').Split(' ').Length == 1)
-                            AddOrAppend(dict, varName, "DECLARATION", file_path, line);
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                ErrorListener?.Invoke(nameof(extract_constants_variables), ex);
-            }
+MATCH (v:Variable {run_id: 5273}) RETURN v.file_name AS file_name, count(v) AS variable_count ORDER BY variable_count DESC
+Yesterday
 
-            result.AddRange(dict.Values);
-            return result;
-        }
+23:59
 
-        // ---- Extract numeric constants ----
-        public List<DataDefinitionJSON> extract_numeric_constants(string code_snippet, string file_path)
-        {
-            var result = new List<DataDefinitionJSON>();
-            var dict = new Dictionary<string, DataDefinitionJSON>(StringComparer.OrdinalIgnoreCase);
+MATCH (v:Variable {run_id: 5381}) RETURN v.file_name AS file_name, count(v) AS variable_count ORDER BY variable_count DESC
 
-            try
-            {
-                foreach (string line in code_snippet.Split('\n'))
-                {
-                    foreach (Match match in numeric_constant_regex!.Matches(line))
-                    {
-                        string constant = match.Value;
-                        if (constant.Trim('\'').Split(' ').Length == 1)
-                            AddOrAppend(dict, constant, "CONSTANT", file_path, line);
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                ErrorListener?.Invoke(nameof(extract_numeric_constants), ex);
-            }
+22:49
 
-            result.AddRange(dict.Values);
-            return result;
-        }
+MATCH (v:Variable {run_id: 5381}) RETURN v.file_name AS file_name, count(v) AS variable_count ORDER BY variable_count DESC
 
-        // ---- Helper: Add or append usage context ----
-        private static void AddOrAppend(Dictionary<string, DataDefinitionJSON> dict, string key, string type, string file, string line)
-        {
-            if (!dict.TryGetValue(key, out var existing))
-            {
-                dict[key] = new DataDefinitionJSON(type, key, new List<string> { line }, file, "");
-            }
-            else
-            {
-                existing.UsageContext.Add(line);
-            }
-        }
+22:48
 
-        // ---- Legacy wrappers ----
-        public List<Dictionary<string, object>> ExtractMathematicalCalculations(string codeSnippet) =>
-            extract_mathematical_calculations(codeSnippet);
-        public List<Dictionary<string, object>> ExtractMathematicalCalculationsStartline(string codeSnippet) =>
-            extract_mathematical_calculations_startline(codeSnippet);
-        public List<DataDefinitionJSON> ExtractConstantsVariables(string codeSnippet, string filePath) =>
-            extract_constants_variables(codeSnippet, filePath);
-        public List<DataDefinitionJSON> ExtractNumericConstants(string codeSnippet, string filePath) =>
-            extract_numeric_constants(codeSnippet, filePath);
-    }
+MATCH (v:Variable {run_id: 5381}) RETURN v.file_name AS file_name, count(v) AS variable_count ORDER BY variable_count DESC
 
-    // ---- POCO data model ----
-    public class DataDefinitionJSON
-    {
-        public string Type { get; set; }
-        public string Term { get; set; }
-        public List<string> UsageContext { get; set; }
-        public string FilePath { get; set; }
-        public string Meaning { get; set; }
+22:40
 
-        public DataDefinitionJSON(string type, string term, List<string> usage_context, string file_path, string meaning)
-        {
-            Type = type;
-            Term = term;
-            UsageContext = usage_context ?? new();
-            FilePath = file_path;
-            Meaning = meaning;
-        }
+MATCH (v:Variable {run_id: 5273}) RETURN v.file_name AS file_name, count(v) AS variable_count ORDER BY variable_count DESC
 
-        // Lowercase property aliases for backward compatibility
-        public string type { get => Type; set => Type = value; }
-        public string term { get => Term; set => Term = value; }
-        public List<string> usage_context { get => UsageContext; set => UsageContext = value; }
-        public string file_path { get => FilePath; set => FilePath = value; }
-        public string meaning { get => Meaning; set => Meaning = value; }
-    }
-}
+22:40
+
+MATCH (v:Variable {run_id: 5381}) RETURN v.file_name AS file_name, count(v) AS variable_count ORDER BY variable_count DESC
+
+22:39
+
+MATCH (v:Variable {run_id: 5273}) RETURN v.file_name AS file_name, count(v) AS variable_count ORDER BY variable_count DESC
+
+22:38
+
+MATCH (v:Variable {run_id: 5381}) RETURN v.file_name AS file_name, count(v) AS variable_count ORDER BY variable_count DESC
+
+22:37
+
+MATCH (v:Variable {run_id: 5381}) RETURN v.file_name AS file_name, count(v) AS variable_count ORDER BY variable_count DESC
+
+20:59
+
+match (n:Variable) WHERE n.run_id=5381 return count(n)
+
+20:59
+
+match (n:Variable) WHERE n.run_id=5273 return count(n)
+
+20:58
+
+MATCH (v:Variable {run_id: 5381}) RETURN v.file_name AS file_name, count(v) AS variable_count ORDER BY variable_count DESC
+
+20:58
+
+MATCH (v:Variable {run_id: 5273}) RETURN v.file_name AS file_name, count(v) AS variable_count ORDER BY variable_count DESC
+
+19:36
+
+MATCH (v:Variable {run_id: 5381}) RETURN v.file_name AS file_name, count(v) AS variable_count ORDER BY variable_count DESC
+
+19:36
+
+MATCH (v:Variable {run_id: 5273}) RETURN v.file_name AS file_name, count(v) AS variable_count ORDER BY variable_count DESC
+
+19:35
+
+MATCH (v:Variable {run_id: 3420}) RETURN v.file_name AS file_name, count(v) AS variable_count ORDER BY variable_count DESC
+
+19:35
+
+MATCH (v:Variable {run_id: 3420}) RETURN v.file_name AS file_name, count(v) AS variable_count ORDER BY variable_count DESC
+
+19:34
+
+MATCH (v:Variable {run_id: 5273}) RETURN v.file_name AS file_name, count(v) AS variable_count ORDER BY variable_count DESC
+
+19:26
+
+MATCH (v:Variable {run_id: 5381}) RETURN v.file_name AS file_name, count(v) AS variable_count ORDER BY variable_count DESC
+
+19:25
+
+MATCH (v:Variable {run_id: 5273}) RETURN v.file_name AS file_name, count(v) AS variable_count ORDER BY variable_count DESC
+
+19:25
+
+MATCH (v:Variable {run_id: 5381}) RETURN v.file_name AS file_name, count(v) AS variable_count ORDER BY variable_count DESC
+
+18:14
+
+MATCH (v:Variable {run_id: 5315}) RETURN v.file_name AS file_name, count(v) AS variable_count ORDER BY variable_count DESC
+
+18:14
+
+MATCH (v:Variable {run_id: 5273}) RETURN v.file_name AS file_name, count(v) AS variable_count ORDER BY variable_count DESC
+
+18:00
+Failed
+
+MATCH (v:Variable {run_id: 5315}) RETURN count(v) AS dotnet_total UNION MATCH (v:Variable {run_id: 5273}) RETURN count(v) AS python_total
+
+14:31
+
+MATCH (v:Variable {run_id: 5273}) RETURN v.file_name AS file_name, count(v) AS variable_count ORDER BY variable_count DESC
+
+14:31
+
+MATCH (v:Variable {run_id: 5315}) RETURN v.file_name AS file_name, count(v) AS variable_count ORDER BY variable_count DESC
+
+14:29
+
+MATCH (v:Variable) RETURN v LIMIT 3
+
+14:28
+
+MATCH (v:Variable) RETURN keys(v) LIMIT 5
+
+14:27
+
+CALL db.relationshipTypes() YIELD relationshipType RETURN relationshipType ORDER BY relationshipType
+
+14:26
+
+CALL db.labels() YIELD label RETURN label ORDER BY label
+
+14:24
+
+MATCH (f:File) OPTIONAL MATCH (f)-[:CONTAINS]->(v1:Variable)<-[:HAS_FILE]-(r1:Run {run_id: 5315}) OPTIONAL MATCH (f)-[:CONTAINS]->(v2:Variable)<-[:HAS
+
+14:23
+
+MATCH (f:File) OPTIONAL MATCH (f)-[:CONTAINS]->(v1:Variable)<-[:HAS_FILE]-(r1:Run {run_id: 5315}) OPTIONAL MATCH (f)-[:CONTAINS]->(v2:Variable)<-[:HAS
+
+10:51
+
+match (n:Variable) WHERE n.run_id=5315 return count(n)
+
+10:51
+
+match (n:Variable) WHERE n.run_id=5273 return count(n)
+
+10:10
+
+match (n:Variable) WHERE n.run_id=5315 return count(n)
+
+10:10
+
+match (n:Variable) WHERE n.run_id=5273 return count(n)
+
+07:35
+
+match (n:Variable) WHERE n.run_id=5315 return count(n)
+
+07:35
+
+match (n:Variable) WHERE n.run_id=5273 return count(n)
+
+07:27
+
+match (n:Variable) WHERE n.run_id=5273 return count(n)
+
+07:26
+
+match (n:Variable) WHERE n.run_id=5315 return count(n)
+February 17, 2026
+
+18:38
+
+match (n:Variable) WHERE n.run_id=5273 return count(n)
+
+18:37
+
+match (n:Variable) WHERE n.run_id=5315 return count(n)
+
+18:37
+
+match (n:DatabaseEntity) WHERE n.run_id=5315 return n
+
+18:37
+
+match (n) WHERE n.run_id=5315 return n
+
+18:06
+
+match (n:Variable) WHERE n.run_id=5273 return count(n)
+
+18:06
+
+match (n:Variable) WHERE n.run_id=5315 return count(n)
+
+18:06
+
+match (n:DatabaseEntity) WHERE n.run_id=5315 return n
+
+12:51
+
+match (n:Variable) WHERE n.run_id=5315 return count(n)
+
+12:50
+
+match (n:Variable) WHERE n.run_id=5273 return count(n)
+
+12:49
+
+match (n:Variable) WHERE n.run_id=5273 return n
+
+12:49
+
+match (n:ReportCall) WHERE n.run_id=5273 return n
+
+12:49
+
+match (n:ReportInterface) WHERE n.run_id=5273 return n
+
+12:48
+
+match (n:InputEntity) WHERE n.run_id=5273 return n
+
+12:48
+
+match (n:InputInterface) WHERE n.run_id=5273 return n
+
+12:48
+
+match (n:AliasNode) WHERE n.run_id=5273 return n
+
+12:47
+
+match (n:FileEntityNode) WHERE n.run_id=5273 return n
+
+12:46
+
+match (n:IOCall) WHERE n.run_id=5273 return n
+
+12:31
+
+match (n:Servicecall) WHERE n.run_id=5273 return n
+
+12:30
+
+match (n:Servicecall) WHERE n.run_id=5315 return n
+
+12:16
+
+match (n:DatabaseEntity) WHERE n.run_id=5315 return n
+
+10:16
+
+match (n:Dbcall) WHERE n.run_id=5315 return n
+February 16, 2026
+
+22:39
+
+match (n:Dbcall) WHERE n.run_id=5315 return n
+
+22:39
+
+match (n:Dbcall) WHERE n.run_id=5273 return n
+
+22:39
+
+match (n:DatabaseEntity) WHERE n.run_id=5315 return n
+
+22:38
+
+match (n:DatabaseEntity) WHERE n.run_id=5273 return n
+
+22:38
+
+match (n:DatabaseEntity) WHERE n.run_id=5315 return n
+
+22:38
+
+match (n:DatabaseEntity) WHERE n.run_id=5273 return n
+
+13:52
+
+match (n:DatabaseEntity) WHERE n.run_id=5274 return n
+
+13:47
+
+match (n:DatabaseEntity) WHERE n.run_id=5273 return n
+
+13:47
+
+match (n:DatabaseEntity) WHERE n.run_id=5274 return n
+
+13:47
+
+match (n:Dbcall) WHERE n.run_id=5274 return n
+
+13:47
+
+match (n:Dbcall) WHERE n.run_id=5273 return n
+
+13:42
+
+match (n:DatabaseEntity) WHERE n.run_id=5274 return n
+
+13:42
+
+match (n:DatabaseEntity) WHERE n.run_id=5273 return n
+
+13:41
+
+match (n:DatabaseEntity) WHERE n.run_id=5274 return n
+
+13:41
+
+match (n:Dbcall) WHERE n.run_id=5274 return n
+
+13:41
+
+match (n:Dbcall) WHERE n.run_id=5274 return n
+
+13:40
+
+match (n:Dbcall) WHERE n.run_id=5274 return n
+
+13:40
+
+match (n:Dbcall) WHERE n.run_id=5273 return n
+
+13:40
+Failed
+
+match (n:Dbcall) WHEREn.run_id=5273 return n
+February 13, 2026
+
+18:48
+
+MATCH (n)WHERE n.run_id=5229 return DISTINCT labels(n),count(n)
+
+18:43
+
+MATCH (n)WHERE n.run_id=5206 return DISTINCT labels(n),count(n)
+
+15:50
+
+MATCH (n)WHERE n.run_id=5206 return DISTINCT labels(n),count(n)
+
+15:50
+
+MATCH (n)WHERE n.run_id=5206 return DISTINCT labels(n)
+
+15:49
+
+MATCH (n)WHERE n.run_id=5229 return DISTINCT labels(n)
+
+15:27
+
+MATCH (n)WHERE n.run_id=5229 return n
+
+15:27
+Failed
+
+MATCH (n)WHERE n.run_id=5229 return n
+February 12, 2026
+
+10:34
+
+MATCH (n)WHERE n.run_id=5065 return n
+
+10:33
+
+MATCH (n)WHERE n.run_id=5065 return n
+
+10:33
+
+MATCH (n)WHERE n.run_id=5065 return n
+
+10:32
+
+MATCH (n) WHERE (n:Snippet OR n:Callee OR n:DecisionNode OR n:CalculationNode) AND n.run_id = 5065 AND n.file_name IS NOT NULL AND (trim(n.file_
+
+10:32
+
+MATCH (n) WHERE (n:Snippet OR n:Callee OR n:DecisionNode OR n:CalculationNode) AND n.run_id = 5065 AND n.file_name IS NOT NULL AND (toLower(trim
+
+10:09
+
+MATCH (n) WHERE n.run_id = 5065 AND n.file_name IS NOT NULL AND toLower(n.file_name) ENDS WITH '.jcl' MATCH(n)-[*1..5]->(n) WHERE n:Snippet OR n:C
+February 10, 2026
+
+21:20
+
+MATCH (n) WHERE (n:Snippet OR n:Callee OR n:DecisionNode OR n:CalculationNode) AND n.run_id = 5065 AND n.file_name IS NOT NULL AND toLower(trim(
+
+21:20
+
+MATCH (n) WHERE n.run_id = 5065 AND n.file_name IS NOT NULL AND toLower(trim(n.file_name)) ENDS WITH '.jcl' MATCH (n)-[*1..5]->(m) WHERE (m:Snippe
+
+21:19
+
+MATCH (n) WHERE n.run_id = 5065 AND n.file_name IS NOT NULL AND toLower(n.file_name) ENDS WITH '.jcl' MATCH(n)-[*1..5]->(n) WHERE n:Snippet OR n:C
+
+20:29
+
+MATCH (n:Snippet) WHERE n.run_id = 5065 AND toLower(trim(coalesce(n.file_name, n.fileName, ''))) ENDS WITH '.jcl' RETURN id(n) AS id, labels(
+
+20:28
+
+MATCH (n:Snippet) WHERE (n.run_id = 5065 OR n.run_id = '5065') AND toLower(trim(coalesce(n.file_name, n.fileName, ''))) ENDS WITH '.jcl' RETURN id(n
+
+20:22
+
+MATCH (n:Snippet)WHERE n.run_id=5065 return n
+
+20:20
+
+MATCH (n) WHERE any(l IN labels(n) WHERE l IN ['CalculationNode','Snippet','Callee','DecisionNode']) AND (n.run_id = 5065 OR n.run_id = '5065') RETU
+
+20:17
+
+MATCH (n)WHERE n.run_id=5065 return n
+
+20:16
+
+MATCH (n) WHERE any(l IN labels(n) WHERE l IN ['CalculationNode','Snippet','Callee','DecisionNode']) AND (n.run_id = 5065 OR n.run_id = '5065') AN
+
+20:12
+
+MATCH (n) WHERE n.run_id = 5065 RETURN distinct labels(n) AS labels, count(n) AS cnt LIMIT 100
+
+20:10
+
+MATCH (n) WHERE (n:CalculationNode OR n:Snippet OR n:Callee OR n:DecisionNode) AND n.run_id = 5065 AND n.file_name IS NOT NULL AND toLower(trim(
+
+20:07
+
+MATCH (n) WHERE (n:CalculationNode OR n:Snippet OR n:Callee OR n:DecisionNode) AND n.run_id = 5065 AND n.file_name IS NOT NULL AND toLower(trim(
+
+20:02
+
+MATCH (n) WHERE n.run_id = 5065 AND any(label in labels (n) where label in ['CalculationNode' ,'Snippet' ,'Callee' ,'DecisionNode']) AND n.file_na
+
+19:35
+
+match(n) where n.run_id=5065 and n.file_name is NOT NULL return count(n) as total_with_filename
+
+19:29
+
+MATCH (n) WHERE n.run_id = 5065 AND (n:CalculationNode OR n:Snippet OR n:Callee OR n:DecisionNode) AND n.file_name IS NOT NULL RETURN DISTINCT n.f
+
+19:24
+
+MATCH (n) WHERE n.run_id = 5065 AND any(label in labels (n) where label in ['CalculationNode' ,'Snippet' ,'Callee' ,'DecisionNode']) AND n.file_na
+
+19:24
+Failed
+
+MATCH (n) WHERE n.run_id = 5065 AND any(label in labels (n) where label in ['CalculationNode' ,'Snippet' ,'Callee' ,'DecisionNode'] AND n.file_nam
+
+19:23
+Failed
+
+MATCH (n) WHERE n.run_id = 5065 AND any(label in labels (n)) where label in ['CalculationNode' ,'Snippet' ,'Callee' ,'DecisionNode'] AND n.file_na
+
+19:14
+
+MATCH (n) WHERE n.run_id = 5065 AND (n:CalculationNode OR n:Snippet OR n:Callee OR n:DecisionNode) AND n.file_name IS NOT NULL AND toLower(trim(
+
+19:14
+Failed
+
+MATCH (n) WHERE n.run_id = 5065 AND (n:CalculationNode OR n:Snippet OR n:Callee OR n:DecisionNode) AND exists(n.file_name) AND toLower(trim(n.fi
+
+19:13
+Failed
+
+MATCH (n) WHERE n.run_id = 5065 AND (n:CalculationNode OR n:Snippet OR n:Callee OR n:DecisionNode) AND exists(n.file_name) RETURN count(n) as coun
+
+19:13
+Failed
+
+MATCH (n) WHERE n.run_id = 5065 AND (n:CalculationNode OR n:Snippet OR n:Callee OR n:DecisionNode) AND exists(n.file_name) RETURN count(n) as coun
+
+19:11
+Terminated
+
+MATCH (n) WHERE n.run_id = 5065 AND (n:CalculationNode OR n:Snippet OR n:Callee OR n:DecisionNode) AND exists(n.file_name) RETURN n.file_name LIMI
+
+19:10
+Failed
+
+MATCH (n) WHERE n.run_id = 5065 AND (n:CalculationNode OR n:Snippet OR n:Callee OR n:DecisionNode) AND exists(n.file_name) RETURN count(n) as coun
+
+19:02
+Failed
+
+MATCH (n) WHERE n.run_id = 5065 AND (n:CalculationNode OR n:Snippet OR n:Callee OR n:DecisionNode) AND exists(n.file_name) RETURN count(n) as coun
+
+18:59
+
+MATCH (n) WHERE n.run_id = 5065 AND (n:CalculationNode OR n:Snippet OR n:Callee OR n:DecisionNode) RETURN count(n) as nodeCount, labels(n) as nodeLa
+
+18:57
+
+MATCH (n) WHERE toLower(n.file_name) ENDS WITH '.jcl' AND n.run_id = 5065 AND ( n:CalculationNode OR n:Snippet OR n:Callee OR n
+
+18:56
+
+MATCH (n) WHERE toLower(n.file_name) ENDS WITH '.jcl' AND n.run_id = 5062 AND ( n:CalculationNode OR n:Snippet OR n:Callee OR n
+
+18:48
+
+MATCH (n)WHERE n.run_id=5062 return n
+
+18:36
+
+MATCH (n)WHERE n.run_id=5005 return n
+
+18:36
+Failed
+
+MATCH (n)WHERE n.run_id=5005 return n
+February 9, 2026
+
+13:18
+
+MATCH (n)WHERE n.run_id=5005 return n
+
+13:01
+
+MATCH (n)WHERE n.run_id=5005 return n
+
+12:57
+
+MATCH (n)WHERE n.run_id=5005 return n
+February 5, 2026
+
+20:21
+
+MATCH (n)WHERE n.run_id=4957 return n
+
+20:21
+Failed
+
+MATCH (n)WHERE n.run_id=4957 return n
+
+14:11
+
+MATCH (n)WHERE n.run_id=4940 return n
+
+13:53
+
+MATCH (n)WHERE n.run_id=4938 return n.project_id
+
+13:52
+
+MATCH (n)WHERE n.run_id=4934 return n.project_id
+
+13:52
+
+MATCH (n:ExecutionFlow)WHERE n.run_id=4934 return n.project_id
+
+10:27
+
+MATCH (n:ExecutionFlow)WHERE n.run_id=4934 return n
+
+10:26
+
+MATCH (n)WHERE n.run_id=4934 return n
+January 20, 2026
+
+15:49
+
+MATCH (n:ExecutionFlow)WHERE n.run_id=4798 return n
+January 19, 2026
+
+16:51
+
+MATCH (n:ExecutionFlow)WHERE n.run_id=4798 return n
+
+16:35
+
+MATCH (n:Snippet)WHERE n.run_id=4798 return n
+
+16:34
+Failed
+
+MATCH (n:Snippet)WHERE n.run_id=4797 return n
+
+15:48
+
+MATCH (n:Snippet)WHERE n.run_id=4797 return n
+
+15:48
+
+MATCH (n:Snippet)WHERE n.run_id=4797 return n.type
+
+15:48
+
+MATCH (n:Snippet)WHERE n.run_id=4797 return n.type
+
+15:44
+
+MATCH (n:ExecutionFlow)WHERE n.run_id=4797 return n
+
+15:44
+
+MATCH (n:ExecutionFlow)WHERE n.run_id=4797 return n
+
+15:42
+
+MATCH (n:ExecutionFlow)WHERE n.run_id=4797 return n
+January 16, 2026
+
+14:49
+
+MATCH (n:ExecutionFlow)WHERE n.run_id=4778 return n
+
+14:49
+
+MATCH (n:ExecutionFlow)WHERE n.run_id=4757 return n
+
+14:48
+
+MATCH (n:ExecutionFlow)WHERE n.run_id=4778 return COLLECT(n.key)
+
+14:48
+
+MATCH (n) WHERE n.run_id = 4778 RETURN labels(n) AS labels, COUNT(CASE WHEN n.analysis_status = "NOT_STARTED" THEN 1 END) AS not_started_count, COUNT(
+
+11:24
+
+MATCH (n) WHERE n.run_id = 4778 RETURN labels(n) AS labels, COUNT(CASE WHEN n.analysis_status = "NOT_STARTED" THEN 1 END) AS not_started_count, COUNT(
+
+10:51
+
+MATCH (n) WHERE n.run_id = 4778 RETURN labels(n) AS labels, COUNT(CASE WHEN n.analysis_status = "NOT_STARTED" THEN 1 END) AS not_started_count, COUNT(
+
+10:49
+
+MATCH (n) WHERE n.run_id = 4778 RETURN labels(n) AS labels, COUNT(CASE WHEN n.analysis_status = "NOT_STARTED" THEN 1 END) AS not_started_count, COUNT(
+
+10:44
+
+MATCH (n) WHERE n.run_id = 4757 RETURN labels(n) AS labels, COUNT(CASE WHEN n.analysis_status = "NOT_STARTED" THEN 1 END) AS not_started_count, COUNT(
+
+10:43
+Failed
+
+MATCH (n) WHERE n.run_id = 4757 RETURN labels(n) AS labels, COUNT(CASE WHEN n.analysis_status = "NOT_STARTED" THEN 1 END) AS not_started_count, COUNT(
+January 9, 2026
+
+11:50
+
+MATCH (n:ExecutionFlow)WHERE n.run_id=4757 return COLLECT(n.key)
+
+11:28
+
+MATCH (n:FunctionalModule)WHERE n.run_id=4757 return n
+
+11:27
+Failed
+
+MATCH (n:FunctionalModule) return n
+
+10:48
+
+MATCH (a:JclJob {project_id:3045}) return a
+
+10:46
+
+MATCH (n) WHERE n.run_id = 4757 RETURN labels(n) AS labels, COUNT(CASE WHEN n.analysis_status = "NOT_STARTED" THEN 1 END) AS not_started_count, COUNT(
+
+10:45
+
+MATCH (a:ExecutionFlow {project_id:3045}) return a
+
+10:45
+Failed
+
+MATCH (a:ExecutionFlow {project_id:3045}) return a
+January 8, 2026
+
+18:17
+
+MATCH (a:ExecutionFlow {project_id:3045}) return a
+
+18:17
+
+MATCH (n) WHERE n.run_id = 4757 RETURN labels(n) AS labels, COUNT(CASE WHEN n.analysis_status = "NOT_STARTED" THEN 1 END) AS not_started_count, COUNT(
+
+18:10
+
+MATCH (a:ExecutionFlow {project_id:3045}) return a
+
+17:58
+
+MATCH (n) WHERE n.run_id = 4757 RETURN labels(n) AS labels, COUNT(CASE WHEN n.analysis_status = "NOT_STARTED" THEN 1 END) AS not_started_count, COUNT(
+
+17:06
+
+MATCH (n) WHERE n.run_id = 4757 RETURN labels(n) AS labels, COUNT(CASE WHEN n.analysis_status = "NOT_STARTED" THEN 1 END) AS not_started_count, COUNT(
+
+16:57
+
+MATCH (a:Snippet {run_id: 4757})-[r:CALLS]->(b:Snippet) return a,r,b
+
+16:48
+
+MATCH (a:Parent {project_id:3045}) return a
+
+16:46
+
+MATCH (a:ExecutionFlow {project_id:3045}) return a
+
+16:33
+
+MATCH(n) WHERE n.run_id=4757 RETURN n
+
+16:32
+
+MATCH (a:Snippet {run_id: 4757})-[r:CALLS]->(b:Snippet) return a,r,b
+
+16:32
+
+MATCH (a:Snippet {run_id: 4318})-[r:CALLS]->(b:Snippet) return a,r,b
+November 24, 2025
+
+15:56
+
+MATCH (a:Snippet {run_id: 4318})-[r:CALLS]->(b:Snippet) return a,r,b
+
+15:36
+
+MATCH (a:ExecutionFlow {project_id:4318}) return a
+
+14:48
+
+MATCH (a:ExecutionFlow {project_id:8}) return a
+
+14:46
+
+MATCH (a:ExecutionFlow {project_id:8}) return a
+
+14:44
+
+MATCH (a:ExecutionFlow {run_id: 4318}) return a
+November 19, 2025
+
+13:13
+
+MATCH (a:ExecutionFlow {run_id: 4318}) return a
+
+13:13
+
+MATCH (a:Snippet {run_id: 4318})-[r:CALLS]->(b:Snippet) return a,r,b
+
+13:06
+
+MATCH (a:ExecutionFlow {run_id: 4318}) return a
+
+13:03
+
+MATCH (a:ExecutionFlow {run_id: 4318}) return a
+
+13:02
+
+MATCH (a:Snippet {run_id: 4318})-[r:CALLS]->(b:Snippet) return a,r,b
+
+13:01
+
+MATCH (a:ExecutionFlow {run_id: 4318}) return a
+
+12:44
+
+MATCH (a:ExecutionFlow {run_id: 4318}) return a
+
+12:42
+
+MATCH (a:ExecutionFlow {run_id: 4318}) return a
+
+12:42
+
+MATCH (a:ExecutionFlow {run_id: 4318}) return a
+
+12:42
+
+MATCH (a:ExecutionFlow {run_id: 4318}) return a
+
+12:40
+
+MATCH (a:ExecutionFlow {run_id: 4318}) return a
+November 14, 2025
+
+12:44
+
+MATCH(n {run_id:10}) return n
+
+12:44
+Failed
+
+MATCH(n {rule_id10}) return n
+
+12:44
+Failed
+
+MATCH(n {rule_id10}) return n
+
+12:43
+
+match(n:Snippet {run_id:10, function_name:'M214HI'}) return n.snippet
+
+11:41
+
+match(n:Snippet {run_id:10, function_name:'M214HI'}) return n.snippet
+November 12, 2025
+
+18:11
+
+MATCH (a:ExecutionFlow {run_id: 4318}) return a
+
+18:06
+
+MATCH (a:ExecutionFlow {run_id: 4318}) return a
+
+15:23
+
+MATCH (a:ExecutionFlow {run_id: 4318}) return a
+
+12:52
+
+MATCH (a:ExecutionFlow {run_id: 4318}) return a
+
+12:44
+
+MATCH (a:ExecutionFlow {run_id: 4318}) return a
+
+12:44
+
+MATCH (a:ExecutionFlow {run_id: 4318}) return a
+
+12:44
+
+MATCH (a:ExecutionFlow {run_id: 4318}) return a
+
+12:44
+
+MATCH (a:ExecutionFlow {run_id: 4318}) return a
+
+12:44
+
+MATCH (a:ExecutionFlow {run_id: 4318}) return a
+
+12:44
+
+MATCH (a:ExecutionFlow {run_id: 4318}) return a
+
+12:44
+
+MATCH (a:ExecutionFlow {run_id: 4318}) return a
+
+12:44
+
+MATCH (a:ExecutionFlow {run_id: 4318}) return a
+
+12:41
+
+MATCH (a:ExecutionFlow {run_id: 4318}) return a
+
+12:40
+
+MATCH (a:ExecutionFlow {run_id: 4318}) return a
+
+12:40
+
+MATCH (a:ExecutionFlow {run_id: 4318}) return a
+
+12:40
+
+MATCH (a:ExecutionFlow {run_id: 4318}) return a
+
+12:40
+
+MATCH (a:ExecutionFlow {run_id: 4318}) return a
+
+11:41
+
+MATCH (a:ExecutionFlow {run_id: 4318}) return a
+November 11, 2025
+
+21:37
+
+MATCH (a:ExecutionFlow {run_id: 4318}) return a
+
+21:36
+
+MATCH (a:Snippet {run_id: 4318})-[r:CALLS]->(b:Snippet) return a,r,b
+
+21:11
+
+MATCH (a:Snippet {run_id: 4318})-[r:CALLS]->(b:Snippet) return a,r,b
+
+21:11
+
+MATCH (a:ExecutionFlow {run_id: 4318}) return a
+
+18:30
+
+MATCH (s:Snippet)-[:IS_A_CHILD_OF_PARENT]->(p:Parent) WHERE s.key = "0f5a7c76-625a-4bbc-b34d-ca5eb6a2f1d7" RETURN p
+
+18:26
+
+MATCH (a:ExecutionFlow {run_id: 4318}) return a
+
+16:50
+
+MATCH (a:ExecutionFlow {run_id: 4318}) return a
+
+16:09
+
+MATCH (a:ExecutionFlow {run_id: 4318}) return a
+
+15:58
+
+MATCH (a:ExecutionFlow {run_id: 4318}) return a
+
+15:58
+
+MATCH (a:Snippet {run_id: 4318})-[r:CALLS]->(b:Snippet) return a,r,b
+
+15:57
+
+MATCH (a:ExecutionFlow {run_id: 4318}) return a
+
+15:57
+
+MATCH (a:ExecutionFlow {run_id: 4318}) return a
+
+15:57
+
+MATCH (a:ExecutionFlow {run_id: 4318}) return a
+November 10, 2025
+
+18:32
+
+MATCH (a:Snippet {run_id: 4318})-[r:CALLS]->(b:Snippet) return a,r,b
+
+18:28
+
+MATCH (a:Snippet {run_id: 4318})-[r:CALLS]->(b:Snippet) return a,r,b
+
+18:28
+
+MATCH (a:ExecutionFlow {run_id: 4318}) return a
+
+17:07
+
+MATCH (a:ExecutionFlow {run_id: 4318}) return a
+
+16:23
+
+MATCH (a:ExecutionFlow {run_id: 4318}) return a
+
+16:22
+
+MATCH (a:Snippet {run_id: 4318})-[r:CALLS]->(b:Snippet) return a,r,b
+
+16:21
+
+MATCH (a:ExecutionFlow {run_id: 4318}) return a
+
+16:20
+
+MATCH (a:ExecutionFlow {run_id: 4318}) return a
+
+16:06
+
+MATCH (a:ExecutionFlow {run_id: 4318}) return a
+
+16:02
+
+MATCH (a:ExecutionFlow {run_id: 4318}) return a
+
+16:01
+
+MATCH (a:ExecutionFlow {run_id: 4318}) return a
+
+16:01
+
+MATCH (a:ExecutionFlow {run_id: 4318}) return a
+
+14:24
+
+MATCH (a:ExecutionFlow {run_id: 4318}) return a
+
+14:24
+
+MATCH (a:Snippet {run_id: 4318})-[r:CALLS]->(b:Snippet) return a,r,b
+
+14:23
+
+MATCH (a:Snippet {run_id: 4318})-[r:CALLS]->(b:Snippet) return a,r,b
+November 9, 2025
+
+14:58
+
+MATCH (a:Snippet {run_id: 4318})-[r:CALLS]->(b:Snippet) return a,r,b
+
+14:09
+
+MATCH (a:Snippet {run_id: 4318})-[r:CALLS]->(b:Snippet) return a,r,b
+November 8, 2025
+
+00:39
+
+MATCH (a:Snippet {run_id: 4318})-[r:CALLS]->(b:Snippet) return a,r,b
+November 7, 2025
+
+22:25
+
+MATCH (a:Snippet {run_id: 4318})-[r:CALLS]->(b:Snippet) return a,r,b
+
+21:44
+
+MATCH (a:Snippet)-[r:CALLS]->(b:Snippet) WHERE coalesce(a.file_name,a.file,'') IN ['ABCDEF.cbl','TEST01.cbl'] OR coalesce(b.file_name,b.file,'') IN
+
+14:03
+
+MATCH (a:Snippet)-[r:CALLS]->(b:Snippet) RETURN a.key AS src, b.key AS dst, r.execution_order AS exec_order, r.behavior AS behavior
+
+13:57
+
+Match (n:ExecutionFlow) where n.run_id=4318 return n
+
+13:57
+
+Match (n:ExecutionFlow) where n.run_id=4318 return n.flow_scrip
+
+12:34
+
+Match (n:ExecutionFlow) where n.run_id=4318 return n.flow_scrip
+
+12:34
+
+MATCH (s:ExecutionFlow) WHERE s.type = 'ROOT' AND s.run_id = 4318 AND s.project_id = 2626 RETURN s SKIP 0 LIMIT 2
+
+12:32
+
+MATCH (s:Snippet) WHERE s.type = 'ROOT' AND s.run_id = 4318 AND s.project_id = 2626 RETURN s SKIP 0 LIMIT 20
+
+12:27
+
+MATCH (s:Snippet) WHERE s.type = 'ROOT' AND s.run_id = 4318 AND s.project_id = 2626 RETURN s SKIP 0 LIMIT 20
+
+12:27
+
+MATCH (s:Snippet) WHERE s.type = 'ROOT' AND s.run_id = 4318 AND s.project_id = 2626 RETURN s SKIP 0 LIMIT 20
+November 6, 2025
+
+22:15
+
+MATCH (a:Snippet)-[r:CALLS]->(b:Snippet) RETURN a.key AS src, b.key AS dst, r.execution_order AS exec_order, r.behavior AS behavior
+
+12:33
+
+MATCH (s:Snippet) WHERE s.type = 'ROOT' AND s.run_id = 4318 AND s.project_id = 2626 RETURN s SKIP 0 LIMIT 20
+
+12:32
+
+MATCH (a:Snippet)-[r:CALLS]->(b:Snippet) RETURN a.key AS src, b.key AS dst, r.execution_order AS order, r.behavior AS behavior
+
+12:32
+
+MATCH (a:Snippet)-[r:CALLS]->(b:Snippet) RETURN a.key AS src, b.key AS dst, r.execution_order AS order, r.behavior AS behavior
+
+12:32
+
+MATCH (a:Snippet)-[r:CALLS]->(b:Snippet) RETURN a.key AS src, b.key AS dst, r.execution_order AS order, r.behavior AS behavior
+
+01:06
+
+MATCH (s:Snippet {key: 'd0bf1df8-7ba5-4961-b0c9-6f0194ea6617'}) OPTIONAL MATCH (s)-[:CALLS*0..50]->(reachable) WITH s, collect(DISTIN
+
+00:56
+
+MATCH (a:Snippet)-[r:CALLS]->(b:Snippet) RETURN a.key AS src, b.key AS dst, r.execution_order AS order, r.behavior AS behavior
+
+00:52
+
+MATCH (s:Snippet) WHERE s.type = 'ROOT' AND s.run_id = 4318 AND s.project_id = 2626 RETURN s SKIP 0 LIMIT 20
+November 5, 2025
+
+23:53
+
+Match (n:Snippet) where n.run_id=4318 and n.function_name="TEST-B05-EXIT" return n
+
+18:31
+
+Match (n:Snippet) where n.run_id=4318 and n.function_name="TEST-B05-EXIT" return n
+
+18:29
+
+Match (n:Snippet) where n.run_id=4318 and n.function_name="TEST-B05-10" return n
+
+18:29
+
+Match (n:Snippet) where n.run_id=4318 and n.function_name="TEST-B05-10" return n.flow_script
+
+13:01
+
+Match (n:ExecutionFlow) where n.run_id=4318 return n.flow_script
+
+13:00
+
+Match (n:ExecutionFlow) where n.run_id=4318 return n.flow_scrip
+
+13:00
+
+Match (n:ExecutionFlow) where n.run_id=4318 return n
+
+13:00
+
+Match (n:ExecutionFlow) where n.run_id=4318 return n
+
+12:36
+
+// cypher MATCH (s:Snippet {key:'d0bf1df8-7ba5-4961-b0c9-6f0194ea6617'}) CALL apoc.path.expandConfig(s, { relationshipFilter: 'CALLS>', minLevel:
+
+12:30
+
+// cypher MATCH (s:Snippet {key:'d0bf1df8-7ba5-4961-b0c9-6f0194ea6617'})-[r:CALLS]->(t) RETURN r.execution_order AS exec_order, r.behavior AS behavior
+November 4, 2025
+
+19:32
+
+MATCH (s:Snippet {key: 'd0bf1df8-7ba5-4961-b0c9-6f0194ea6617'}) CALL apoc.path.expandConfig(s, { relationshipFilter: 'CALL
+
+19:30
+Failed
+
+MATCH (s:Snippet {key: 'd0bf1df8-7ba5-4961-b0c9-6f0194ea6617'}) CALL apoc.path.expandConfig(s, { relationshipFilter: 'CALL
+
+19:25
+
+MATCH (s:Snippet {key: 'd0bf1df8-7ba5-4961-b0c9-6f0194ea6617'}) CALL apoc.path.expandConfig(s, { relationshipFilter: 'CALLS>',
+
+18:59
+
+Match (n:Snippet) where n.run_id=4318 and n.type='ROOT' return n
+
+17:50
+
+Match (n:Snippet) where n.run_id=4379 return n
+
+16:21
+
+Match (n:Snippet) where n.run_id=4379 return n
+
+16:21
+
+Match (n:Snippet) where n.run_id=4379 return n.function_name, n.exit_program_status
+
+16:06
+
+Match (n:Snippet) where n.run_id=4379 return n.function_name, n.exit_program_status
+
+16:06
+
+Match (n:Snippet) where n.run_id=4379 return n.function_name, n.exit_program_status
+October 31, 2025
+
+16:30
+
+Match (n:Snippet) where n.run_id=4318 return n.function_name, n.exit_program_status
+
+16:29
+
+Match (n:Snippet) where n.run_id=4318 return n
+
+16:27
+
+Match (n:ExecutionFlow) where n.run_id=4318 return n
+October 29, 2025
+
+18:50
+
+MATCH(n:Snippet)-[r:CALLS]->(s) WHERE n.run_id=4318 RETURN n,r,s
+
+16:33
+
+MATCH(n:Snippet)-[r:CALLS]->(s) WHERE n.run_id=4318 RETURN n,r,s
+
+16:14
+
+MATCH(n:Snippet)-[r:CALLS]->(s) WHERE n.run_id=4286 RETURN n,r,s
+
+16:14
+Failed
+
+MATCH(n:Snippet)-[r:CALLS]->(s) WHERE n.run_id=4286 RETURN n,r,s
+
+15:50
+
+:connect
+
+15:50
+
+:connect
+
+15:50
+
+:connect
+
+15:43
+
+MATCH(n:Snippet)-[r:CALLS]->(s) WHERE n.run_id=4286 RETURN n,r,s
+
+15:39
+
+MATCH(n:Snippet) WHERE n.run_id=4318 RETURN n
+
+15:38
+
+MATCH(n) WHERE n.run_id=4318 RETURN n
+
+15:32
+
+MATCH(n) WHERE n.run_id=4318 RETURN n
+
+15:23
+
+MATCH(n) WHERE n.run_id=4318 RETURN n
+The history is limited to the 300 most recent entries. This limit can be adjusted in the settings.
+neo4j$
+
+
+
+
+
+match (n:Variable) WHERE n.run_id=5273 return count(n)
+
+
+
+
+
+Table
+RAW
+
+
+
+1
+23355
+Started streaming 1 record after 2 ms and completed after 2,772 ms.
+
+match (n:Variable) WHERE n.run_id=5381 return count(n)
+
+
+
+
+
+Table
+RAW
+
+
+
+1
+33306
+Started streaming 1 record after 3 ms and completed after 1,841 ms.
+
+MATCH (v:Variable {run_id: 5381}) RETURN v.file_name AS file_name, count(v) AS variable_count ORDER BY variable_count DESC
+
+
+
+
+
+Table
+RAW
+
+
+
+1
+"wspCrewSchedule.sql"
+19557
+2
+"wSP_ChgLayoverInfo_CH.sql"
+8711
+3
+"wSP_HC_HotelInfo.sql"
+1702
+4
+"P_QueueMgt_TripsQueue.sql"
+1697
+5
+"P_MakeGrndEntry_Dep.sql"
+1385
+6
+"U_Insert_tblTravelPair_CH.sql"
+185
+7
+"wSP_SelectHotelAirlines_CH.sql"
+69
+Started streaming 7 records after 1 ms and completed after 1,835 ms.
+
+MATCH (v:Variable {run_id: 5273}) RETURN v.file_name AS file_name, count(v) AS variable_count ORDER BY variable_count DESC
+
+
+
+
+
+Table
+RAW
+
+
+
+1
+"wspCrewSchedule.sql"
+13649
+2
+"wSP_ChgLayoverInfo_CH.sql"
+4804
+3
+"P_QueueMgt_TripsQueue.sql"
+1689
+4
+"wSP_HC_HotelInfo.sql"
+1456
+5
+"P_MakeGrndEntry_Dep.sql"
+1400
+6
+"U_Insert_tblTravelPair_CH.sql"
+285
+7
+"wSP_SelectHotelAirlines_CH.sql"
+72
+ 5381 is the dotnet run id
