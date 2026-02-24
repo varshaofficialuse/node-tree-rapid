@@ -1,54 +1,1043 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Text.RegularExpressions;
+using Antlr4.Runtime;
+using Antlr4.Runtime.Misc;
+using Antlr4.Runtime.Tree;
+using ParserService.Entities.Models;
+using ParserService.Entities.Schemas;
+using ParserService.Entities.Entities;
+using ParserService.Infrastructure.Utils;
 
 namespace TsqlParserProject
 {
-    public class TSqlPreprocessor
+    public class CustomTSqlParser : TSqlParserBaseVisitor<object>
     {
-        private string singleLineCommentPattern = @"(?:^|\s)(?:---|--)[^\n]*";
-        private string multiLineCommentPattern = @"/\*[\s\S]*?\*/";
-        private List<string> unwantedLinePatterns = new()
-        {
-            @"^[ \t]*Text\s+--.*$",
-            @"^[ \t]*Completion\stime:.*$"
-        };
+        public const string MAIN_SNIPPET = "MAIN_SNIPPET";
+        public static readonly string[] target_functions = { "sp_OACreate", "sp_OADestroy", "sp_OAGetErrorInfo", "sp_OAMethod", "sp_OASetProperty", "sp_OAStop", "sp_OAGetProperty" };
 
-        public string RemoveUnwantedLines(string fileContent)
+        public enum CalleeConstructType { EXECUTE, SCALAR_FUNCTION }
+        public enum ServiceCallConstructType { EXECUTE, ROWSET_FUNCTION }
+        public enum LoopEntityType { WHILE }
+        public enum RuleConstructType { IF_CONSTRUCT, SWITCH_CONSTRUCT }
+        public enum DbCallLevel { PARENT, CHILD }
+        public enum DbCallDataEntity_TYPE { SELECT, INSERT, UPDATE, DELETE }
+        public enum CalleeBehavior { RETURNS }
+
+        public CodeComprehensionMetadata projectMetadata { get; set; }
+        public string project_id { get; set; }
+        public string path { get; set; }
+        public string file_content { get; set; }
+        public ICharStream input_stream { get; set; }
+        public CommonTokenStream token_stream { get; set; }
+        public string file_name { get; set; }
+        public string folder_name { get; set; }
+        public FunctionSnippetSchema current_function { get; set; }
+
+        public int current_if_depth = 0;
+        public int current_case_depth = 0;
+        public int current_loop_depth = 0;
+        public List<FunctionSnippetSchema> function_snippets = new();
+        public Stack<FunctionSnippetSchema> function_snippet_stack = new();
+
+        public List<DecisionNodeSchema> main_program_decision_nodes = new();
+        public HashSet<string> column_name = new();
+        public Dictionary<string, string> table_alias = new();
+        public HashSet<(string, string)> unique_fields = new();
+        public List<FunctionCallee> main_program_callees = new();
+        public List<ServiceCallDataEntity> main_program_service_calls = new();
+        public List<DbCallDataEntity> main_program_dbcalls = new();
+        public List<CalculationEntity> main_program_calculations = new();
+        public List<TransactionCommitEntity> main_program_transaction_commits = new();
+        public List<TransactionRollbackEntity> main_program_transaction_rollbacks = new();
+        public List<object> main_program_io_calls = new();
+        public List<LoopEntityNodeSchema> main_program_loop_entities = new();
+        public List<DatabaseEntitySchema> main_program_database_entities = new();
+        public List<object> main_program_input_entities = new();
+        public List<DatabaseFieldSchema> main_program_database_fields = new();
+
+        public List<object> entities = new();
+        public List<object> entity_metadata = new();
+        public List<object> imports = new();
+        public List<object> aliases = new();
+
+        public int execution_order = 0;
+        public int callee_execution_order = 0;
+        public int snippet_execution_order = 0;
+
+        public List<object> return_control_constructs = new();
+        public int current_dbcall_depth = 0;
+        public Stack<DbCallDataEntity> db_call_stack = new();
+        public int db_call_execution_order = 0;
+
+        public ConstantVariableExtractor cve = new();
+        public HashSet<int> comment_tokens = new() { TSqlLexer.COMMENT, TSqlLexer.LINE_COMMENT };
+
+        public CustomTSqlParser(CodeComprehensionMetadata projectMetadata, string filePath, string file_content, ICharStream input_stream, CommonTokenStream token_stream)
         {
-            foreach (var pattern in unwantedLinePatterns)
+            this.projectMetadata = projectMetadata;
+            this.project_id = projectMetadata.ProjectId.ToString();
+            this.path = filePath;
+            this.file_content = file_content;
+            this.input_stream = input_stream;
+            this.token_stream = token_stream;
+            this.file_name = Path.GetFileName(this.path);
+            this.folder_name = Path.GetFileName(Path.GetDirectoryName(filePath));
+        }
+
+        public string GetOriginalTextFromContext(dynamic ctx)
+        {
+            return input_stream.GetText(new Interval(ctx.Start.StartIndex, ctx.Stop.StopIndex));
+        }
+
+        public string GetSnippetTextFromContext(dynamic ctx)
+        {
+            int startIdx = ctx.Start.TokenIndex;
+            int stopIdx = ctx.Stop.TokenIndex;
+            var tokens = token_stream.GetTokens(startIdx, stopIdx + 1);
+            return string.Join("", tokens.Where(t => !comment_tokens.Contains(t.Type)).Select(t => t.Text));
+        }
+
+        public string GetCurrentContextName(dynamic ctx)
+        {
+            var p = ctx;
+            while (p != null)
             {
-                fileContent = Regex.Replace(fileContent, pattern, match =>
-                {
-                    int lineCount = match.Value.Count(c => c == '\n');
-                    return new string('\n', lineCount);
-                }, RegexOptions.Multiline);
+                string typeName = p.GetType().Name;
+                if (typeName == "Create_or_alter_functionContext") return ((string)p.funcName.procedure.GetText()).Trim('[', ']');
+                if (typeName == "Create_or_alter_procedureContext") return ((string)p.procName.procedure.GetText()).Trim('[', ']');
+                if (typeName == "Create_or_alter_dml_triggerContext" || typeName == "Create_or_alter_ddl_triggerContext")
+                    return ((string)p.simple_name().name.GetText()).Trim('[', ']');
+                p = p.Parent;
             }
-            return fileContent;
+            return MAIN_SNIPPET;
         }
 
-        public string ExtractComments(string fileContent)
+        public List<VariableEntity> CreateVariableEntityList(List<DataDefinitionJSON> variables)
         {
-            var singleLineComments = Regex.Matches(fileContent, singleLineCommentPattern, RegexOptions.Multiline)
-                                          .Cast<Match>().Select(m => m.Value);
-            var multiLineComments = Regex.Matches(fileContent, multiLineCommentPattern, RegexOptions.Multiline)
-                                         .Cast<Match>().Select(m => m.Value);
-            
-            return string.Join("\n", singleLineComments.Concat(multiLineComments));
-        }
-
-        public string RemoveComments(string fileContent)
-        {
-            string textWithoutComments = Regex.Replace(fileContent, singleLineCommentPattern, "", RegexOptions.Multiline);
-            
-            textWithoutComments = Regex.Replace(textWithoutComments, multiLineCommentPattern, match =>
+            return variables.Select(v => new VariableEntity
             {
-                int lineCount = match.Value.Count(c => c == '\n');
-                return new string('\n', lineCount);
-            }, RegexOptions.Multiline);
+                Term = v.Term,
+                Type = v.Type,
+                UsageContext = v.UsageContext,
+                Meaning = v.Meaning,
+                FilePath = v.FilePath
+            }).ToList();
+        }
 
-            return textWithoutComments;
+        public (HashSet<string>, HashSet<string>, List<string>) ExtractTableSource(TSqlParser.Table_sourceContext table_source)
+        {
+            var tables = new HashSet<string>();
+            var aliases = new HashSet<string>();
+            var filter_conditions = new List<string>();
+
+            if (table_source != null)
+            {
+                var tsi = table_source.table_source_item();
+                if (tsi.as_table_alias() != null) aliases.Add(GetOriginalTextFromContext(tsi.as_table_alias()));
+                if (tsi.full_table_name() != null) tables.Add(GetOriginalTextFromContext(tsi.full_table_name()));
+
+                if (table_source.join_part() != null)
+                {
+                    foreach (var join in table_source.join_part())
+                    {
+                        if (join.join_on() != null)
+                        {
+                            var join_on = join.join_on();
+                            if (join_on.search_condition() != null)
+                                filter_conditions.Add(GetOriginalTextFromContext(join_on.search_condition()));
+                            
+                            var result = ExtractTableSource(join_on.table_source());
+                            foreach (var t in result.Item1) tables.Add(t);
+                            foreach (var a in result.Item2) aliases.Add(a);
+                            filter_conditions.AddRange(result.Item3);
+                        }
+                    }
+                }
+            }
+            return (tables, aliases, filter_conditions);
+        }
+
+        public void CreateExtractedCalculationSnippet(string snippet, string function_name, int func_start_line)
+        {
+            var extractData = cve.ExtractMathematicalCalculations(snippet);
+            var extractDataStartLine = cve.ExtractMathematicalCalculationsStartLine(snippet);
+
+            for (int cnt = 0; cnt < extractData.Count; cnt++)
+            {
+                try
+                {
+                    var lineDict = extractData[cnt];
+                    string resultantData = "";
+                    string expressionData = "";
+                    string matchGroup = (string)lineDict["match_group"];
+
+                    if (matchGroup.Contains("="))
+                    {
+                        var matchData = matchGroup.Split('=');
+                        resultantData = matchData[0];
+                        expressionData = matchData[1];
+                    }
+                    else
+                    {
+                        expressionData = matchGroup;
+                    }
+
+                    var variablesDetails = cve.ExtractConstantsVariables(string.Join(" ", expressionData.ToCharArray()), this.path);
+                    var variableEntities = CreateVariableEntityList(variablesDetails);
+
+                    string matchedData = expressionData.Trim();
+                    bool keyword = matchedData.Contains("SELECT", StringComparison.OrdinalIgnoreCase);
+
+                    if (!keyword)
+                    {
+                        var operands = GetOperands(matchedData);
+                        var linesResult = FindTargetLines(matchedData, (int)extractDataStartLine[cnt]["start"]);
+
+                        var calculationEntity = new CalculationEntity
+                        {
+                            Name = function_name,
+                            Tech = projectMetadata.Language,
+                            FileName = file_name,
+                            FilePath = path,
+                            StartLineNumber = linesResult.Item1,
+                            EndLineNumber = linesResult.Item2,
+                            ProgramId = file_name,
+                            Snippet = matchedData,
+                            Resultant = resultantData,
+                            Operands = operands,
+                            Variables = variableEntities.Select(v => new DataDefinitionJSON { Term = v.Term, Type = v.Type, FilePath = v.FilePath, Meaning = v.Meaning, UsageContext = v.UsageContext }).ToList()
+                        };
+
+                        if (current_function != null) current_function.Calculation.Add(calculationEntity);
+                        else main_program_calculations.Add(calculationEntity);
+                    }
+                }
+                catch (Exception) { }
+            }
+        }
+
+        public FunctionSnippetSchema CreateFunctionSnippet(dynamic ctx)
+        {
+            execution_order = 0;
+            callee_execution_order = 0;
+            current_if_depth = 0;
+            current_case_depth = 0;
+            snippet_execution_order++;
+
+            int start_line_number = ctx.Start.Line;
+            int end_line_number = ctx.Stop.Line;
+            string function_name = GetCurrentContextName(ctx);
+
+            string class_name = file_name;
+            string typeName = ctx.GetType().Name;
+            if (typeName == "Create_or_alter_functionContext") class_name = (string)ctx.funcName.GetText();
+            if (typeName == "Create_or_alter_procedureContext") class_name = (string)ctx.procName.GetText();
+            if (typeName == "Create_or_alter_dml_triggerContext" || typeName == "Create_or_alter_ddl_triggerContext")
+                class_name = (string)ctx.simple_name().GetText();
+
+            string snippet_text = GetOriginalTextFromContext(ctx);
+            var variablesDetails = cve.ExtractConstantsVariables(snippet_text, this.path);
+            var variable_entities = CreateVariableEntityList(variablesDetails);
+
+            var function_snippet = new FunctionSnippetSchema
+            {
+                FilePath = path,
+                FileName = file_name,
+                FunctionName = function_name,
+                ClassName = class_name,
+                Snippet = snippet_text,
+                StartLineNumber = start_line_number,
+                EndLineNumber = end_line_number,
+                ExecutionOrder = execution_order,
+                SnippetExecutionOrder = snippet_execution_order,
+                ReturnType = "NA",
+                Variable = variable_entities.Select(v => new DataDefinitionJSON { Term = v.Term, Type = v.Type, FilePath = v.FilePath, Meaning = v.Meaning, UsageContext = v.UsageContext }).Cast<object>().ToList()
+            };
+
+            function_snippets.Add(function_snippet);
+            return function_snippet;
+        }
+
+        public void VisitFunctionSnippet(dynamic ctx)
+        {
+            var functionSnippet = CreateFunctionSnippet(ctx);
+            int functionStartLine = ctx.Start.StartIndex;
+
+            current_function = functionSnippet;
+            function_snippet_stack.Push(functionSnippet);
+
+            CreateExtractedCalculationSnippet(current_function.Snippet, current_function.FunctionName, functionStartLine);
+
+            VisitChildren(ctx);
+
+            function_snippet_stack.Pop();
+            current_function = function_snippet_stack.Count > 0 ? function_snippet_stack.Peek() : null;
+        }
+
+        public DecisionNodeSchema CreateRuleSnippet(dynamic ctx, RuleConstructType constructType)
+        {
+            int start_line_number = ctx.Start.Line;
+            int end_line_number = ctx.Stop.Line;
+
+            Regex conditionalKeywords;
+            if (constructType == RuleConstructType.SWITCH_CONSTRUCT)
+                conditionalKeywords = new Regex(@"\b(WHEN|ELSE)\b", RegexOptions.IgnoreCase);
+            else
+                conditionalKeywords = new Regex(@"\b((?<!END-)IF|ELSE|(?<!END-)DECIDE)\b", RegexOptions.IgnoreCase);
+
+            string snippet_text = GetOriginalTextFromContext(ctx);
+            int num_conditions = conditionalKeywords.Matches(snippet_text).Count;
+
+            string cleaned_text = snippet_text.Replace("\r", " ");
+            string hosting_function_name = GetCurrentContextName(ctx);
+
+            var variablesDetails = cve.ExtractConstantsVariables(cleaned_text, this.path);
+
+            string numericExtractionText = "";
+            if (ctx.GetType().Name == "If_statementContext" && ctx.children != null)
+            {
+                var conditionCtx = ctx.search_condition();
+                if (conditionCtx != null)
+                {
+                    numericExtractionText = GetOriginalTextFromContext(conditionCtx);
+                }
+            }
+            else
+            {
+                numericExtractionText = snippet_text;
+            }
+
+            variablesDetails.AddRange(cve.ExtractNumericConstants(numericExtractionText.Replace("\r", " "), this.path));
+            var variableEntities = CreateVariableEntityList(variablesDetails);
+
+            return new DecisionNodeSchema
+            {
+                Name = hosting_function_name,
+                ShortSummary = "",
+                StartLineNumber = start_line_number,
+                EndLineNumber = end_line_number,
+                Snippet = snippet_text,
+                NumberOfConditionals = num_conditions,
+                Complexity = ComplexityHelper.CategorizeComplexity(num_conditions).ToString(),
+                ConstructType = constructType.ToString(),
+                ExecutionOrder = execution_order,
+                Variable = variableEntities.Cast<object>().ToList()
+            };
+        }
+
+        public DbCallDataEntity CreateDbCall(dynamic ctx, string query, List<string> filter_conditions, HashSet<string> aliases, HashSet<string> tables, string operation_type)
+        {
+            execution_order++;
+            string full_text = GetOriginalTextFromContext(ctx);
+            string cleaned_text = full_text.Replace("\r", " ");
+
+            int start_line_number = ctx.Start.Line;
+            int end_line_number = ctx.Stop.Line;
+
+            var variablesDetails = cve.ExtractConstantsVariables(cleaned_text, this.path);
+            var variableEntities = CreateVariableEntityList(variablesDetails);
+
+            string hosting_function_name = GetCurrentContextName(ctx);
+
+            var db_call_entity = new DbCallDataEntity
+            {
+                Name = hosting_function_name,
+                FilePath = path,
+                FileName = file_name,
+                Tech = projectMetadata.Language,
+                ProgramId = file_name,
+                StartLineNumber = start_line_number,
+                EndLineNumber = end_line_number,
+                Snippet = cleaned_text,
+                OperationType = operation_type,
+                ExecutionOrder = execution_order,
+                Variable = variableEntities,
+                Query = query,
+                FilterConditions = filter_conditions,
+                Aliases = aliases.ToList(),
+                TableNames = tables.Select(t => t.Split('.').Last().Trim('[', ']').ToLower()).ToList()
+            };
+
+            if (current_function != null) current_function.DbCalls.Add(db_call_entity);
+            else main_program_dbcalls.Add(db_call_entity);
+
+            if (db_call_stack.Count == 0)
+            {
+                db_call_execution_order++;
+                db_call_entity.Level = DbCallLevel.PARENT.ToString();
+                db_call_entity.DbCallExecutionOrder = db_call_execution_order.ToString();
+                db_call_entity.ChildCount = 0;
+            }
+            else
+            {
+                var parent = db_call_stack.Peek();
+                parent.ChildCount++;
+                db_call_entity.Level = DbCallLevel.CHILD.ToString();
+                db_call_entity.DbCallExecutionOrder = parent.DbCallExecutionOrder + "." + parent.ChildCount;
+                db_call_entity.ChildCount = 0;
+            }
+
+            return db_call_entity;
+        }
+
+        public ServiceCallDataEntity CreateServiceCall(dynamic ctx, string funcName)
+        {
+            execution_order++;
+            int start_line_number = ctx.Start.Line;
+            int end_line_number = ctx.Stop.Line;
+            string snippet_text = GetOriginalTextFromContext(ctx);
+
+            var variablesDetails = cve.ExtractConstantsVariables(snippet_text, this.path);
+            var variableEntities = CreateVariableEntityList(variablesDetails);
+            var parameters = variablesDetails.Select(v => v.Term).ToList();
+            var parameterValue = parameters.Where(p => !p.Contains(funcName)).ToList();
+
+            string hosting_function_name = GetCurrentContextName(ctx);
+
+            var data_entity = new ServiceCallDataEntity
+            {
+                Name = hosting_function_name,
+                Tech = projectMetadata.Language,
+                FileName = file_name,
+                FilePath = path,
+                StartLineNumber = start_line_number,
+                EndLineNumber = end_line_number,
+                ProgramId = file_name,
+                Target = funcName,
+                ExecutionOrder = execution_order,
+                Snippet = snippet_text,
+                OperationType = "NA",
+                Parameters = parameterValue,
+                Scope = "EXTERNAL",
+                Variable = variableEntities
+            };
+
+            if (current_function != null) current_function.ServiceCalls.Add(data_entity);
+            else main_program_service_calls.Add(data_entity);
+
+            return data_entity;
+        }
+
+        public FunctionCallee CreateCallee(dynamic ctx, CalleeConstructType constructType)
+        {
+            execution_order++;
+            callee_execution_order++;
+            int start_line_number = ctx.Start.Line;
+            int end_line_number = ctx.Stop.Line;
+            string snippet_text = GetOriginalTextFromContext(ctx);
+
+            var conditionalHierarchy = GetCalleeConditionalHierarchy(ctx);
+            bool isConditional = conditionalHierarchy.Count > 0;
+            string condition = "NA";
+            if (isConditional)
+            {
+                condition = (bool)conditionalHierarchy["is_else"] ? "ELSE_OF(" + (string)conditionalHierarchy["condition"] + ")" : (string)conditionalHierarchy["condition"];
+            }
+
+            string targetFunctionName = null;
+            var variableEntities = new List<VariableEntity>();
+            var parameters = new List<string>();
+
+            if (constructType == CalleeConstructType.EXECUTE)
+            {
+                if (ctx.execute_body() != null && ctx.execute_body().func_proc_name_server_database_schema() != null)
+                {
+                    targetFunctionName = ParseFuncProcNameServerDatabaseSchema(ctx.execute_body().func_proc_name_server_database_schema());
+                    var variablesDetails = cve.ExtractConstantsVariables(snippet_text, this.path);
+                    variableEntities = CreateVariableEntityList(variablesDetails);
+                    parameters = variablesDetails.Select(v => v.Term).ToList();
+                }
+            }
+            else if (constructType == CalleeConstructType.SCALAR_FUNCTION)
+            {
+                if (ctx.scalar_function_name() != null && ctx.scalar_function_name().func_proc_name_server_database_schema() != null)
+                {
+                    targetFunctionName = ParseFuncProcNameServerDatabaseSchema(ctx.scalar_function_name().func_proc_name_server_database_schema());
+                }
+                if (ctx.expression_list_() != null)
+                {
+                    string variables = GetOriginalTextFromContext(ctx.expression_list_());
+                    var variablesDetails = cve.ExtractConstantsVariables(variables, this.path);
+                    variableEntities = CreateVariableEntityList(variablesDetails);
+                    parameters = variablesDetails.Select(v => v.Term).ToList();
+                }
+            }
+
+            if (targetFunctionName != null)
+            {
+                var callee = new FunctionCallee
+                {
+                    ExecutionOrder = execution_order,
+                    CalleeExecutionOrder = callee_execution_order,
+                    StartLineNumber = start_line_number,
+                    EndLineNumber = end_line_number,
+                    Tech = projectMetadata.Language,
+                    CallerFunction = GetCurrentContextName(ctx),
+                    CalleeFunction = targetFunctionName,
+                    CalleeClass = file_name,
+                    CalleeFileName = file_name,
+                    CalleeFilePath = path,
+                    Snippet = snippet_text,
+                    CalleeType = constructType.ToString(),
+                    TypeOfConstruct = "External",
+                    ModuleName = folder_name,
+                    Behavior = CalleeBehavior.RETURNS.ToString(),
+                    Condition = condition,
+                    Variable = variableEntities.Cast<object>().ToList(),
+                    Parameters = parameters,
+                    IsConditional = isConditional,
+                    ConditionalHierarchy = conditionalHierarchy
+                };
+
+                if (current_function != null) current_function.Callees.Add(callee);
+                else main_program_callees.Add(callee);
+                return callee;
+            }
+            return null;
+        }
+
+        public void CreateTransactionCommit(dynamic ctx)
+        {
+            execution_order++;
+            int start_line_number = ctx.Start.Line;
+            int end_line_number = ctx.Stop.Line;
+            string function_name = GetCurrentContextName(ctx);
+            var variablesDetails = cve.ExtractConstantsVariables((string)ctx.GetText(), this.path);
+            var variableEntities = CreateVariableEntityList(variablesDetails);
+
+            var tce = new TransactionCommitEntity
+            {
+                Name = function_name,
+                Tech = projectMetadata.Language,
+                FileName = file_name,
+                FilePath = path,
+                StartLineNumber = start_line_number,
+                EndLineNumber = end_line_number,
+                ProgramId = file_name,
+                ExecutionOrder = execution_order,
+                Snippet = GetOriginalTextFromContext(ctx),
+                Variable = variableEntities
+            };
+
+            if (current_function != null) current_function.TransactionCommits.Add(tce);
+            else main_program_transaction_commits.Add(tce);
+        }
+
+        public void CreateTransactionRollback(dynamic ctx)
+        {
+            execution_order++;
+            int start_line_number = ctx.Start.Line;
+            int end_line_number = ctx.Stop.Line;
+            string function_name = GetCurrentContextName(ctx);
+            var variablesDetails = cve.ExtractConstantsVariables((string)ctx.GetText(), this.path);
+            var variableEntities = CreateVariableEntityList(variablesDetails);
+
+            var tre = new TransactionRollbackEntity
+            {
+                Name = function_name,
+                Tech = projectMetadata.Language,
+                FileName = file_name,
+                FilePath = path,
+                StartLineNumber = start_line_number,
+                EndLineNumber = end_line_number,
+                ProgramId = file_name,
+                ExecutionOrder = execution_order,
+                Snippet = GetOriginalTextFromContext(ctx),
+                Variable = variableEntities
+            };
+
+            if (current_function != null) current_function.TransactionRollbacks.Add(tre);
+            else main_program_transaction_rollbacks.Add(tre);
+        }
+
+        public void CreateDatabaseEntity(string snippet, string tableName, int startLine, int endLine)
+        {
+            string server = "", database = "", schema = "", table = "";
+            var parts = tableName.Split('.');
+            if (parts.Length == 4) { server = parts[0]; database = parts[1]; schema = parts[2]; table = parts[3]; }
+            else if (parts.Length == 3) { database = parts[0]; schema = parts[1]; table = parts[2]; }
+            else if (parts.Length == 2) { schema = parts[0]; table = parts[1]; }
+            else table = tableName;
+
+            var db_entity = new DatabaseEntitySchema
+            {
+                Name = table.Trim('[', ']').ToLower(),
+                BusinessAliases = new List<string>(),
+                FileName = file_name,
+                FilePath = path,
+                StartLineNumber = startLine,
+                EndLineNumber = endLine,
+                ProgramId = file_name,
+                Type = "TABLE",
+                Snippet = snippet,
+                SchemaTable = tableName.ToLower(),
+                StructureSchema = "NA",
+                Fields = new List<string>(),
+                SampleRecord = "NA",
+                Complexity = "NA",
+                VolumeClass = "NA",
+                MainRole = "NA",
+                RelationshipDensity = "NA",
+                DbType = "Relational",
+                Description = "NA",
+                DbTech = projectMetadata.Language,
+                HostedAt = "NA",
+                RecordsType = "NA",
+                CreatedFrom = "Program",
+                Category = "NA",
+                Servers = !string.IsNullOrEmpty(server) ? new List<string> { server.Trim('[', ']').ToLower() } : new List<string>(),
+                Databases = !string.IsNullOrEmpty(database) ? new List<string> { database.Trim('[', ']').ToLower() } : new List<string>(),
+                Schemas = !string.IsNullOrEmpty(schema) ? new List<string> { schema.Trim('[', ']').ToLower() } : new List<string>()
+            };
+
+            if (current_function != null) current_function.DatabaseEntities.Add(db_entity);
+            else main_program_database_entities.Add(db_entity);
+        }
+
+        public override object VisitSelect_statement(TSqlParser.Select_statementContext ctx)
+        {
+            string query = null;
+            var aliases = new HashSet<string>();
+            var tables = new HashSet<string>();
+            var filter_conditions = new List<string>();
+            string operation_type = DbCallDataEntity_TYPE.SELECT.ToString();
+
+            try
+            {
+                query = GetOriginalTextFromContext(ctx).Trim(' ', '\n');
+                if (ctx.query_expression() != null)
+                {
+                    var qe_ctx = ctx.query_expression();
+                    var qs_ctx = qe_ctx.query_specification();
+                    if (qs_ctx.table_sources() != null)
+                    {
+                        foreach (var con in qs_ctx.search_condition())
+                            if (con != null) filter_conditions.Add(GetOriginalTextFromContext(con));
+
+                        foreach (var ts in qs_ctx.table_sources().table_source())
+                        {
+                            var result = ExtractTableSource(ts);
+                            foreach (var t in result.Item1) tables.Add(t);
+                            foreach (var a in result.Item2) aliases.Add(a);
+                            filter_conditions.AddRange(result.Item3);
+                        }
+                    }
+                    if (qs_ctx.table_name() != null) tables.Add(GetOriginalTextFromContext(qs_ctx.table_name()));
+
+                    if (qe_ctx.sql_union() != null)
+                    {
+                        foreach (var union in qe_ctx.sql_union())
+                        {
+                            var uqs_ctx = union.query_specification();
+                            if (uqs_ctx.table_sources() != null)
+                            {
+                                foreach (var con in uqs_ctx.search_condition())
+                                    if (con != null) filter_conditions.Add(GetOriginalTextFromContext(con));
+                                foreach (var ts in uqs_ctx.table_sources().table_source())
+                                {
+                                    var result = ExtractTableSource(ts);
+                                    foreach (var t in result.Item1) tables.Add(t);
+                                    foreach (var a in result.Item2) aliases.Add(a);
+                                    filter_conditions.AddRange(result.Item3);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            catch { }
+
+            if (tables.Count == 0) return null;
+            string snippet = GetOriginalTextFromContext(ctx);
+            var table_list = new HashSet<string>();
+            foreach (var table in tables)
+            {
+                string t = table;
+                if (t.Contains('.')) t = t.Split('.')[1];
+                table_list.Add(t);
+                if (!EntityExists(table.Trim())) CreateDatabaseEntity(snippet, table.Trim(), ctx.Start.Line, ctx.Stop.Line);
+            }
+
+            var db_call = CreateDbCall(ctx, query, filter_conditions, aliases, table_list, operation_type);
+            db_call_stack.Push(db_call);
+            current_dbcall_depth++;
+            VisitChildren(ctx);
+            current_dbcall_depth--;
+            db_call_stack.Pop();
+            CreateDatabaseField();
+            return null;
+        }
+
+        public override object VisitInsert_statement(TSqlParser.Insert_statementContext ctx)
+        {
+            var aliases = new HashSet<string>();
+            var tables = new HashSet<string>();
+            var filter_conditions = new List<string>();
+            string operation_type = DbCallDataEntity_TYPE.INSERT.ToString();
+            string query = GetOriginalTextFromContext(ctx);
+
+            if (ctx.ddl_object() != null)
+            {
+                string table = GetOriginalTextFromContext(ctx.ddl_object());
+                tables.Add(table);
+                if (!EntityExists(table.Trim())) CreateDatabaseEntity(query, table.Trim(), ctx.Start.Line, ctx.Stop.Line);
+            }
+            else if (ctx.rowset_function_limited() != null)
+                tables.Add(GetOriginalTextFromContext(ctx.rowset_function_limited()));
+
+            if (tables.Count == 0) return null;
+
+            var db_call = CreateDbCall(ctx, query, filter_conditions, aliases, tables, operation_type);
+            db_call_stack.Push(db_call);
+            current_dbcall_depth++;
+            VisitChildren(ctx);
+            current_dbcall_depth--;
+            db_call_stack.Pop();
+            CreateDatabaseField();
+            return null;
+        }
+
+        public override object VisitTransaction_statement(TSqlParser.Transaction_statementContext ctx)
+        {
+            if (ctx.COMMIT() != null) CreateTransactionCommit(ctx);
+            else if (ctx.ROLLBACK() != null) CreateTransactionRollback(ctx);
+            return VisitChildren(ctx);
+        }
+
+        public override object VisitFunc_body_returns_scalar(TSqlParser.Func_body_returns_scalarContext ctx)
+        {
+            if (ctx.expression() != null)
+            {
+                Visit(ctx.expression());
+            }
+            return VisitChildren(ctx);
+        }
+
+        public override object VisitSCALAR_FUNCTION(TSqlParser.SCALAR_FUNCTIONContext ctx)
+        {
+            CreateCallee(ctx, CalleeConstructType.SCALAR_FUNCTION);
+            return VisitChildren(ctx);
+        }
+
+        public Dictionary<string, object> GetCalleeConditionalHierarchy(dynamic ctx)
+        {
+            var hierarchy = new Dictionary<string, object>();
+            var currentLevel = hierarchy;
+            bool isElse = false;
+
+            while (ctx != null)
+            {
+                var parentCtx = ctx.Parent;
+                if (parentCtx == null) break;
+
+                if (parentCtx.GetType().Name == "If_statementContext" && parentCtx.children != null)
+                {
+                    if (parentCtx.ELSE() != null)
+                    {
+                        var sym = parentCtx.ELSE().Symbol;
+                        if (sym.StopIndex < ctx.Stop.StartIndex) isElse = true;
+                    }
+
+                    try
+                    {
+                        var conditionCtx = parentCtx.search_condition();
+                        if (conditionCtx != null)
+                        {
+                            string conditionString = GetOriginalTextFromContext(conditionCtx);
+                            conditionString = Regex.Replace(conditionString, @"\n\d{4}\s*$", "");
+                            currentLevel["condition"] = conditionString;
+                            currentLevel["start_line_number"] = parentCtx.Start.Line;
+                            currentLevel["end_line_number"] = parentCtx.Stop.Line;
+                            currentLevel["siblings"] = new List<string>();
+                            currentLevel["is_else"] = isElse;
+                            var nextParent = new Dictionary<string, object>();
+                            currentLevel["parent"] = nextParent;
+                            currentLevel = nextParent;
+                        }
+                    }
+                    catch { }
+                    isElse = false;
+                }
+                ctx = parentCtx;
+            }
+            return hierarchy;
+        }
+
+        public string ParseFuncProcNameServerDatabaseSchema(TSqlParser.Func_proc_name_server_database_schemaContext ctx)
+        {
+            dynamic procedure = null;
+            if (ctx.func_proc_name_database_schema() != null)
+            {
+                if (ctx.func_proc_name_database_schema().func_proc_name_schema() != null)
+                    procedure = ctx.func_proc_name_database_schema().func_proc_name_schema().procedure;
+                else
+                    procedure = ctx.func_proc_name_database_schema().procedure;
+            }
+            else procedure = ctx.procedure;
+
+            return procedure != null ? ((string)procedure.GetText()).Trim('[', ']') : (string)ctx.GetText();
+        }
+
+        public bool EntityExists(string name)
+        {
+            return false;
+        }
+
+        public List<DatabaseFieldSchema> CreateDatabaseField()
+        {
+            var database_fields = new List<DatabaseFieldSchema>();
+            string default_table = table_alias.FirstOrDefault(kv => kv.Key == kv.Value).Value;
+
+            foreach (var field_data in column_name)
+            {
+                var parts = field_data.Split('.');
+                if (parts.Length == 2)
+                {
+                    string table_part = parts[0].Trim('[', ']');
+                    string column_part = parts[1];
+                    if (table_alias.TryGetValue(table_part, out var actual_table))
+                    {
+                        string actual_table_name = actual_table.Split('.').Last().Trim('[', ']').ToLower();
+                        var field_key = (column_part, actual_table_name);
+                        if (!unique_fields.Contains(field_key))
+                        {
+                            unique_fields.Add(field_key);
+                            database_fields.Add(new DatabaseFieldSchema { Name = column_part, TableName = actual_table_name, DbTech = projectMetadata.Language });
+                        }
+                    }
+                }
+                else if (parts.Length == 1 && default_table != null)
+                {
+                    string column_part = parts[0];
+                    string default_table_name = default_table.Split('.').Last().Trim('[', ']').ToLower();
+                    var field_key = (column_part, default_table_name);
+                    if (!unique_fields.Contains(field_key))
+                    {
+                        unique_fields.Add(field_key);
+                        database_fields.Add(new DatabaseFieldSchema { Name = column_part, TableName = default_table_name, DbTech = projectMetadata.Language });
+                    }
+                }
+            }
+            if (current_function != null) current_function.DatabaseFields.AddRange(database_fields);
+            else main_program_database_fields.AddRange(database_fields);
+            column_name.Clear();
+            return database_fields;
+        }
+
+        public override object Visit(IParseTree tree) { return base.Visit(tree); }
+
+        public override object VisitCreate_or_alter_function(TSqlParser.Create_or_alter_functionContext ctx) { VisitFunctionSnippet(ctx); return null; }
+        public override object VisitCreate_or_alter_procedure(TSqlParser.Create_or_alter_procedureContext ctx) { VisitFunctionSnippet(ctx); return null; }
+        public override object VisitCreate_or_alter_ddl_trigger(TSqlParser.Create_or_alter_ddl_triggerContext ctx) { VisitFunctionSnippet(ctx); return null; }
+        public override object VisitCreate_or_alter_dml_trigger(TSqlParser.Create_or_alter_dml_triggerContext ctx) { VisitFunctionSnippet(ctx); return null; }
+
+        public override object VisitIf_statement(TSqlParser.If_statementContext ctx)
+        {
+            if (current_if_depth == 0)
+            {
+                execution_order++;
+                var decision_node = CreateRuleSnippet(ctx, RuleConstructType.IF_CONSTRUCT);
+                if (current_function != null) current_function.DecisionNodeConstructs.Add(decision_node);
+                else main_program_decision_nodes.Add(decision_node);
+            }
+            current_if_depth++;
+            VisitChildren(ctx);
+            current_if_depth--;
+            return null;
+        }
+
+        public override object VisitCase_expression(TSqlParser.Case_expressionContext ctx)
+        {
+            if (current_case_depth == 0)
+            {
+                execution_order++;
+                var decision_node = CreateRuleSnippet(ctx, RuleConstructType.SWITCH_CONSTRUCT);
+                if (current_function != null) current_function.DecisionNodeConstructs.Add(decision_node);
+                else main_program_decision_nodes.Add(decision_node);
+            }
+            current_case_depth++;
+            VisitChildren(ctx);
+            current_case_depth--;
+            return null;
+        }
+
+        public override object VisitSql_clauses(TSqlParser.Sql_clausesContext ctx)
+        {
+            table_alias.Clear();
+            return VisitChildren(ctx);
+        }
+
+        public override object VisitUpdate_statement(TSqlParser.Update_statementContext ctx)
+        {
+            var aliases = new HashSet<string>();
+            var tables = new HashSet<string>();
+            var filter_conditions = new List<string>();
+            string operation_type = DbCallDataEntity_TYPE.UPDATE.ToString();
+            string query = GetOriginalTextFromContext(ctx);
+
+            if (ctx.ddl_object() != null)
+            {
+                string table = GetOriginalTextFromContext(ctx.ddl_object());
+                tables.Add(table);
+                if (!EntityExists(table.Trim())) CreateDatabaseEntity(query, table.Trim(), ctx.Start.Line, ctx.Stop.Line);
+            }
+            else if (ctx.rowset_function_limited() != null)
+                tables.Add(GetOriginalTextFromContext(ctx.rowset_function_limited()));
+
+            if (ctx.table_sources() != null)
+            {
+                foreach (var ts in ctx.table_sources().table_source())
+                {
+                    var result = ExtractTableSource(ts);
+                    foreach (var t in result.Item1) tables.Add(t);
+                    foreach (var a in result.Item2) aliases.Add(a);
+                    filter_conditions.AddRange(result.Item3);
+                }
+            }
+            if (tables.Count == 0) return null;
+            foreach (var table in tables) if (!EntityExists(table.Trim())) CreateDatabaseEntity(query, table.Trim(), ctx.Start.Line, ctx.Stop.Line);
+
+            var db_call = CreateDbCall(ctx, query, filter_conditions, aliases, tables, operation_type);
+            db_call_stack.Push(db_call);
+            current_dbcall_depth++;
+            VisitChildren(ctx);
+            current_dbcall_depth--;
+            db_call_stack.Pop();
+            CreateDatabaseField();
+            return null;
+        }
+
+        public override object VisitDelete_statement(TSqlParser.Delete_statementContext ctx)
+        {
+            var aliases = new HashSet<string>();
+            var tables = new HashSet<string>();
+            var filter_conditions = new List<string>();
+            string operation_type = DbCallDataEntity_TYPE.DELETE.ToString();
+            string query = GetOriginalTextFromContext(ctx);
+
+            if (ctx.delete_statement_from() != null) tables.Add(GetOriginalTextFromContext(ctx.delete_statement_from()));
+            if (ctx.search_condition() != null) filter_conditions.Add(GetOriginalTextFromContext(ctx.search_condition()));
+            if (ctx.table_sources() != null)
+            {
+                foreach (var ts in ctx.table_sources().table_source())
+                {
+                    var result = ExtractTableSource(ts);
+                    foreach (var t in result.Item1) tables.Add(t);
+                    foreach (var a in result.Item2) aliases.Add(a);
+                    filter_conditions.AddRange(result.Item3);
+                }
+            }
+            if (tables.Count == 0) return null;
+
+            var db_call = CreateDbCall(ctx, query, filter_conditions, aliases, tables, operation_type);
+            db_call_stack.Push(db_call);
+            current_dbcall_depth++;
+            VisitChildren(ctx);
+            current_dbcall_depth--;
+            db_call_stack.Pop();
+            CreateDatabaseField();
+            return null;
+        }
+
+        public override object VisitTable_source_item(TSqlParser.Table_source_itemContext ctx)
+        {
+            if ((ctx.full_table_name() != null || ctx.LOCAL_ID() != null) && ctx.as_table_alias() != null)
+            {
+                string alias = (string)ctx.as_table_alias().table_alias().GetText();
+                if (ctx.full_table_name() != null) table_alias[alias] = (string)ctx.full_table_name().GetText();
+                else if (ctx.LOCAL_ID() != null) table_alias[alias] = (string)ctx.LOCAL_ID().GetText();
+            }
+            else if (ctx.full_table_name() != null)
+            {
+                table_alias[(string)ctx.full_table_name().GetText()] = (string)ctx.full_table_name().GetText();
+            }
+            return null;
+        }
+
+        public override object VisitExecute_statement(TSqlParser.Execute_statementContext ctx)
+        {
+            string targetFunctionName = null;
+            if (ctx.execute_body() != null && ctx.execute_body().func_proc_name_server_database_schema() != null)
+                targetFunctionName = ParseFuncProcNameServerDatabaseSchema(ctx.execute_body().func_proc_name_server_database_schema());
+
+            if (target_functions.Contains(targetFunctionName)) CreateServiceCall(ctx, targetFunctionName);
+            else CreateCallee(ctx, CalleeConstructType.EXECUTE);
+
+            return VisitChildren(ctx);
+        }
+
+        public override object VisitRowset_function(TSqlParser.Rowset_functionContext ctx)
+        {
+            string snippet_text = GetOriginalTextFromContext(ctx);
+            if (snippet_text.ToUpperInvariant().Contains("OPENROWSET")) CreateServiceCall(ctx, "OPENROWSET");
+            return VisitChildren(ctx);
+        }
+
+        public override object VisitWhile_statement(TSqlParser.While_statementContext ctx)
+        {
+            execution_order++;
+            execution_order = execution_order + 1;
+
+            string full_text = GetOriginalTextFromContext(ctx);
+            string cleaned_text = full_text.Replace("\r", " ");
+            int start_line_number = ctx.Start.Line;
+            int end_line_number = ctx.Stop.Line;
+            string hosting_function_name = GetCurrentContextName(ctx);
+
+            var loop_entity = new LoopEntityNodeSchema
+            {
+                Name = hosting_function_name,
+                Tech = projectMetadata.Language,
+                FileName = file_name,
+                FilePath = path,
+                StartLineNumber = start_line_number,
+                EndLineNumber = end_line_number,
+                ProgramId = file_name.Split('.')[0],
+                Type = "WHILE",
+                Snippet = cleaned_text,
+                ExecutionOrder = execution_order,
+                ModuleName = folder_name
+            };
+
+            if (current_function != null) current_function.LoopEntity.Add(loop_entity);
+            else main_program_loop_entities.Add(loop_entity);
+
+            return VisitChildren(ctx);
+        }
+
+        public override object VisitExpression(TSqlParser.ExpressionContext ctx)
+        {
+            if (ctx.full_column_name() != null)
+            {
+                string full_name = (string)ctx.full_column_name().GetText();
+                var parts = full_name.Split('.').Select(p => p.Trim('[', ']')).ToList();
+                if (parts.Count >= 2) column_name.Add($"{parts[parts.Count - 2]}.{parts.Last()}");
+                else column_name.Add(parts[0]);
+            }
+            return VisitChildren(ctx);
+        }
+
+        public List<string> GetOperands(string data)
+        {
+            return Regex.Matches(data, @"[+\-*/]").Cast<Match>().Select(m => m.Value).ToList();
+        }
+
+        public (int, int) FindTargetLines(string target_data, int start_line)
+        {
+            try
+            {
+                var target_data_line = target_data.Split(new[] { "\r\n", "\r", "\n" }, StringSplitOptions.None);
+                if (target_data_line.Length > 1) return (start_line, start_line + target_data_line.Length - 1);
+                if (target_data_line.Length == 1) return (start_line, start_line);
+            }
+            catch (Exception e)
+            {
+                Console.WriteLine($"Error in find_target_lines: {e}");
+            }
+            return (0, 0);
         }
     }
 }
