@@ -1,45 +1,54 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.IO;
-using System.Linq;
 using Newtonsoft.Json;
-using ParserService.Entities.Entities;
 using ClosedXML.Excel;
 
 namespace TsqlParserProject
 {
     public static class ParserUtils
     {
-        public static void WriteFunctionSnippetsToExcelWithCounts(CodeContext output, string inputFilePath, string saveDirectory)
+        public static void WriteFunctionSnippetsToExcelWithCounts(
+            CodeContext output,
+            string inputFilePath,
+            string saveDirectory)
         {
-            // Extract the base name of the input file (without extension)
+            if (output == null)
+                throw new ArgumentNullException(nameof(output));
+
+            if (inputFilePath == null)
+                throw new ArgumentNullException(nameof(inputFilePath));
+
+            if (saveDirectory == null)
+                throw new ArgumentNullException(nameof(saveDirectory));
+
+            // ---- EXACT PYTHON LOGIC ----
+
             string baseFilename = Path.GetFileNameWithoutExtension(inputFilePath);
-
-            // Generate a timestamp for the filename
             string timestamp = DateTime.Now.ToString("ddMMyyyy_HHmmss");
-
-            // Construct the Excel file name
             string excelFilename = $"{baseFilename}_Parser_Results_{timestamp}.xlsx";
             string excelPath = Path.Combine(saveDirectory, excelFilename);
 
-            // Create a new workbook
             var workbook = new XLWorkbook();
 
-            // Define the fields and their additional properties
+            // ---- EXACT PYTHON FIELD STRUCTURE (snake_case) ----
+
             var fields = new Dictionary<string, List<string>>
             {
-                { "DecisionNodeConstructs", new List<string> { "FileName", "Name", "StartLineNumber", "EndLineNumber" } },
-                { "LoopEntity", new List<string> { "FileName", "Name", "StartLineNumber", "EndLineNumber" } },
-                { "DbCalls", new List<string> { "FileName", "FunctionName", "StartLineNumber", "EndLineNumber", "OperationType", "Aliases", "TableNames", "FilterConditions" } },
-                { "DatabaseEntities", new List<string> { "Name", "FileName", "StartLineNumber", "EndLineNumber" } },
-                { "Calculation", new List<string> { "FileName", "Name", "StartLineNumber", "EndLineNumber", "Snippet", "Operands", "Variable" } },
-                { "Callees", new List<string> { "CalleeFileName", "CallerFunction", "Snippet", "StartLineNumber", "EndLineNumber", "CalleeFunction", "Condition", "ConditionalHierarchy", "IsConditional", "Parameters" } },
-                { "ServiceCalls", new List<string> { "FileName", "Name", "StartLineNumber", "EndLineNumber", "Snippet", "Target", "Parameters" } },
-                { "TransactionCommits", new List<string> { "FileName", "Name", "StartLineNumber", "EndLineNumber", "Snippet" } },
-                { "TransactionRollbacks", new List<string> { "FileName", "Name", "StartLineNumber", "EndLineNumber", "Snippet" } }
+                { "decision_node_constructs", new List<string>{ "file_name", "name", "start_line_number", "end_line_number" } },
+                { "loop_entity", new List<string>{ "file_name", "name", "start_line_number", "end_line_number" } },
+                { "db_calls", new List<string>{ "file_name", "function_name", "start_line_number", "end_line_number", "operation_type", "aliases", "table_names", "filter_conditions" } },
+                { "database_entities", new List<string>{ "name", "file_name", "start_line_number", "end_line_number" } },
+                { "calculation", new List<string>{ "file_name", "name", "start_line_number", "end_line_number", "snippet", "operands", "variable" } },
+                { "callees", new List<string>{ "callee_file_name", "caller_function", "snippet", "start_line_number", "end_line_number", "callee_function", "condition", "conditional_hierarchy", "is_conditional", "parameters" } },
+                { "service_calls", new List<string>{ "file_name", "name", "start_line_number", "end_line_number", "snippet", "target", "parameters" } },
+                { "transaction_commits", new List<string>{ "file_name", "name", "start_line_number", "end_line_number", "snippet" } },
+                { "transaction_rollbacks", new List<string>{ "file_name", "name", "start_line_number", "end_line_number", "snippet" } }
             };
 
-            // Write each field's data to separate tabs
+            // ---- WRITE EACH FIELD SHEET ----
+
             foreach (var fieldEntry in fields)
             {
                 string fieldName = fieldEntry.Key;
@@ -47,78 +56,78 @@ namespace TsqlParserProject
 
                 var sheet = workbook.Worksheets.Add(fieldName);
 
-                // Write header row
+                // Header row (row 1)
                 for (int i = 0; i < properties.Count; i++)
                 {
                     sheet.Cell(1, i + 1).Value = properties[i];
                 }
 
                 int rowIndex = 2;
+
                 foreach (var functionSnippet in output.FunctionSnippets)
                 {
-                    var fieldObjects = GetPropertyValue(functionSnippet, fieldName) as System.Collections.IEnumerable;
-                    if (fieldObjects != null)
-                    {
-                        foreach (var obj in fieldObjects)
-                        {
-                            for (int colIndex = 0; colIndex < properties.Count; colIndex++)
-                            {
-                                string prop = properties[colIndex];
-                                var value = GetPropertyValue(obj, prop);
+                    var fieldObjects = GetPropertyValue(functionSnippet, fieldName) as IEnumerable;
 
-                                // Explicit handling for ConditionalHierarchy
-                                if (prop == "ConditionalHierarchy" && value != null)
-                                {
-                                    sheet.Cell(rowIndex, colIndex + 1).Value = JsonConvert.SerializeObject(value, Formatting.Indented);
-                                }
-                                else
-                                {
-                                    sheet.Cell(rowIndex, colIndex + 1).Value = value?.ToString() ?? "";
-                                }
+                    if (fieldObjects == null)
+                        continue;
+
+                    foreach (var obj in fieldObjects)
+                    {
+                        for (int colIndex = 0; colIndex < properties.Count; colIndex++)
+                        {
+                            string prop = properties[colIndex];
+                            var value = GetPropertyValue(obj, prop);
+
+                            if (prop == "conditional_hierarchy")
+                            {
+                                sheet.Cell(rowIndex, colIndex + 1).Value =
+                                    JsonConvert.SerializeObject(value ?? new object(), Formatting.Indented);
                             }
-                            rowIndex++;
+                            else
+                            {
+                                sheet.Cell(rowIndex, colIndex + 1).Value =
+                                    value?.ToString() ?? "";
+                            }
                         }
+
+                        rowIndex++;
                     }
                 }
             }
 
-            // Create a summary sheet for counts
+            // ---- SUMMARY SHEET (EXACT PYTHON STRUCTURE) ----
+
             var summarySheet = workbook.Worksheets.Add("Summary");
+
             var summaryHeaders = new List<string>
             {
-                "FileName", "FunctionName", "StartLineNumber", "EndLineNumber",
-                "DecisionNodeConstructsCount", "LoopEntityCount", "DbCallsCount",
-                "CalculationCount", "CalleesCount"
+                "file_name", "function_name", "start_line_number", "end_line_number",
+                "decision_node_constructs_count", "loop_entity_count", "db_calls_count",
+                "calculation_count", "callees_count"
             };
 
-            // Write summary headers
             for (int i = 0; i < summaryHeaders.Count; i++)
             {
                 summarySheet.Cell(1, i + 1).Value = summaryHeaders[i];
             }
 
             int summaryRowIndex = 2;
+
             foreach (var functionSnippet in output.FunctionSnippets)
             {
-                string fileName = GetPropertyValue(functionSnippet, "FileName")?.ToString();
-                string functionName = GetPropertyValue(functionSnippet, "FunctionName")?.ToString();
-                var startLineNumber = GetPropertyValue(functionSnippet, "StartLineNumber");
-                var endLineNumber = GetPropertyValue(functionSnippet, "EndLineNumber");
+                var fileName = GetPropertyValue(functionSnippet, "file_name");
+                var functionName = GetPropertyValue(functionSnippet, "function_name");
+                var startLineNumber = GetPropertyValue(functionSnippet, "start_line_number");
+                var endLineNumber = GetPropertyValue(functionSnippet, "end_line_number");
 
-                var decisionNodes = GetPropertyValue(functionSnippet, "DecisionNodeConstructs") as System.Collections.IEnumerable;
-                var loopEntities = GetPropertyValue(functionSnippet, "LoopEntity") as System.Collections.IEnumerable;
-                var dbCalls = GetPropertyValue(functionSnippet, "DbCalls") as System.Collections.IEnumerable;
-                var calculations = GetPropertyValue(functionSnippet, "Calculation") as System.Collections.IEnumerable;
-                var callees = GetPropertyValue(functionSnippet, "Callees") as System.Collections.IEnumerable;
+                int decisionCount = GetCount(functionSnippet, "decision_node_constructs");
+                int loopCount = GetCount(functionSnippet, "loop_entity");
+                int dbCallCount = GetCount(functionSnippet, "db_calls");
+                int calcCount = GetCount(functionSnippet, "calculation");
+                int calleeCount = GetCount(functionSnippet, "callees");
 
-                int decisionCount = decisionNodes?.Cast<object>().Count() ?? 0;
-                int loopCount = loopEntities?.Cast<object>().Count() ?? 0;
-                int dbCallCount = dbCalls?.Cast<object>().Count() ?? 0;
-                int calcCount = calculations?.Cast<object>().Count() ?? 0;
-                int calleeCount = callees?.Cast<object>().Count() ?? 0;
-
-                summarySheet.Cell(summaryRowIndex, 1).Value = fileName;
-                summarySheet.Cell(summaryRowIndex, 2).Value = functionName;
+                summarySheet.Cell(summaryRowIndex, 1).Value = fileName?.ToString() ?? "";
+                summarySheet.Cell(summaryRowIndex, 2).Value = functionName?.ToString() ?? "";
                 summarySheet.Cell(summaryRowIndex, 3).Value = startLineNumber?.ToString() ?? "";
                 summarySheet.Cell(summaryRowIndex, 4).Value = endLineNumber?.ToString() ?? "";
                 summarySheet.Cell(summaryRowIndex, 5).Value = decisionCount;
@@ -130,31 +139,43 @@ namespace TsqlParserProject
                 summaryRowIndex++;
             }
 
-            // Remove the default sheet created by ClosedXML (if it exists and is empty)
-            var sheet1 = workbook.Worksheet("Sheet1");
-            if (sheet1 != null)
+            // ---- REMOVE DEFAULT SHEET (MATCH PYTHON LOGIC) ----
+
+            if (workbook.Worksheets.Contains("Sheet"))
             {
-                sheet1.Delete();
+                workbook.Worksheet("Sheet").Delete();
             }
 
-            // Save the workbook to the specified path
             workbook.SaveAs(excelPath);
         }
 
         private static object GetPropertyValue(object obj, string propertyName)
         {
-            if (obj == null) return null;
-            var property = obj.GetType().GetProperty(propertyName);
-            if (property != null)
-            {
-                return property.GetValue(obj);
-            }
+            if (obj == null)
+                return null;
+
+            var prop = obj.GetType().GetProperty(propertyName);
+            if (prop != null)
+                return prop.GetValue(obj);
+
             var field = obj.GetType().GetField(propertyName);
             if (field != null)
-            {
                 return field.GetValue(obj);
-            }
+
             return null;
+        }
+
+        private static int GetCount(object obj, string propertyName)
+        {
+            var value = GetPropertyValue(obj, propertyName) as IEnumerable;
+            if (value == null)
+                return 0;
+
+            int count = 0;
+            foreach (var _ in value)
+                count++;
+
+            return count;
         }
     }
 }
