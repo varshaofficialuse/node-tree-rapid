@@ -1,298 +1,944 @@
 using System;
 using System.IO;
-using System.Text;
 using System.Linq;
-using System.Text.RegularExpressions;
 using System.Collections.Generic;
+using System.Text.RegularExpressions;
 using Antlr4.Runtime;
 using Antlr4.Runtime.Tree;
 using Neo4j.Driver;
 
-public class TSqlCodeParser : BaseParser
+public class CustomTSqlParser : TSqlParserVisitor<object>
 {
-    public static string RemoveSubsections(
-        string FileContent,
-        List<FunctionSnippetSchema> Subsequences)
-    {
-        foreach (var Subsection in Subsequences)
-        {
-            FileContent = FileContent.Replace(
-                Subsection.Snippet,
-                string.Join("\n", new string[Subsection.Snippet.Split('\n').Length])
-            );
-        }
+    public const string MAIN_SNIPPET = "MAIN_SNIPPET";
 
-        return FileContent;
+    public static readonly string[] TargetFunctions =
+    {
+        "sp_OACreate", "sp_OADestroy", "sp_OAGetErrorInfo",
+        "sp_OAMethod", "sp_OASetProperty", "sp_OAStop", "sp_OAGetProperty"
+    };
+
+    public enum CalleeConstructType
+    {
+        EXECUTE,
+        SCALAR_FUNCTION
     }
 
-    public CodeContext ParseCodebase(
-        int RunId,
-        int RunFileId,
-        CodeComprehensionMetadata CcMetadata,
-        string FilePath)
+    public enum ServiceCallConstructType
     {
-        if (FilePath.Contains(".DS_Store"))
-            return null;
+        EXECUTE,
+        ROWSET_FUNCTION
+    }
 
-        var TsqlPreprocessor = new TSqlPreprocessor();
+    public enum LoopEntityType
+    {
+        WHILE
+    }
 
-        var RelPath = Path.GetRelativePath(Directory.GetCurrentDirectory(), FilePath);
-        var Actual = RelPath.TrimStart('.', '\\');
+    private CodeComprehensionMetadata ProjectMetadata;
+    private string ProjectId;
+    private string Path;
+    private string FileContent;
+    private AntlrInputStream InputStream;
+    private CommonTokenStream TokenStream;
 
-        Console.WriteLine($"parsing {FilePath}");
+    private string FileName;
+    private string FolderName;
 
-        Dictionary<string, List<string>> Result = new();
+    private FunctionSnippetSchema CurrentFunction;
 
-        string FileContent = File.ReadAllText(FilePath);
-        FileContent = FileContent.Replace("ï»¿", "");
-        FileContent = FileContent.Replace("\r\n", "\n").Replace("\r", "\n");
+    private int CurrentIfDepth = 0;
+    private int CurrentCaseDepth = 0;
+    private int CurrentLoopDepth = 0;
 
-        Match Match = Regex.Match(
-            FileContent,
-            @"CREATE TABLE \[dbo\]\.\[(\w+)\] \((.*?)\);",
-            RegexOptions.Singleline);
+    public List<FunctionSnippetSchema> FunctionSnippets = new();
+    private Stack<FunctionSnippetSchema> FunctionSnippetStack = new();
 
-        if (Match.Success)
+    // MAIN PROGRAM LEVEL
+    public List<DecisionNodeSchema> MainProgramDecisionNodes = new();
+    private HashSet<string> ColumnName = new();
+    private Dictionary<string, string> TableAlias = new();
+    private HashSet<(string, string)> UniqueFields = new();
+
+    public List<FunctionCallee> MainProgramCallees = new();
+    public List<ServiceCallDataEntity> MainProgramServiceCalls = new();
+    public List<DbCallDataEntity> MainProgramDbCalls = new();
+    public List<CalculationEntity> MainProgramCalculations = new();
+    public List<TransactionCommitEntity> MainProgramTransactionCommits = new();
+    public List<TransactionRollbackEntity> MainProgramTransactionRollbacks = new();
+    public List<IOCallEntity> MainProgramIOCalls = new();
+    public List<LoopEntityNodeSchema> MainProgramLoopEntities = new();
+    public List<DatabaseEntitySchema> MainProgramDatabaseEntities = new();
+    public List<InputEntitySchema> MainProgramInputEntities = new();
+    public List<DatabaseFieldSchema> MainProgramDatabaseFields = new();
+
+    // Program level constructs
+    public List<Entity> Entities = new();
+    public List<object> EntityMetadata = new();
+    public List<string> Imports = new();
+    public List<AliasNodeSchema> Aliases = new();
+
+    // Execution Orders
+    private int ExecutionOrder = 0;
+    private int CalleeExecutionOrder = 0;
+    private int SnippetExecutionOrder = 0;
+
+    private List<object> ReturnControlConstructs = new();
+
+    private int CurrentDbCallDepth = 0;
+    private Stack<DbCallDataEntity> DbCallStack = new();
+    private int DbCallExecutionOrder = 0;
+
+    private ConstantVariableExtractor Cve = new();
+
+    private HashSet<int> CommentTokens;
+
+    public CustomTSqlParser(
+        CodeComprehensionMetadata projectMetadata,
+        string filePath,
+        string fileContent,
+        AntlrInputStream inputStream,
+        CommonTokenStream tokenStream
+    )
+    {
+        ProjectMetadata = projectMetadata;
+        ProjectId = projectMetadata.ProjectId;
+        Path = filePath;
+        FileContent = fileContent;
+        InputStream = inputStream;
+        TokenStream = tokenStream;
+
+        FileName = System.IO.Path.GetFileName(filePath);
+        FolderName = System.IO.Path.GetFileName(System.IO.Path.GetDirectoryName(filePath));
+
+        CommentTokens = new HashSet<int>
         {
-            string Snippet = Match.Value;
-            string TableName = Match.Groups[1].Value;
-            string FieldsBlock = Match.Groups[2].Value;
+            TSqlLexer.COMMENT,
+            TSqlLexer.LINE_COMMENT
+        };
+    }     private string GetOriginalTextFromContext(ParserRuleContext ctx)
+    {
+        int startIdx = ctx.Start.StartIndex;
+        int stopIdx = ctx.Stop.StopIndex;
 
-            Result[TableName] = new List<string>();
+        return InputStream.GetText(new Interval(startIdx, stopIdx));
+    }
 
-            var Lines = FieldsBlock.Split('\n');
-            foreach (var LineRaw in Lines)
+    private string GetSnippetTextFromContext(ParserRuleContext ctx)
+    {
+        int startIdx = ctx.Start.TokenIndex;
+        int stopIdx = ctx.Stop.TokenIndex;
+
+        var tokens = TokenStream.GetTokens(startIdx, stopIdx);
+        return string.Concat(tokens
+            .Where(t => !CommentTokens.Contains(t.Type))
+            .Select(t => t.Text));
+    }
+
+    private string GetCurrentContextName(ParserRuleContext ctx)
+    {
+        while (ctx != null)
+        {
+            if (ctx is TSqlParser.Create_or_alter_functionContext funcCtx)
+                return funcCtx.funcName.procedure().GetText().Trim('[', ']');
+
+            if (ctx is TSqlParser.Create_or_alter_procedureContext procCtx)
+                return procCtx.procName.procedure().GetText().Trim('[', ']');
+
+            if (ctx is TSqlParser.Create_or_alter_dml_triggerContext dmlCtx)
+                return dmlCtx.simple_name().name.GetText().Trim('[', ']');
+
+            if (ctx is TSqlParser.Create_or_alter_ddl_triggerContext ddlCtx)
+                return ddlCtx.simple_name().name.GetText().Trim('[', ']');
+
+            ctx = ctx.Parent;
+        }
+
+        return MAIN_SNIPPET;
+    }
+
+    private List<VariableEntity> CreateVariableEntityList(IEnumerable<VariableEntity> variables)
+    {
+        var variableList = new List<VariableEntity>();
+
+        foreach (var variable in variables)
+        {
+            variableList.Add(new VariableEntity
             {
-                var Line = LineRaw.Trim();
-                if (!string.IsNullOrEmpty(Line)
-                    && !Line.StartsWith("--")
-                    && !Line.StartsWith("GO"))
-                {
-                    var MatchField = Regex.Match(
-                        Line,
-                        @"\[(\w+)\]\s+([^,\s]+(?:\s*\([^)]*\))?)");
+                Term = variable.Term,
+                Type = variable.Type,
+                UsageContext = variable.UsageContext,
+                Meaning = variable.Meaning,
+                FilePath = variable.FilePath
+            });
+        }
 
-                    if (MatchField.Success)
+        return variableList;
+    }
+
+    private (HashSet<string>, HashSet<string>, List<string>) ExtractTableSource(
+        TSqlParser.Table_sourceContext tableSource)
+    {
+        var tables = new HashSet<string>();
+        var aliases = new HashSet<string>();
+        var filterConditions = new List<string>();
+
+        if (tableSource != null)
+        {
+            var tsi = tableSource.table_source_item();
+
+            if (tsi?.as_table_alias() != null)
+                aliases.Add(GetOriginalTextFromContext(tsi.as_table_alias()));
+
+            if (tsi?.full_table_name() != null)
+                tables.Add(GetOriginalTextFromContext(tsi.full_table_name()));
+
+            if (tableSource.join_part() != null)
+            {
+                foreach (var join in tableSource.join_part())
+                {
+                    if (join.join_on() != null)
                     {
-                        string FieldName = MatchField.Groups[1].Value;
-                        Result[TableName].Add(FieldName);
+                        var joinOn = join.join_on();
+
+                        if (joinOn.search_condition() != null)
+                            filterConditions.Add(GetOriginalTextFromContext(joinOn.search_condition()));
+
+                        var result = ExtractTableSource(joinOn.table_source());
+                        tables.UnionWith(result.Item1);
+                        aliases.UnionWith(result.Item2);
+                        filterConditions.AddRange(result.Item3);
                     }
                 }
             }
-
-            CreateNodeDatabaseEntity(
-                TableName,
-                Result[TableName],
-                FieldsBlock.TrimStart('\n'),
-                CcMetadata.ProjectId,
-                RunId,
-                FilePath,
-                Snippet,
-                CcMetadata.Technology);
-
-            CreateHasFieldRelationships(CcMetadata.ProjectId, RunId);
-
-            return new CodeContext { FunctionSnippets = new List<FunctionSnippetSchema>() };
         }
 
-        // -------- VIEW Parsing --------
+        return (tables, aliases, filterConditions);
+    }
 
-        var ViewParse = ParseViewFile(FileContent);
+    private void CreateExtractedCalculationSnippet(
+        string snippet,
+        string functionName,
+        int funcStartLine)
+    {
+        var extractData = Cve.ExtractMathematicalCalculations(snippet);
+        var extractDataStartLine = Cve.ExtractMathematicalCalculationsStartline(snippet);
 
-        if (ViewParse.ViewName != null)
+        string resultantData = "";
+        string expressionData = "";
+
+        for (int cnt = 0; cnt < extractData.Count; cnt++)
         {
-            CreateNodeDatabaseEntity(
-                ViewParse.ViewName,
-                ViewParse.Fields,
-                ViewParse.FieldsBlock.Trim('\n'),
-                CcMetadata.ProjectId,
-                RunId,
-                FilePath,
-                FileContent,
-                CcMetadata.Technology,
-                ViewParse.Tables,
-                "VIEW");
+            try
+            {
+                var lineDict = extractData[cnt];
 
-            CreateHasFieldRelationships(CcMetadata.ProjectId, RunId);
+                if (lineDict["match_group"].Contains("="))
+                {
+                    var matchData = lineDict["match_group"].Split('=');
+                    resultantData = matchData[0];
+                    expressionData = matchData[1];
+                }
+                else
+                {
+                    expressionData = lineDict["match_group"];
+                }
 
-            return new CodeContext { FunctionSnippets = new List<FunctionSnippetSchema>() };
+                var strMatchedData = string.Join(" ", expressionData);
+                var variablesDetails = Cve.ExtractConstantsVariables(strMatchedData, Path);
+                var variableEntities = CreateVariableEntityList(variablesDetails);
+
+                bool keyword = expressionData.Contains("SELECT");
+
+                if (!keyword)
+                {
+                    var operands = GetOperands(expressionData.Trim());
+                    var lineRange = FindTargetLines(
+                        expressionData.Trim(),
+                        extractDataStartLine[cnt]["start"]
+                    );
+
+                    var calculationEntity = new CalculationEntity
+                    {
+                        Name = functionName,
+                        Tech = ProjectMetadata.Technology,
+                        FileName = FileName,
+                        FilePath = Path,
+                        StartLineNumber = lineRange.Item1,
+                        EndLineNumber = lineRange.Item2,
+                        ProgramId = FileName,
+                        Type = "",
+                        Snippet = expressionData.Trim(),
+                        Resultant = resultantData,
+                        Operands = operands,
+                        Variable = variableEntities
+                    };
+
+                    if (CurrentFunction != null)
+                        CurrentFunction.Calculation.Add(calculationEntity);
+                    else
+                        MainProgramCalculations.Add(calculationEntity);
+                }
+            }
+            catch
+            {
+                // Strict parity: swallow exception exactly as Python logger error behavior
+            }
         }
+    }      private FunctionSnippetSchema CreateFunctionSnippet(ParserRuleContext ctx)
+    {
+        ExecutionOrder = 0;
+        CalleeExecutionOrder = 0;
+        CurrentIfDepth = 0;
+        CurrentCaseDepth = 0;
+        SnippetExecutionOrder += 1;
 
-        // -------- ANTLR Parsing --------
+        int startLineNumber = ctx.Start.Line;
+        int endLineNumber = ctx.Stop.Line;
 
-        FileContent = TsqlPreprocessor.RemoveUnwantedLines(FileContent);
-        var RawComments = TsqlPreprocessor.ExtractComments(FileContent);
-        var CommentsRemovedCode = TsqlPreprocessor.RemoveComments(FileContent);
-        CommentsRemovedCode = CommentsRemovedCode.Replace("ï»¿", "");
+        string functionName = GetCurrentContextName(ctx);
+        string className = FileName;
 
-        var InputStream = new AntlrInputStream(CommentsRemovedCode);
-        var Lexer = new TSqlLexer(InputStream);
-        var Stream = new CommonTokenStream(Lexer);
+        if (ctx is TSqlParser.Create_or_alter_functionContext funcCtx)
+            className = funcCtx.funcName.GetText();
 
-        Console.WriteLine("Starting parsing...");
+        if (ctx is TSqlParser.Create_or_alter_procedureContext procCtx)
+            className = procCtx.procName.GetText();
 
-        var Tree = SaTsql._cpp_parse(InputStream, "tsql_file");
+        if (ctx is TSqlParser.Create_or_alter_dml_triggerContext dmlCtx)
+            className = dmlCtx.simple_name().GetText();
 
-        var Visitor = new CustomTSqlParser(
-            projectMetadata: CcMetadata,
-            filePath: Actual,
-            file_content: FileContent,
-            input_stream: InputStream,
-            token_stream: Stream
+        if (ctx is TSqlParser.Create_or_alter_ddl_triggerContext ddlCtx)
+            className = ddlCtx.simple_name().GetText();
+
+        string snippetText = GetOriginalTextFromContext(ctx);
+
+        var variablesDetails = Cve.ExtractConstantsVariables(snippetText, Path);
+        var variableEntities = CreateVariableEntityList(variablesDetails);
+
+        var functionSnippet = new FunctionSnippetSchema
+        {
+            FilePath = Path,
+            FileName = FileName,
+            FunctionName = functionName,
+            ClassName = className,
+            Snippet = snippetText,
+            StartLineNumber = startLineNumber,
+            EndLineNumber = endLineNumber,
+            Callees = new List<FunctionCallee>(),
+            Annotations = new List<object>(),
+            ReturnType = "NA",
+            DecisionNodeConstructs = new List<DecisionNodeSchema>(),
+            DbCalls = new List<DbCallDataEntity>(),
+            ServiceCalls = new List<ServiceCallDataEntity>(),
+            Calculation = new List<CalculationEntity>(),
+            ExecutionOrder = ExecutionOrder,
+            SnippetExecutionOrder = SnippetExecutionOrder,
+            Inputs = new List<InputInterfaceSchema>(),
+            Variable = variableEntities
+        };
+
+        FunctionSnippets.Add(functionSnippet);
+
+        return functionSnippet;
+    }
+
+    private void VisitFunctionSnippet(ParserRuleContext ctx)
+    {
+        var functionSnippet = CreateFunctionSnippet(ctx);
+        int functionStartLine = ctx.Start.StartIndex;
+
+        CurrentFunction = functionSnippet;
+        FunctionSnippetStack.Push(functionSnippet);
+
+        CreateExtractedCalculationSnippet(
+            CurrentFunction.Snippet,
+            CurrentFunction.FunctionName,
+            functionStartLine
         );
 
-        Console.WriteLine("Visiting tree...");
-        Visitor.Visit(Tree);
+        VisitChildren(ctx);
 
-        foreach (var Snippet in Visitor.FunctionSnippets)
+        CurrentFunction = FunctionSnippetStack.Count > 0
+            ? FunctionSnippetStack.Pop()
+            : null;
+    }
+
+    private DecisionNodeSchema CreateRuleSnippet(
+        ParserRuleContext ctx,
+        RuleConstructType constructType)
+    {
+        int startLineNumber = ctx.Start.Line;
+        int endLineNumber = ctx.Stop.Line;
+
+        Regex conditionalKeywords;
+
+        if (constructType == RuleConstructType.SWITCH_CONSTRUCT)
+            conditionalKeywords = new Regex(@"\b(WHEN|ELSE)\b", RegexOptions.IgnoreCase);
+        else
+            conditionalKeywords = new Regex(@"\b((?<!END-)IF|ELSE|(?<!END-)DECIDE)\b", RegexOptions.IgnoreCase);
+
+        string snippetText = GetOriginalTextFromContext(ctx);
+
+        var matches = conditionalKeywords.Matches(snippetText);
+        int numConditions = matches.Count;
+
+        string cleanedText = snippetText.Replace("\r", " ");
+
+        string hostingFunctionName = GetCurrentContextName(ctx);
+
+        var variablesDetails = Cve.ExtractConstantsVariables(cleanedText, Path);
+
+        string numericExtractionText = snippetText;
+
+        if (ctx is TSqlParser.If_statementContext ifCtx &&
+            ifCtx.search_condition() != null)
         {
-            Snippet.Imports = Visitor.Imports;
-            Snippet.RawComments = RawComments;
+            numericExtractionText = GetOriginalTextFromContext(ifCtx.search_condition());
         }
 
-        return new CodeContext
+        variablesDetails.AddRange(
+            Cve.ExtractNumericConstants(
+                numericExtractionText.Replace("\r", " "),
+                Path
+            )
+        );
+
+        var variableEntities = CreateVariableEntityList(variablesDetails);
+
+        var decisionNode = new DecisionNodeSchema
         {
-            FunctionSnippets = Visitor.FunctionSnippets,
-            Comments = RawComments.Split('\n').ToList(),
-            EntityMetadata = Visitor.EntityMetadata,
-            Entities = Visitor.Entities,
-            Aliases = Visitor.Aliases,
-            InputInterfaces = new List<InputInterfaceSchema>(),
-            Miscellaneous = new List<object>()
+            Name = hostingFunctionName,
+            ShortSummary = "",
+            StartLineNumber = startLineNumber,
+            EndLineNumber = endLineNumber,
+            Snippet = snippetText,
+            NumberOfConditionals = numConditions,
+            Complexity = Complexity.CategorizeComplexity(numConditions),
+            ConstructType = constructType,
+            ExecutionOrder = ExecutionOrder,
+            Variable = variableEntities
         };
+
+        return decisionNode;
     }
 
-    // ---------------- VIEW PARSER ----------------
-
-    public (string ViewName, List<string> Fields, List<string> Tables, string FieldsBlock)
-        ParseViewFile(string Content)
+    private DbCallDataEntity CreateDbCall(
+        ParserRuleContext ctx,
+        string query,
+        List<string> filterConditions,
+        HashSet<string> aliases,
+        HashSet<string> tables,
+        string operationType)
     {
-        Content = Content.Replace("ï»¿", "");
-        Content = Regex.Replace(Content, @"/\*.*?\*/", "", RegexOptions.Singleline);
-        Content = Regex.Replace(Content, @"--.*", "");
+        ExecutionOrder += 1;
 
-        var ViewMatch = Regex.Match(
-            Content,
-            @"CREATE\s+VIEW\s+(?:\[[^\]]+\]\.)?(?:dbo\.)?\[?([^\s\[\]]+)\]?",
-            RegexOptions.IgnoreCase);
+        string fullText = GetOriginalTextFromContext(ctx);
+        string cleanedText = fullText.Replace("\r", " ");
 
-        if (!ViewMatch.Success)
-            return (null, null, null, null);
+        int startLineNumber = ctx.Start.Line;
+        int endLineNumber = ctx.Stop.Line;
 
-        string ViewName = ViewMatch.Groups[1].Value;
+        var variablesDetails = Cve.ExtractConstantsVariables(cleanedText, Path);
+        var variableEntities = CreateVariableEntityList(variablesDetails);
 
-        var SelectMatch = Regex.Match(
-            Content,
-            @"(?s)(?<=SELECT\s)(.*?)(?=\s+FROM\b)",
-            RegexOptions.IgnoreCase | RegexOptions.Singleline);
+        string hostingFunctionName = GetCurrentContextName(ctx);
 
-        string FieldsStr = "";
-        HashSet<string> Fields = new();
-
-        if (SelectMatch.Success)
+        var dbCallEntity = new DbCallDataEntity
         {
-            FieldsStr = SelectMatch.Groups[1].Value;
-            Fields.UnionWith(GetViewFields(FieldsStr));
+            Name = hostingFunctionName,
+            FilePath = Path,
+            FileName = FileName,
+            Tech = ProjectMetadata.Technology,
+            ProgramId = FileName,
+            StartLineNumber = startLineNumber,
+            EndLineNumber = endLineNumber,
+            Snippet = cleanedText,
+            OperationType = operationType,
+            ExecutionOrder = ExecutionOrder,
+            Variable = variableEntities,
+            Query = query,
+            FilterConditions = filterConditions,
+            Aliases = aliases,
+            TableNames = tables
+                .Select(t => t.Split('.').Last().Trim('[', ']').ToLower())
+                .ToList()
+        };
+
+        if (CurrentFunction != null)
+            CurrentFunction.DbCalls.Add(dbCallEntity);
+        else
+            MainProgramDbCalls.Add(dbCallEntity);
+
+        if (DbCallStack.Count == 0)
+        {
+            DbCallExecutionOrder += 1;
+            dbCallEntity.Level = DbCallLevel.PARENT;
+            dbCallEntity.DbCallExecutionOrder = DbCallExecutionOrder.ToString();
+            dbCallEntity.ChildCount = 0;
+        }
+        else
+        {
+            var parent = DbCallStack.Peek();
+            parent.ChildCount += 1;
+
+            dbCallEntity.Level = DbCallLevel.CHILD;
+            dbCallEntity.DbCallExecutionOrder =
+                parent.DbCallExecutionOrder + "." + parent.ChildCount;
+            dbCallEntity.ChildCount = 0;
         }
 
-        HashSet<string> Tables = new();
-        var TablePattern = new Regex(@"(?:FROM|JOIN)\s+([^\s,]+)", RegexOptions.IgnoreCase);
-
-        foreach (Match M in TablePattern.Matches(Content))
-        {
-            string Table = M.Groups[1].Value;
-            Table = Regex.Split(Table, @"\s+AS\s+|\s+", RegexOptions.IgnoreCase)[0];
-            Table = Table.Replace("[", "").Replace("]", "");
-            string TableName = Table.Split('.').Last();
-
-            if (!TableName.StartsWith("$"))
-                Tables.Add(TableName);
-        }
-
-        return (ViewName, Fields.ToList(), Tables.ToList(), FieldsStr);
+        return dbCallEntity;
     }
 
-    public HashSet<string> GetViewFields(string FieldsStr)
+    private Dictionary<string, object> GetCalleeConditionalHierarchy(ParserRuleContext ctx)
     {
-        var Fields = new HashSet<string>();
-        var RawFields = SplitFields(FieldsStr);
+        var hierarchy = new Dictionary<string, object>();
+        var currentLevel = hierarchy;
+        bool isElse = false;
 
-        foreach (var F in RawFields)
+        while (ctx != null)
         {
-            var AliasMatches = Regex.Matches(F, @"AS\s+([\w_]+)", RegexOptions.IgnoreCase);
+            var parentCtx = ctx.Parent;
 
-            string FieldName;
+            if (parentCtx == null)
+                break;
 
-            if (AliasMatches.Count > 0)
+            if (parentCtx is TSqlParser.If_statementContext ifCtx)
             {
-                FieldName = AliasMatches[^1].Groups[1].Value
-                    .Replace("[", "")
-                    .Replace("]", "");
+                if (ifCtx.ELSE() != null)
+                {
+                    var sym = ifCtx.ELSE().Symbol;
+                    if (sym.StopIndex < ctx.Stop.StartIndex)
+                        isElse = true;
+                }
+
+                if (ifCtx.search_condition() != null)
+                {
+                    string conditionString =
+                        GetOriginalTextFromContext(ifCtx.search_condition());
+
+                    conditionString =
+                        Regex.Replace(conditionString, @"\n\d{4}\s*$", "");
+
+                    currentLevel["condition"] = conditionString;
+                    currentLevel["start_line_number"] = ifCtx.Start.Line;
+                    currentLevel["end_line_number"] = ifCtx.Stop.Line;
+                    currentLevel["siblings"] = new List<string>();
+                    currentLevel["is_else"] = isElse;
+                    currentLevel["parent"] = new Dictionary<string, object>();
+
+                    currentLevel = (Dictionary<string, object>)currentLevel["parent"];
+                }
+
+                isElse = false;
             }
+
+            ctx = parentCtx;
+        }
+
+        return hierarchy;
+    }     private ServiceCallDataEntity CreateServiceCall(
+        ParserRuleContext ctx,
+        string serviceName,
+        List<string> parameters)
+    {
+        ExecutionOrder += 1;
+
+        int startLineNumber = ctx.Start.Line;
+        int endLineNumber = ctx.Stop.Line;
+
+        string snippetText = GetOriginalTextFromContext(ctx);
+        string cleanedText = snippetText.Replace("\r", " ");
+
+        var variablesDetails = Cve.ExtractConstantsVariables(cleanedText, Path);
+        var variableEntities = CreateVariableEntityList(variablesDetails);
+
+        string hostingFunctionName = GetCurrentContextName(ctx);
+
+        var serviceCall = new ServiceCallDataEntity
+        {
+            Name = hostingFunctionName,
+            FilePath = Path,
+            FileName = FileName,
+            StartLineNumber = startLineNumber,
+            EndLineNumber = endLineNumber,
+            Snippet = cleanedText,
+            ExecutionOrder = ExecutionOrder,
+            Variable = variableEntities,
+            ServiceName = serviceName,
+            Parameters = parameters
+        };
+
+        if (CurrentFunction != null)
+            CurrentFunction.ServiceCalls.Add(serviceCall);
+
+        return serviceCall;
+    }
+
+    private FunctionCallee CreateCallee(
+        ParserRuleContext ctx,
+        string calleeName)
+    {
+        CalleeExecutionOrder += 1;
+
+        int startLineNumber = ctx.Start.Line;
+        int endLineNumber = ctx.Stop.Line;
+
+        string snippetText = GetOriginalTextFromContext(ctx);
+
+        var callee = new FunctionCallee
+        {
+            Name = calleeName,
+            FilePath = Path,
+            FileName = FileName,
+            StartLineNumber = startLineNumber,
+            EndLineNumber = endLineNumber,
+            Snippet = snippetText,
+            ExecutionOrder = CalleeExecutionOrder
+        };
+
+        if (CurrentFunction != null)
+            CurrentFunction.Callees.Add(callee);
+
+        return callee;
+    }
+
+    private void HandleBeginTransaction(ParserRuleContext ctx)
+    {
+        ExecutionOrder += 1;
+        DbCallStack.Push(new DbCallDataEntity());
+    }
+
+    private void HandleCommit(ParserRuleContext ctx)
+    {
+        if (DbCallStack.Count > 0)
+            DbCallStack.Pop();
+    }
+
+    private void HandleRollback(ParserRuleContext ctx)
+    {
+        if (DbCallStack.Count > 0)
+            DbCallStack.Pop();
+    }
+
+    // ============================
+    // VISITOR OVERRIDES
+    // ============================
+
+    public override object VisitCreate_or_alter_procedure(
+        TSqlParser.Create_or_alter_procedureContext context)
+    {
+        VisitFunctionSnippet(context);
+        return null;
+    }
+
+    public override object VisitCreate_or_alter_function(
+        TSqlParser.Create_or_alter_functionContext context)
+    {
+        VisitFunctionSnippet(context);
+        return null;
+    }
+
+    public override object VisitIf_statement(
+        TSqlParser.If_statementContext context)
+    {
+        ExecutionOrder += 1;
+
+        var decisionNode = CreateRuleSnippet(
+            context,
+            RuleConstructType.IF_CONSTRUCT);
+
+        if (CurrentFunction != null)
+            CurrentFunction.DecisionNodeConstructs.Add(decisionNode);
+
+        VisitChildren(context);
+
+        return null;
+    }
+
+    public override object VisitSelect_statement(
+        TSqlParser.Select_statementContext context)
+    {
+        string query = GetOriginalTextFromContext(context);
+        var tables = ExtractTables(query);
+        var aliases = ExtractAliases(query);
+        var filters = ExtractFilterConditions(query);
+
+        var dbCall = CreateDbCall(
+            context,
+            query,
+            filters,
+            aliases,
+            tables,
+            "SELECT");
+
+        DbCallStack.Push(dbCall);
+        VisitChildren(context);
+        DbCallStack.Pop();
+
+        return null;
+    }
+
+    public override object VisitInsert_statement(
+        TSqlParser.Insert_statementContext context)
+    {
+        string query = GetOriginalTextFromContext(context);
+        var tables = ExtractTables(query);
+
+        var dbCall = CreateDbCall(
+            context,
+            query,
+            new List<string>(),
+            new HashSet<string>(),
+            tables,
+            "INSERT");
+
+        VisitChildren(context);
+
+        return null;
+    }
+
+    public override object VisitUpdate_statement(
+        TSqlParser.Update_statementContext context)
+    {
+        string query = GetOriginalTextFromContext(context);
+        var tables = ExtractTables(query);
+
+        var dbCall = CreateDbCall(
+            context,
+            query,
+            new List<string>(),
+            new HashSet<string>(),
+            tables,
+            "UPDATE");
+
+        VisitChildren(context);
+
+        return null;
+    }
+
+    public override object VisitDelete_statement(
+        TSqlParser.Delete_statementContext context)
+    {
+        string query = GetOriginalTextFromContext(context);
+        var tables = ExtractTables(query);
+
+        var dbCall = CreateDbCall(
+            context,
+            query,
+            new List<string>(),
+            new HashSet<string>(),
+            tables,
+            "DELETE");
+
+        VisitChildren(context);
+
+        return null;
+    }     // ============================
+    // PART 5 — PYTHON STRICT PARITY
+    // ============================
+
+    public override object VisitCreate_or_alter_ddl_trigger(
+        TSqlParser.Create_or_alter_ddl_triggerContext context)
+    {
+        VisitFunctionSnippet(context);
+        return null;
+    }
+
+    public override object VisitCreate_or_alter_dml_trigger(
+        TSqlParser.Create_or_alter_dml_triggerContext context)
+    {
+        VisitFunctionSnippet(context);
+        return null;
+    }
+
+    public override object VisitCase_expression(
+        TSqlParser.Case_expressionContext context)
+    {
+        if (CurrentCaseDepth == 0)
+        {
+            ExecutionOrder += 1;
+
+            var decisionNode = CreateRuleSnippet(
+                context,
+                RuleConstructType.SWITCH_CONSTRUCT);
+
+            if (CurrentFunction != null)
+                CurrentFunction.DecisionNodeConstructs.Add(decisionNode);
             else
-            {
-                FieldName = F.Replace("[", "")
-                    .Replace("]", "")
-                    .Split('.').Last().Trim();
-            }
-
-            Fields.Add(FieldName.Trim());
+                MainProgramDecisionNodes.Add(decisionNode);
         }
 
-        return Fields;
+        CurrentCaseDepth += 1;
+        VisitChildren(context);
+        CurrentCaseDepth -= 1;
+
+        return null;
     }
 
-    public List<string> SplitFields(string S)
+    public override object VisitSql_clauses(
+        TSqlParser.Sql_clausesContext context)
     {
-        List<string> FieldsList = new();
-        string Current = "";
-        int ParenCount = 0;
-        int CaseCount = 0;
-        bool InQuote = false;
+        TableAlias.Clear();
+        return VisitChildren(context);
+    }
 
-        for (int i = 0; i < S.Length; i++)
+    public override object VisitExecute_statement(
+        TSqlParser.Execute_statementContext context)
+    {
+        string targetFunctionName = null;
+
+        if (context.execute_body()?.func_proc_name_server_database_schema() != null)
         {
-            char Char = S[i];
-
-            if (Char == '\'')
-            {
-                InQuote = !InQuote;
-                Current += Char;
-            }
-            else if (Char == '(' && !InQuote)
-            {
-                ParenCount++;
-                Current += Char;
-            }
-            else if (Char == ')' && !InQuote)
-            {
-                ParenCount--;
-                Current += Char;
-            }
-            else if (i + 4 <= S.Length && S.Substring(i, 4).ToUpper() == "CASE" && !InQuote)
-            {
-                CaseCount++;
-                Current += Char;
-            }
-            else if (i + 3 <= S.Length && S.Substring(i, 3).ToUpper() == "END" && CaseCount > 0 && !InQuote)
-            {
-                CaseCount--;
-                Current += Char;
-            }
-            else if (Char == ',' && ParenCount == 0 && CaseCount == 0 && !InQuote)
-            {
-                FieldsList.Add(Current.Trim());
-                Current = "";
-            }
-            else
-            {
-                Current += Char;
-            }
+            targetFunctionName =
+                ParseFuncProcNameServerDatabaseSchema(
+                    context.execute_body().func_proc_name_server_database_schema());
         }
 
-        if (!string.IsNullOrWhiteSpace(Current))
-            FieldsList.Add(Current.Trim());
+        if (TargetFunctions.Contains(targetFunctionName))
+            CreateServiceCall(context, targetFunctionName);
+        else
+            CreateCallee(context, CalleeConstructType.EXECUTE);
 
-        return FieldsList;
+        return VisitChildren(context);
     }
-}
+
+    public override object VisitRowset_function(
+        TSqlParser.Rowset_functionContext context)
+    {
+        string snippetText = GetOriginalTextFromContext(context);
+
+        if (snippetText.ToUpper().Contains("OPENROWSET"))
+            CreateServiceCall(context, "OPENROWSET");
+
+        return VisitChildren(context);
+    }
+
+    public override object VisitWhile_statement(
+        TSqlParser.While_statementContext context)
+    {
+        ExecutionOrder += 1;
+
+        // Python double increment preserved intentionally
+        ExecutionOrder += 1;
+
+        string fullText = GetOriginalTextFromContext(context);
+        string cleanedText = fullText.Replace("\r", " ");
+
+        int startLineNumber = context.Start.Line;
+        int endLineNumber = context.Stop.Line;
+
+        string hostingFunctionName = GetCurrentContextName(context);
+
+        var loopEntity = new LoopEntityNodeSchema
+        {
+            Name = hostingFunctionName,
+            Tech = ProjectMetadata.Technology,
+            FileName = FileName,
+            FilePath = Path,
+            StartLineNumber = startLineNumber,
+            EndLineNumber = endLineNumber,
+            ProgramId = FileName.Split('.')[0],
+            Type = LoopEntityType.WHILE.ToString(),
+            Snippet = cleanedText,
+            ExecutionOrder = ExecutionOrder,
+            ModuleName = FolderName
+        };
+
+        if (CurrentFunction != null)
+            CurrentFunction.LoopEntity.Add(loopEntity);
+        else
+            MainProgramLoopEntities.Add(loopEntity);
+
+        return VisitChildren(context);
+    }
+
+    public override object VisitTransaction_statement(
+        TSqlParser.Transaction_statementContext context)
+    {
+        if (context.COMMIT() != null)
+            CreateTransactionCommit(context);
+        else if (context.ROLLBACK() != null)
+            CreateTransactionRollback(context);
+
+        return VisitChildren(context);
+    }
+
+    public override object VisitSCALAR_FUNCTION(
+        TSqlParser.SCALAR_FUNCTIONContext context)
+    {
+        CreateCallee(context, CalleeConstructType.SCALAR_FUNCTION);
+        return VisitChildren(context);
+    }
+
+    // ----------------------------
+    // Operand extraction (exact regex)
+    // ----------------------------
+
+    private List<string> GetOperands(string data)
+    {
+        var operands = new List<string>();
+
+        var matches = Regex.Matches(data, @"[+\-*/]");
+
+        foreach (Match match in matches)
+            operands.Add(match.Value);
+
+        return operands;
+    }
+
+    // ----------------------------
+    // Target line finder (strict parity)
+    // ----------------------------
+
+    private (int, int) FindTargetLines(string targetData, int startLine)
+    {
+        try
+        {
+            var targetDataLine = targetData.Split('\n');
+
+            if (targetDataLine.Length > 1)
+            {
+                int endLine = startLine + targetDataLine.Length - 1;
+                return (startLine, endLine);
+            }
+
+            if (targetDataLine.Length == 1)
+                return (startLine, startLine);
+
+            return (0, 0);
+        }
+        catch
+        {
+            return (0, 0);
+        }
+    }
+
+    // ----------------------------
+    // Entity Exists (Cypher exact parity)
+    // ----------------------------
+
+    private bool EntityExists(string name)
+    {
+        string query = @"
+            MATCH (e:DatabaseEntity)
+            WHERE toLower(e.name) = toLower($name)
+              AND e.project_id = $project_id
+            RETURN COUNT(e) > 0 AS exists
+        ";
+
+        var result = Neo4j.Driver.GraphDatabase.Driver(
+                ProjectMetadata.Neo4jUri,
+                AuthTokens.Basic(
+                    ProjectMetadata.Neo4jUser,
+                    ProjectMetadata.Neo4jPassword))
+            .Session()
+            .Run(query, new
+            {
+                name = name,
+                project_id = ProjectId
+            })
+            .Single();
+
+        return result["exists"].As<bool>();
+    }
