@@ -1,5 +1,137 @@
 using System;
 using System.Collections.Generic;
+using System.Text.RegularExpressions;
+
+namespace TsqlParserProject
+{
+    public class TSqlPreprocessor
+    {
+        private string single_line_comment_pattern = @"(?:^|\s)(?:---|--)[^\n]*";
+        private string multi_line_comment_pattern = @"/\*[\s\S]*?\*/";
+
+        private List<string> unwanted_line_patterns = new List<string>
+        {
+            @"^[ \t]*Text\s+--.*$",
+            @"^[ \t]*Completion\stime:.*$"
+        };
+
+        public TSqlPreprocessor()
+        {
+        }
+
+        public string RemoveUnwantedLines(string file_content)
+        {
+            if (file_content == null)
+            {
+                return null;
+            }
+
+            foreach (string pattern in unwanted_line_patterns)
+            {
+                file_content = Regex.Replace(
+                    file_content,
+                    pattern,
+                    delegate (Match match)
+                    {
+                        int newlineCount = 0;
+                        string value = match.Value;
+                        for (int i = 0; i < value.Length; i++)
+                        {
+                            if (value[i] == '\n')
+                            {
+                                newlineCount++;
+                            }
+                        }
+
+                        return new string('\n', newlineCount);
+                    },
+                    RegexOptions.Multiline
+                );
+            }
+
+            return file_content;
+        }
+
+        public string ExtractComments(string file_content)
+        {
+            if (file_content == null)
+            {
+                return null;
+            }
+
+            List<string> comments = new List<string>();
+
+            MatchCollection single_line_matches = Regex.Matches(
+                file_content,
+                single_line_comment_pattern,
+                RegexOptions.Multiline
+            );
+
+            foreach (Match match in single_line_matches)
+            {
+                comments.Add(match.Value);
+            }
+
+            MatchCollection multi_line_matches = Regex.Matches(
+                file_content,
+                multi_line_comment_pattern,
+                RegexOptions.Multiline
+            );
+
+            foreach (Match match in multi_line_matches)
+            {
+                comments.Add(match.Value);
+            }
+
+            return string.Join("\n", comments);
+        }
+
+        public string RemoveComments(string file_content)
+        {
+            if (file_content == null)
+            {
+                return null;
+            }
+
+            string text_without_comments = Regex.Replace(
+                file_content,
+                single_line_comment_pattern,
+                "",
+                RegexOptions.Multiline
+            );
+
+            text_without_comments = Regex.Replace(
+                text_without_comments,
+                multi_line_comment_pattern,
+                delegate (Match match)
+                {
+                    int newlineCount = 0;
+                    string value = match.Value;
+                    for (int i = 0; i < value.Length; i++)
+                    {
+                        if (value[i] == '\n')
+                        {
+                            newlineCount++;
+                        }
+                    }
+
+                    return new string('\n', newlineCount);
+                },
+                RegexOptions.Multiline
+            );
+
+            return text_without_comments;
+        }
+    }
+}
+
+
+---------------------------------------------
+
+
+
+using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Reflection;
@@ -11,6 +143,8 @@ namespace TsqlParserProject
     public class ConstantVariableExtractor
     {
         private HashSet<string> keywords = new();
+        private string negative_lookahead;
+        private string variable_pattern;
         private Regex variable_regex;
         private Regex keywords_as_vars;
         private string string_constant = @"'([^']*)'";
@@ -22,130 +156,85 @@ namespace TsqlParserProject
 
         public ConstantVariableExtractor()
         {
+            keywords = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
             ReadKeywords();
-            
-            // Build negative lookahead pattern from keywords (sorted by length descending for proper matching)
-            string negative_lookahead = string.Join("|", keywords.OrderByDescending(k => k.Length).Select(k => Regex.Escape(k)));
-            
-            // Match Python exactly: variable_pattern with negative lookahead to exclude SQL keywords
-            string variable_pattern = $@"(?<!@)(?!(?:{negative_lookahead})(?=[\s(]|$))\b[A-Z]+(?:[-._][A-Z0-9]+)*\b";
+
+            negative_lookahead = string.Join("|", keywords.Select(k => Regex.Escape(k)));
+
+            variable_pattern = $@"(?<!@)(?!(?:{negative_lookahead})(?=[\s(]|$))\b[A-Z]+(?:[-._][A-Z0-9]+)*\b";
             variable_regex = new Regex(variable_pattern);
-            
-            // Match Python exactly: keywords_as_vars pattern for @variables
+
             keywords_as_vars = new Regex(@"(?:(?<=\s)|(?<=^))(@[A-Z][A-Z0-9_]*)(?=[\s(]|$)");
             string_constant_regex = new Regex(string_constant);
             numeric_constant_regex = new Regex(@"(?<=\s)\d+(?=\s)|(?<=\s)\d+$");
 
-            // Build calc pattern with keyword exclusion - case sensitive like Python
-            calc_pattern = $@"(?!(?:T|CT|ECT|LECT|ELECT|{negative_lookahead})(?=\s|$))(?:(?:SET|SELECT)?\s*(@[\w]+)?\s*(?:=\s*)?)?\(*\s*@[\w.]+(?:\s*[+\-*/]\s*[@\w.()]+)+\s*\)*";
+            calc_pattern =
+                $@"(?!(?:T|CT|ECT|LECT|ELECT|{negative_lookahead})(?=\s|$))" +
+                $@"(?:(?:SET|SELECT)?\s*(@[\w]+)?\s*(?:=\s*)?)?" +
+                $@"\(*\s*@[\w.]+(?:\s*[+\-*/]\s*[@\w.()]+)+\s*\)*";
+
             calc_regex = new Regex(calc_pattern);
         }
 
         public void ReadKeywords()
         {
-            string currentFile = Assembly.GetExecutingAssembly().Location;
-            string currentDir = Path.GetDirectoryName(currentFile);
-            
-            // Assembly is in bin/Debug/net8.0/, need to go up 3 levels to reach project root
-            // Then into LanguageParser/tsql/grammer/
-            string grammarPath = Path.GetFullPath(Path.Combine(currentDir, "..", "..", "..", "LanguageParser", "tsql", "grammer", "TSqlLexer.g4"));
-            
-            Console.WriteLine("Reading the Lexer File: " + grammarPath);
-            
-            if (!File.Exists(grammarPath))
-            {
-                // Try alternative paths
-                string[] alternativePaths = new[]
-                {
-                    Path.GetFullPath(Path.Combine(currentDir, "..", "..", "..", "..", "..", "LanguageParser", "tsql", "grammer", "TSqlLexer.g4")),
-                    @"c:\dotnetRapidx\app-codescout\Parser3.0\parser-service-v2\ParserService.Grammar\LanguageParser\tsql\grammer\TSqlLexer.g4"
-                };
-                
-                foreach (var altPath in alternativePaths)
-                {
-                    if (File.Exists(altPath))
-                    {
-                        grammarPath = altPath;
-                        break;
-                    }
-                }
-            }
-            
-            if (!File.Exists(grammarPath))
-            {
-                // Match Python: silently return with empty keywords
-                // But we need keywords to filter, so add common SQL keywords
-                keywords = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-                {
-                    "SELECT", "FROM", "WHERE", "AND", "OR", "NOT", "NULL", "IS", "IN", "EXISTS",
-                    "BETWEEN", "LIKE", "AS", "JOIN", "INNER", "OUTER", "LEFT", "RIGHT", "FULL",
-                    "ON", "GROUP", "BY", "HAVING", "ORDER", "ASC", "DESC", "TOP", "DISTINCT",
-                    "INSERT", "INTO", "VALUES", "UPDATE", "SET", "DELETE", "CREATE", "TABLE",
-                    "ALTER", "DROP", "INDEX", "VIEW", "PROCEDURE", "FUNCTION", "TRIGGER",
-                    "BEGIN", "END", "IF", "ELSE", "WHILE", "RETURN", "DECLARE", "CURSOR",
-                    "FETCH", "OPEN", "CLOSE", "WITH", "NOCOUNT", "NOLOCK", "XACT_ABORT",
-                    "TRANSACTION", "COMMIT", "ROLLBACK", "UNION", "ALL", "CASE", "WHEN",
-                    "THEN", "COALESCE", "ISNULL", "CONVERT", "CAST", "VARCHAR", "INT",
-                    "DATETIME", "BIT", "FLOAT", "NUMERIC", "DECIMAL", "NVARCHAR", "NCHAR",
-                    "CHAR", "TEXT", "NTEXT", "BINARY", "VARBINARY", "IMAGE", "SMALLINT",
-                    "TINYINT", "BIGINT", "MONEY", "SMALLMONEY", "REAL", "SMALLDATETIME",
-                    "UNIQUEIDENTIFIER", "SQL_VARIANT", "XML", "TIMESTAMP", "ROWVERSION",
-                    "PRIMARY", "KEY", "FOREIGN", "REFERENCES", "DEFAULT", "CHECK", "CONSTRAINT",
-                    "UNIQUE", "EXEC", "EXECUTE", "SP_EXECUTESQL", "PRINT", "RAISERROR",
-                    "TRY", "CATCH", "THROW", "WAITFOR", "GOTO", "CONTINUE", "BREAK",
-                    "RETURN", "OPTION", "FAST_FORWARD", "READ_ONLY", "SCROLL_LOCKS",
-                    "OPTIMISTIC", "STATIC", "DYNAMIC", "FORWARD_ONLY", "KEYSET"
-                };
-                return;
-            }
-            
-            string startMarker = "// Keywords Start Here";
-            string endMarker = "// Keywords End Here";
-            bool capture = false;
-
             try
             {
-                if (File.Exists(grammarPath))
-                {
-                    foreach (var line in File.ReadLines(grammarPath))
-                    {
-                        string trimmedLine = line.Trim();
-                        if (trimmedLine == startMarker)
-                        {
-                            capture = true;
-                            continue;
-                        }
-                        else if (trimmedLine == endMarker)
-                        {
-                            capture = false;
-                            break;
-                        }
+                string currentDir = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location);
+                string targetFilePath = Path.GetFullPath(
+                    Path.Combine(currentDir ?? "", "..", "..", "grammer", "TSqlLexer.g4"));
 
-                        if (capture && !string.IsNullOrEmpty(trimmedLine) && !trimmedLine.StartsWith("//"))
+                string startMarker = "// Keywords Start Here";
+                string endMarker = "// Keywords End Here";
+                bool capture = false;
+
+                if (!File.Exists(targetFilePath))
+                    return;
+
+                foreach (var lineRaw in File.ReadLines(targetFilePath))
+                {
+                    string line = lineRaw.Trim();
+
+                    if (line == startMarker)
+                    {
+                        capture = true;
+                        continue;
+                    }
+                    else if (line == endMarker)
+                    {
+                        capture = false;
+                        break;
+                    }
+
+                    if (capture && !string.IsNullOrEmpty(line) && !line.StartsWith("//"))
+                    {
+                        var colonPart = Regex.Match(line, @":(.*?);");
+                        if (colonPart.Success)
                         {
-                            var match = Regex.Match(trimmedLine, @":(.*?);");
-                            if (match.Success)
+                            var afterColon = colonPart.Groups[1].Value;
+                            var keywordMatches = Regex.Matches(afterColon, @"'[^']*'");
+
+                            foreach (Match k in keywordMatches)
                             {
-                                string afterColon = match.Groups[1].Value;
-                                var keywordMatches = Regex.Matches(afterColon, @"'[^']*'");
-                                foreach (Match kMatch in keywordMatches)
-                                {
-                                    keywords.Add(kMatch.Value.Trim(' ', '\''));
-                                }
+                                keywords.Add(k.Value.Trim(' ', '\''));
                             }
                         }
                     }
                 }
             }
-            catch (Exception e)
+            catch (Exception)
             {
-                Console.WriteLine("Error while extracting the variables: " + e.Message);
             }
         }
 
         public List<Dictionary<string, object>> ExtractMathematicalCalculations(string codeSnippet)
         {
             var matchedList = new List<Dictionary<string, object>>();
+
+            if (string.IsNullOrEmpty(codeSnippet))
+                return matchedList;
+
             try
             {
                 foreach (Match match in calc_regex.Matches(codeSnippet))
@@ -156,19 +245,26 @@ namespace TsqlParserProject
                         { "start", match.Index },
                         { "end", match.Index + match.Length }
                     };
+
                     matchedList.Add(dataDict);
                 }
             }
-            catch (Exception e)
+            catch (Exception)
             {
             }
+
             return matchedList;
         }
 
         public List<Dictionary<string, object>> ExtractMathematicalCalculationsStartLine(string codeSnippet)
         {
             var matchedList = new List<Dictionary<string, object>>();
+
+            if (string.IsNullOrEmpty(codeSnippet))
+                return matchedList;
+
             var lines = codeSnippet.Split('\n');
+
             try
             {
                 for (int i = 0; i < lines.Length; i++)
@@ -180,30 +276,39 @@ namespace TsqlParserProject
                             { "match_group", match.Value },
                             { "start", i + 1 }
                         };
+
                         matchedList.Add(dataDict);
                     }
                 }
             }
-            catch (Exception e)
+            catch (Exception)
             {
             }
+
             return matchedList;
         }
 
         public List<DataDefinitionJSON> ExtractConstantsVariables(string codeSnippet, string filePath)
         {
-            var lines = codeSnippet.Split('\n');
             var variableDetails = new List<DataDefinitionJSON>();
+
+            if (string.IsNullOrEmpty(codeSnippet))
+                return variableDetails;
+
+            var lines = codeSnippet.Split('\n');
             var variableDict = new Dictionary<string, DataDefinitionJSON>();
 
             foreach (var line in lines)
             {
-                if (line.Trim().StartsWith("--")) continue;
+                if (line.Trim().StartsWith("--"))
+                    continue;
 
                 foreach (Match match in string_constant_regex.Matches(line))
                 {
                     string constant = match.Groups[1].Value;
-                    if (!string.IsNullOrWhiteSpace(constant) && constant.Trim('\'').Split(new[] { ' ', '\t', '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries).Length == 1)
+
+                    if (!string.IsNullOrWhiteSpace(constant) &&
+                        constant.Trim('\'').Split((char[])null, StringSplitOptions.RemoveEmptyEntries).Length == 1)
                     {
                         if (!variableDict.ContainsKey(constant))
                         {
@@ -224,12 +329,13 @@ namespace TsqlParserProject
                 }
 
                 string upperLine = line.ToUpperInvariant();
-                
+
                 foreach (Match m in variable_regex.Matches(upperLine))
                 {
                     string variable = line.Substring(m.Index, m.Length);
-                    
-                    if (!string.IsNullOrWhiteSpace(variable) && variable.Trim('\'').Split(new[] { ' ', '\t', '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries).Length == 1)
+
+                    if (!string.IsNullOrWhiteSpace(variable) &&
+                        variable.Trim('\'').Split((char[])null, StringSplitOptions.RemoveEmptyEntries).Length == 1)
                     {
                         if (!variableDict.ContainsKey(variable))
                         {
@@ -252,7 +358,9 @@ namespace TsqlParserProject
                 foreach (Match m in keywords_as_vars.Matches(upperLine))
                 {
                     string keyVar = line.Substring(m.Index, m.Length);
-                    if (!string.IsNullOrWhiteSpace(keyVar) && keyVar.Trim('\'').Split(new[] { ' ', '\t', '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries).Length == 1)
+
+                    if (!string.IsNullOrWhiteSpace(keyVar) &&
+                        keyVar.Trim('\'').Split((char[])null, StringSplitOptions.RemoveEmptyEntries).Length == 1)
                     {
                         if (!variableDict.ContainsKey(keyVar))
                         {
@@ -274,13 +382,18 @@ namespace TsqlParserProject
             }
 
             variableDetails.AddRange(variableDict.Values);
+
             return variableDetails;
         }
 
         public List<DataDefinitionJSON> ExtractNumericConstants(string codeSnippet, string filePath)
         {
-            var lines = codeSnippet.Split('\n');
             var variableDetails = new List<DataDefinitionJSON>();
+
+            if (string.IsNullOrEmpty(codeSnippet))
+                return variableDetails;
+
+            var lines = codeSnippet.Split('\n');
             var variableDict = new Dictionary<string, DataDefinitionJSON>();
 
             foreach (var line in lines)
@@ -288,7 +401,9 @@ namespace TsqlParserProject
                 foreach (Match match in numeric_constant_regex.Matches(line))
                 {
                     string constant = match.Value;
-                    if (!string.IsNullOrWhiteSpace(constant) && constant.Trim('\'').Split(new[] { ' ', '\t', '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries).Length == 1)
+
+                    if (!string.IsNullOrWhiteSpace(constant) &&
+                        constant.Trim('\'').Split((char[])null, StringSplitOptions.RemoveEmptyEntries).Length == 1)
                     {
                         if (!variableDict.ContainsKey(constant))
                         {
@@ -310,185 +425,8 @@ namespace TsqlParserProject
             }
 
             variableDetails.AddRange(variableDict.Values);
+
             return variableDetails;
         }
     }
 }
-
-
-
------------------------------------
-
-import re
-import os
-import logging
-from typing import List
-
-from antlr4 import FileStream, InputStream
-from schemas.data_entity_schema import DataDefinitionJSON
-
-logger = logging.getLogger('parser')
-
-
-class ConstantVariableExtractor:
-    def __init__(self):
-        self.keywords = set()
-
-        # load all the keywords of natural from lexer file
-        self.read_keywords()
-        self.negative_lookahead = '|'.join(re.escape(keyword) for keyword in self.keywords)
-        self.variable_pattern = (rf"(?<!@)(?!(?:{self.negative_lookahead})(?=[\s(]|$))" +
-                                 rf"\b[A-Z]+(?:[-._][A-Z0-9]+)*\b")
-        # rf"|(?:(?<=\s)|(?<=^))[\*#]*\b(?!{self.negative_lookahead}\b)[A-Z]+(?:-[A-Z0-9]+)*\b"
-        self.variable_regex = re.compile(self.variable_pattern)
-        self.keywords_as_vars = re.compile(rf"(?:(?<=\s)|(?<=^))(@[A-Z][A-Z0-9_]*)(?=[\s(]|$)")
-        self.string_constant = r"'([^']*)'"
-        self.string_constant_regex = re.compile(self.string_constant)
-        self.numeric_constant_regex = re.compile(r"(?<=\s)\d+(?=\s)|(?<=\s)\d+$")
-        self.calc_pattern = (
-            rf"(?!(?:T|CT|ECT|LECT|ELECT|{self.negative_lookahead})(?=\s|$))"
-            # Optional SET or SELECT and variable assignment
-            rf"(?:"
-            rf"(?:SET|SELECT)?\s*"
-            rf"(@[\w]+)?\s*"
-            rf"(?:=\s*)?"
-            r")?"
-            # Require at least one @ as an operand (not just anywhere)
-            rf"\(*\s*@[\w.]+(?:\s*[+\-*/]\s*[@\w.()]+)+\s*\)*"
-        )
-        self.calc_regex = re.compile(self.calc_pattern)
-        # Regex pattern to match resultant variables (e.g., @x, @y)
-        self.pattern_resultant = r"SET\s+(@\w+)\s+="
-
-    def read_keywords(self):
-        # Construct the lexer file path
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        target_file_path = os.path.join(current_dir, '..', '..', 'grammer', 'TSqlLexer.g4')
-        target_file_path = os.path.abspath(target_file_path)
-        logger.debug('Reading the Lexer File: ' + target_file_path)
-
-        start_marker = "// Keywords Start Here"
-        end_marker = "// Keywords End Here"
-        capture = False
-
-        try:
-            with open(target_file_path, 'r') as file:
-                for line in file:
-                    line = line.strip()
-                    if line == start_marker:
-                        capture = True
-                        continue
-                    elif line == end_marker:
-                        capture = False
-                        break
-
-                    if capture and line and not line.startswith('//'):
-                        # Match only part after colon and before semicolon
-                        colon_part = re.search(r":(.*?);", line)
-                        if colon_part:
-                            after_colon = colon_part.group(1)
-                            # Extract all quoted strings from after colon part
-                            keyword_list = re.findall(r"'[^']*'", after_colon)
-
-                            self.keywords.update([k.strip(" '") for k in keyword_list])
-        except Exception as e:
-            print("Error while extracting the variables", e)
-
-    def extract_mathematical_calculations(self, code_snippet: str):
-        matched_list = []
-        try:
-            for match in self.calc_regex.finditer(code_snippet):
-                print("Match:", match.group(), "Start:", match.start(), "End:", match.end())
-                data_dict = {"match_group": match.group(), "start": match.start(), "end": match.end()}
-                matched_list.append(data_dict)
-        except Exception as e:
-            logger.error(f"Error in extract_mathematical_calculations: {e}", exc_info=True)
-        return matched_list
-    
-    def extract_mathematical_calculations_startline(self, code_snippet: str):
-        matched_list = []
-        lines=code_snippet.splitlines()
-        try:
-            for i, line in enumerate(lines, start=1):
-                for match in re.finditer(self.calc_regex, line):
-                    print("Match:", match.group(), "Start:", i )
-                    data_dict = {"match_group": match.group(), "start": i}
-                    matched_list.append(data_dict)
-        except Exception as e:
-            logger.error(f"Error in extract_mathematical_calculations: {e}", exc_info=True)
-        return matched_list
-
-    def extract_constants_variables(self, code_snippet: str, file_path: str):
-        lines = code_snippet.split('\n')
-        variable_details = []
-        variable_dict = {}
-
-        # Construct the regex pattern with a negative lookahead for each keyword
-        for line in lines:
-            # Skip commented lines
-            if line.strip().startswith('--'):
-                continue
-            # Extract constants (strings within single quotes) and their corresponding lines
-            constants = self.string_constant_regex.findall(line)
-            for constant in constants:
-                if constant not in variable_dict and len(constant.strip("'").split()) == 1:
-                    variable_dict[constant] = DataDefinitionJSON(type='CONSTANT', term=constant,
-                                                                 usage_context=[line],
-                                                                 file_path=file_path,
-                                                                 meaning="")
-                elif constant in variable_dict and len(constant.strip("'").split()) == 1:
-                    variable_dict[constant].usage_context.append(line)
-
-            # Extract variables (starting with #) and their corresponding lines
-            upper_line = line.upper()
-            matches = self.variable_regex.finditer(upper_line)
-            # Then extract the original form of those matches from the original line
-            variables = [line[m.start():m.end()] for m in matches]
-            for variable in variables:
-                if variable not in variable_dict and len(variable.strip("'").split()) == 1:
-                    variable_dict[variable] = DataDefinitionJSON(type='DECLARATION', term=variable,
-                                                                 usage_context=[line],
-                                                                 file_path=file_path,
-                                                                 meaning="")
-                elif variable in variable_dict and len(variable.strip("'").split()) == 1:
-                    variable_dict[variable].usage_context.append(line)
-
-            # Extract variables (starting with #) which are there in lexer tokens AS keywords
-            # First find matches by checking against uppercase version of line
-            matches = self.keywords_as_vars.finditer(upper_line)
-            # Then extract the original form of those matches from the original line
-            keyword_vars = [line[m.start():m.end()] for m in matches]
-            for key_var in keyword_vars:
-                if key_var not in variable_dict and len(key_var.strip("'").split()) == 1:
-                    variable_dict[key_var] = DataDefinitionJSON(type='DECLARATION', term=key_var,
-                                                                usage_context=[line],
-                                                                file_path=file_path,
-                                                                meaning="")
-                elif key_var in variable_dict and len(key_var.strip("'").split()) == 1:
-                    variable_dict[key_var].usage_context.append(line)
-
-        variable_details += list(variable_dict.values())
-
-        return variable_details
-
-    def extract_numeric_constants(self, code_snippet: str, file_path: str):
-        lines = code_snippet.split('\n')
-        variable_details = []
-        variable_dict = {}
-
-        for line in lines:
-            # Extract variables (starting with #) and their corresponding lines
-            constants = self.numeric_constant_regex.findall(line)
-            for constant in constants:
-                if constant not in variable_dict and len(constant.strip("'").split()) == 1:
-                    variable_dict[constant] = DataDefinitionJSON(type='CONSTANT', term=constant,
-                                                                 usage_context=[line],
-                                                                 file_path=file_path,
-                                                                 meaning="")
-                elif constant in variable_dict and len(constant.strip("'").split()) == 1:
-                    variable_dict[constant].usage_context.append(line)
-
-        variable_details += list(variable_dict.values())
-
-        return variable_details
-
