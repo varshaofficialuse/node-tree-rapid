@@ -1,511 +1,92 @@
-import logging
 import os
-import re
-import uuid
-from neomodel import db
-from models.neo4j.database_field import DatabaseField
-from typing import List
 import json
-from antlr4 import *
-from antlr4.tree.Trees import Trees
-from schemas.cc_metadata import CodeComprehensionMetadata
-from schemas.graph_metadata import (CodeContext, InputInterfaceSchema,
-                                    FunctionSnippetSchema)
-
-from services.codeminer.tsql.visitor.extractors.tsql_preprocessor import TSqlPreprocessor
-from services.codeminer.tsql.visitor.visitor_tsql import CustomTSqlParser
-from services.parsers.abstract_parsers import BaseParser
-
-from tsql.parser import sa_tsql
-from tsql.parser.sa_tsql import TSqlParser
-from tsql.parser.sa_tsql import TSqlLexer
-
-from services.parsers.tsql.parser_utils import write_function_snippets_to_excel_with_counts
-
-class TSqlCodeParser(BaseParser):
-
-    @staticmethod
-    def remove_subsections(
-            file_content: str, subsections: List[FunctionSnippetSchema]
-    ) -> str:
-        for subsection in subsections:
-            file_content = file_content.replace(
-                subsection.snippet, '\n' * len(subsection.snippet.splitlines())
-            )
-
-        return file_content
-
-    def parse_codebase(
-            self,
-            run_id: int,
-            run_file_id: int,
-            cc_metadata: CodeComprehensionMetadata,
-            file_path: str
-    ) -> CodeContext:
-
-        if ".DS_Store" in file_path:
-            return None
-
-        tsql_preprocessor = TSqlPreprocessor()
-
-        rel_path = os.path.relpath(file_path)
-        actual = rel_path.lstrip(".\\")
-
-        logging.info(f"parsing {file_path}")
-        result={}
-        # input_stream = FileStream(file_path, encoding=cc_metadata.encoding_type)
-        with open(file_path, 'r') as fp:
-            file_content = fp.read()
-            file_content = file_content.replace("ï»¿", "")
-
-            file_content = file_content.replace('\r\n', '\n').replace('\r','\n')
-            match = re.search(r'CREATE TABLE \[dbo\]\.\[(\w+)\] \((.*?)\);', file_content, re.DOTALL)
-            if match:
-                
-                snippet=match.group()
-                table_name = match.group(1)
-                fields_block = match.group(2)
-                result[table_name]=[]
-                # Parse fields from the block
-                lines = fields_block.split('\n')
-                for line in lines:
-                    line = line.strip()
-                    if line and not line.startswith('--') and not line.startswith('GO'):
-                        # Parse field line: [FieldName] Type ... ,
-                        match_field = re.match(r'\[(\w+)\]\s+([^,\s]+(?:\s*\([^)]*\))?)', line)
-                        if match_field:
-                            field_name = match_field.group(1)
-                            result[table_name].append(field_name)
-            else:
-                match = re.search(r'CREATE TABLE \[dbo\]\.\[([^\]]+)\]', file_content)
-                if match:
-                    snippet=file_content
-                    table_name = match.group(1)
-                    fields_block=""
-                    result[table_name]=[]
-                    # Find the fields part
-                    start = file_content.find('(', file_content.find('CREATE TABLE'))
-                    if start != -1:
-                        constraint_pos = file_content.find('CONSTRAINT', start)
-                        if constraint_pos != -1:
-                            end = constraint_pos
-                        else:
-                            # Find the matching closing parenthesis
-                            pos = start
-                            count = 1
-                            while pos < len(file_content) - 1 and count > 0:
-                                pos += 1
-                                if file_content[pos] == '(':
-                                    count += 1
-                                elif file_content[pos] == ')':
-                                    count -= 1
-                            end = pos
-                        fields_block = file_content[start+1:end]
-
-                        # Extract field names
-                        for line in fields_block.split('\n'):
-                            line = line.strip()
-                            if line.startswith('[') and ']' in line:
-                                field_match = re.match(r'\[([^\]]+)\]', line)
-                                if field_match:
-                                    field_name = field_match.group(1)
-                                    result[table_name].append(field_name)
-
-            if result:
-                self.create_node_database_entity(table_name, result[table_name],fields_block.lstrip('\n'),
-                                                 cc_metadata.project_id, run_id, file_path,snippet,cc_metadata.technology)
-                self.create_has_field_relationships(cc_metadata.project_id, run_id)
-                return CodeContext(function_snippets=[])
-            
-            view_name,fields,tables,fields_block=self.parse_view_file(file_content)
-            if view_name and view_name is not None: 
-                self.create_node_database_entity(view_name, fields,fields_block.strip('\n'),
-                                                    cc_metadata.project_id, run_id, file_path,file_content,cc_metadata.technology,tables,type="VIEW")
-                self.create_has_field_relationships(cc_metadata.project_id, run_id)
-                return CodeContext(function_snippets=[])
+import openpyxl
+from datetime import datetime
 
 
-        filename = os.path.basename(file_path)
+def write_function_snippets_to_excel_with_counts(output, input_file_path, save_directory):
+    # Extract the base name of the input file (without extension)
+    base_filename = os.path.splitext(os.path.basename(input_file_path))[0]
 
-        function_snippets = []
-        comments = []
-        entity_metadata = []
-        entities = []
-        aliases = []
-        input_interfaces = []
-        miscellaneous = []
+    # Generate a timestamp for the filename
+    timestamp = datetime.now().strftime("%d%m%Y_%H%M%S")
 
-        # Perform pre-processing activities first before building the tree
-        file_content = tsql_preprocessor.remove_unwanted_lines(file_content)
-        raw_comments = tsql_preprocessor.extract_comments(file_content)
-        comments_removed_code = tsql_preprocessor.remove_comments(file_content)
-        comments_removed_code = comments_removed_code.replace("ï»¿", "")
-        # file_content = tsql_preprocessor.remove_comments(file_content)
+    # Construct the Excel file name
+    excel_filename = f"{base_filename}_Parser_Results_{timestamp}.xlsx"
+    excel_path = os.path.join(save_directory, excel_filename)
+    # Create a new workbook
+    workbook = openpyxl.Workbook()
 
-        # Uncomment below to save the comment removed code file for debug
-        # with open(
-        #         os.path.join(os.path.split(file_path)[0],
-        #                      f'{os.path.splitext(os.path.split(file_path)[1])[0]}_cleaned_code.txt'), 'w') as fp:
-        #     fp.write(file_content)
+    # Define the fields and their additional properties
+    fields = {
+        "decision_node_constructs": ["file_name", "name", "start_line_number", "end_line_number"],
+        "loop_entity": ["file_name", "name", "start_line_number", "end_line_number"],
+        "db_calls": ["file_name", "function_name", "start_line_number", "end_line_number", "operation_type", "aliases",
+                     "table_names", "filter_conditions"],
+        "database_entities": ["name", "file_name", "start_line_number", "end_line_number"],
+        "calculation": ["file_name", "name", "start_line_number", "end_line_number", "snippet", "operands", "variable"],
+        "callees": [
+            "callee_file_name", "caller_function", "snippet", "start_line_number", "end_line_number",
+            "callee_function", "condition", "conditional_hierarchy", "is_conditional", "parameters"
+        ],
+        "service_calls": [
+            "file_name", "name", "start_line_number", "end_line_number", "snippet", "target", "parameters"
+        ],
+        "transaction_commits": ["file_name", "name", "start_line_number", "end_line_number", "snippet"],
+        "transaction_rollbacks": ["file_name", "name", "start_line_number", "end_line_number", "snippet"]
+    }
 
-        input_stream = InputStream(comments_removed_code)
+    # Write each field's data to separate tabs
+    for field_name, properties in fields.items():
+        sheet = workbook.create_sheet(title=field_name)
+        sheet.append(properties)  # Write header row
 
-        lexer = TSqlLexer(input_stream)
-        stream = CommonTokenStream(lexer)
-        # parser = TSqlParser(stream)
+        for function_snippet in output.function_snippets:
+            field_objects = getattr(function_snippet, field_name, [])
+            for obj in field_objects:
+                row = []
+                for prop in properties:
+                    # Explicit handling for a property
+                    if prop == 'conditional_hierarchy':
+                        row.append(json.dumps(getattr(obj, prop, {}), indent=4))
+                    else:
+                        row.append(str(getattr(obj, prop, '')))
+                sheet.append(row)
 
-        # Apply custom error strategy and listener
-        # parser._errHandler = CustomErrorStrategy()
-        # error_listener = CustomErrorListener()
-        # parser.removeErrorListeners()
-        # parser.addErrorListener(error_listener)
+    # Create a summary sheet for counts
+    summary_sheet = workbook.create_sheet(title="Summary")
+    summary_headers = [
+        "file_name", "function_name", "start_line_number", "end_line_number",
+        "decision_node_constructs_count", "loop_entity_count", "db_calls_count",
+        "calculation_count", "callees_count"
+    ]
+    summary_sheet.append(summary_headers)
 
-        print("Starting parsing...")  # Debug statement
-        # tree = parser.tsql_file()  # Adjust this according to your grammar's start rule
-        tree = sa_tsql._cpp_parse(input_stream, "tsql_file")
+    for function_snippet in output.function_snippets:
+        file_name = getattr(function_snippet, "file_name", None)
+        function_name = getattr(function_snippet, "function_name", None)
+        start_line_number = getattr(function_snippet, "start_line_number", None)
+        end_line_number = getattr(function_snippet, "end_line_number", None)
 
-        visitor = CustomTSqlParser(
-            projectMetadata=cc_metadata, filePath=actual, file_content=file_content,
-            input_stream=input_stream, token_stream=stream
-        )
-
-        print('Visiting tree...')
-
-        visitor.visit(tree)
-
-        # Access collected errors if needed
-        # errors = error_listener.errors
-        # print("Collected Errors:", errors)
-
-        # get the content of the main program by skipping the comment tokens
-        tokens = stream.getTokens(0, stream.index)
-        # main_program = "".join(t.text for t in tokens if t.type not in visitor.comment_tokens)
-        # raw_comments = "\n".join(t.text for t in tokens if t.type in visitor.comment_tokens)
-
-        # removes subsections and makes this as a main function
-        # main_program_without_subroutines = TSqlCodeParser.remove_subsections(
-        #     file_content='', subsections=visitor.function_snippets
-        # )
-        #
-        # start_line_number = 0
-        # end_line_number = len(main_program_without_subroutines.splitlines())
-        #
-        # # now we have the main program which (entire program - all functions blocks). this is residual snippet
-        # main_function_snippet = FunctionSnippetSchema(
-        #     file_path=actual,
-        #     file_name=filename,
-        #     function_name=filename,
-        #     class_name=filename,
-        #     snippet=str(main_program_without_subroutines),
-        #     start_line_number=start_line_number,
-        #     end_line_number=end_line_number,
-        #     callees=[],
-        #     annotations=[],
-        #     return_type="NA",
-        #     decision_node_constructs=visitor.main_program_decision_nodes,
-        #     db_calls=[],
-        #     service_calls=[],
-        #     calculation=[],
-        #     execution_order=visitor.execution_order + 1
-        # )
-        #
-        # # visitors is already maintaining a list of callees, service calls which are not part of any functions,
-        # # so get them, and attach them to residual snippet
-        # main_function_snippet.callees = visitor.main_program_callees
-        # main_function_snippet.service_calls = visitor.main_program_service_calls
-        # main_function_snippet.db_calls = visitor.main_program_dbcalls
-        # main_function_snippet.inputs = visitor.main_program_input_entities
-        # main_function_snippet.calculation = visitor.main_program_calculations
-        # main_function_snippet.decision_node_constructs = visitor.main_program_decision_nodes
-        # main_function_snippet.transaction_commits = visitor.main_program_transaction_commits
-        # main_function_snippet.transaction_rollbacks = visitor.main_program_transaction_rollbacks
-        # main_function_snippet.io_calls = visitor.main_program_io_calls
-        # main_function_snippet.loop_entity = visitor.main_program_loop_entities
-        # main_function_snippet.database_entities = visitor.main_program_database_entities
-        # main_function_snippet.variables = visitor.cve.extract_constants_variables(main_program_without_subroutines,
-        #                                                                           actual)
-        # main_function_snippet.raw_comments = raw_comments
-
-        # add this residual snippet to visitors snippets list
-        # visitor.function_snippets.append(main_function_snippet)
-
-        # Add Raw Comments and Imports to each function snippet by iterating all the function snippets
-        for snippet in visitor.function_snippets:
-            snippet.imports = visitor.imports
-            snippet.raw_comments = raw_comments
-
-        function_snippets = visitor.function_snippets
-        comments = raw_comments.splitlines()
-        entity_metadata = visitor.entity_metadata
-        entities = visitor.entities
-        aliases = visitor.aliases
-
-        # Update the results to code_context
-        code_context = CodeContext(
-            function_snippets=function_snippets,
-            comments=comments,
-            entity_metadata=entity_metadata,
-            entities=entities,
-            aliases=aliases,
-            input_interfaces=input_interfaces,
-            miscellaneous=miscellaneous
-        )
-
-        return code_context
-    
-    def parse_view_file(self, content):
-        content = content.replace("ï»¿", "")
-
-        # Remove comments
-        content = re.sub(r'/\*.*?\*/', '', content, flags=re.DOTALL)
-        content = re.sub(r'--.*', '', content)
-
-        # Extract view name
-        view_name_match = re.search(r'CREATE\s+VIEW\s+(?:\[[^\]]+\]\.)?(?:dbo\.)?\[?([^\s\[\]]+)\]?', content, re.IGNORECASE)
-        if view_name_match is None:
-            return None, None, None, None
-        view_name = view_name_match.group(1)
-
-        # Extract fields between SELECT and FROM (simplified)
-        select_from_match = re.search(r"(?s)(?<=SELECT\s)(.*?)(?=\s+FROM\b)", content, re.IGNORECASE | re.DOTALL)
-        select_from_match1 = re.search(r"(?s)(?<=SELECT\s)(.*?)(?=\s+FROM\b)", content)
-        fields_str=""
-        fields = set()
-        if select_from_match:
-            fields_str = select_from_match.group(1)
-            fields.update(self.get_view_fields(fields_str))
-            # Split by commas not inside parentheses, quotes, or CASE ... END
-        if select_from_match1:
-            fields_str = select_from_match1.group(1)
-            fields.update(self.get_view_fields(fields_str))
-
-        # Extract tables from FROM and JOIN clauses
-        tables = set()
-        # Match table names after FROM or JOIN
-        table_pattern = re.compile(r'(?:FROM|JOIN)\s+([^\s,]+)', re.IGNORECASE)
-        for match in table_pattern.finditer(content):
-            table = match.group(1)
-            # Clean aliases and brackets
-            table = re.split(r'\s+AS\s+|\s+', table, flags=re.IGNORECASE)[0]
-            table_clean = table.replace('[', '').replace(']', '')
-            # Skip if it's a subquery or variable
-            table_name = table_clean.split('.')[-1]
-            if not table_name.startswith('$'):
-                tables.add(table_name)  # Get table name after schema.
-       
-        return  view_name,list(fields),list(tables),fields_str
-    def get_view_fields(self,fields_str):
-        fields = set()
-        sql_reserved_keywords = [
-            "SELECT", "FROM", "WHERE", "INSERT", "UPDATE", "DELETE", "JOIN", "INNER", "LEFT", "RIGHT", "FULL",
-            "GROUP", "ORDER", "BY", "HAVING", "DISTINCT", "AS", "AND", "OR", "NOT", "NULL", "IS", "IN", "BETWEEN",
-            "LIKE", "CREATE", "DROP", "ALTER", "TABLE", "DATABASE", "INDEX", "VIEW", "TRIGGER", "PRIMARY", "KEY",
-            "FOREIGN", "CONSTRAINT", "DEFAULT", "CHECK", "EXISTS", "UNION", "ALL", "ANY", "CASE", "WHEN", "THEN",
-            "ELSE", "END", "LIMIT", "OFFSET", "VALUES", "SET", "TOP", "ASC", "DESC", "TRANSACTION", "COMMIT",
-            "ROLLBACK", "GRANT", "REVOKE", "WITH", "NOLOCK", "ON", "OUTER", "CROSS", "NATURAL", "USING", "INNER JOIN",
+        counts = [
+            len(getattr(function_snippet, "decision_node_constructs", [])),
+            len(getattr(function_snippet, "loop_entity", [])),
+            len(getattr(function_snippet, "db_calls", [])),
+            len(getattr(function_snippet, "calculation", [])),
+            len(getattr(function_snippet, "callees", []))
         ]
-        raw_fields = self.split_fields(fields_str)
-        for f in raw_fields:
-                # Extract field name: if AS alias, take alias, else the expression cleaned
-                # Use regex to find alias after AS (case insensitive)
-            alias_matches = re.findall(r'AS\s+([\w_]+)', f, re.IGNORECASE)
-                
-            if alias_matches:
-                    # Handle multiple aliases separated by commas (e.g., "AS Chng, HS_Updt_Dt AS ChngDt, REPLACE(...) AS ChngBy")
-                    # Split by comma and take last alias
-                last_alias = alias_matches[-1].strip().replace('[', '').replace(']', '')
-                    # Fix for known aliases like Chng, ChngDt, ChngBy
-                if last_alias.lower() == 'changed':
-                    last_alias = 'Chng'
-                elif last_alias.lower() == 'chngdt':
-                    last_alias = 'ChngDt'
-                elif last_alias.lower() == 'chngby':
-                    last_alias = 'ChngBy'
-                field_name = last_alias
-            else:
-                    # Clean brackets and take last part if dotted
-                field_name = f.replace('[', '').replace(']', '').split('.')[-1].strip()
-            for sql_key in sql_reserved_keywords:
-                if sql_key+" " in field_name.upper() or " "+sql_key in field_name.upper():
-                    field_name = re.sub(sql_key, "", field_name, flags=re.IGNORECASE)  # replace
-            fields.add(field_name.strip())
-        return fields
-        
-    def split_fields(self,s):
-        fields_list = []
-        current = ''
-        paren_count = 0
-        case_count = 0
-        in_quote = False
-        i = 0
-        while i < len(s):
-            char = s[i]
-            if char == "'":
-                in_quote = not in_quote
-                current += char
-            elif char == '(' and not in_quote:
-                paren_count += 1
-                current += char
-            elif char == ')' and not in_quote:
-                paren_count -= 1
-                current += char
-            elif s[i:i+4].upper() == 'CASE' and not in_quote:
-                case_count += 1
-                current += char
-            elif s[i:i+3].upper() == 'END' and case_count > 0 and not in_quote:
-                case_count -= 1
-                current += char
-            elif char == ',' and paren_count == 0 and case_count == 0 and not in_quote:
-                fields_list.append(current.strip())
-                current = ''
-            else:
-                current += char
-            i += 1
-        if current.strip():
-            fields_list.append(current.strip())
-        return fields_list
-  
 
-    def delete_entities_if_found(self,name, project_id, run_id):
-        DELETE_QUERY = """
-                    MATCH (e:DatabaseEntity)
-                    WHERE toLower(e.name) = toLower($name) 
-                    AND e.project_id = $project_id 
-                    AND e.run_id = $run_id
-                    OPTIONAL MATCH (e)-[:HAS_FIELD]->(f:DatabaseField)
-                    DETACH DELETE e, f
-                    """
+        summary_row = [file_name, function_name, start_line_number, end_line_number] + counts
+        summary_sheet.append(summary_row)
 
-        # DELETE_QUERY = """
-        #     MATCH (e:DatabaseEntity {name: $name, project_id: $project_id, run_id: $run_id})
-        #     OPTIONAL MATCH (e)-[:HAS_FIELD]->(f:DatabaseField)
-        #     DETACH DELETE e, f
-        #     """
-        db.cypher_query(DELETE_QUERY,
-        {'name': name, 'project_id': project_id, 'run_id': run_id})
-    
-    def create_node_database_entity(self, table_name, field_list, fields, project_id, run_id, file_path, snippet,db_tech,source_tables=[],type="TABLE"):
-        self.delete_entities_if_found(table_name,project_id,run_id)
-        query = """
-            CREATE (d:DatabaseEntity {key:$key,
-                analysis_status:$analysis_status,
-                name: $name,
-                business_aliases: $business_aliases,
-                project_id: $project_id,
-                run_id: $run_id,
-                file_name: $file_name,
-                file_path: $file_path,
-                schema_table: $schema_table,
-                snippet: $snippet,
-                structure_schema: $structure_schema,
-                fields: $fields,
-                type: $type,
-                sample_record: $sample_record,
-                complexity: $complexity,
-                volume_class: $volume_class,
-                main_role: $main_role,
-                relationship_density: $relationship_density,
-                db_type: $db_type,
-                description: $description,
-                db_tech: $db_tech,
-                hosted_at: $hosted_at,
-                records_type: $records_type,
-                category: $category,
-                source_tables: $source_tables
-                })
-                """
+    # Remove the default sheet created by openpyxl
+    if "Sheet" in workbook.sheetnames:
+        workbook.remove(workbook["Sheet"])
 
-        db.cypher_query(query, {'key': str(uuid.uuid4()),
-                                'analysis_status': "NOT_STARTED",
-                                'name': table_name,
-                                'business_aliases': [],
-                                'project_id': project_id,
-                                'run_id': run_id,
-                                'file_name': os.path.splitext(os.path.basename(file_path))[0],
-                                'file_path': file_path,
-                                'schema_table': table_name,
-                                'snippet': snippet,
-                                'structure_schema': fields,
-                                'fields': field_list,
-                                'type': type,
-                                'sample_record': "NA",
-                                'complexity': "NA",
-                                'volume_class': "NA",
-                                'main_role': "NA",
-                                'relationship_density': "NA",
-                                'db_type': "Relational",
-                                'description': "NA",
-                                'db_tech': db_tech,
-                                'hosted_at': "NA",
-                                'records_type': "NA",
-                                'category': "NA",
-                                "source_tables": source_tables})
-        for db_field in field_list:
-            self.generate_database_field(db_field, table_name, project_id, run_id,db_tech)
-            
-    def generate_database_field(self, db_field, table_name, project_id, run_id,db_tech):
-        DatabaseField(
-            key=str(uuid.uuid4()),
-            name=db_field,
-            table_name=table_name,
-            description="",
-            project_id=project_id,
-            run_id=run_id,
-            db_tech=db_tech
-        ).save()
+    # Save the workbook to the specified path
+    workbook.save(excel_path)
 
-    def create_has_field_relationships(self, project_id, run_id):
-        query = """
-        MATCH (de:DatabaseEntity {run_id: $run_id, project_id: $project_id})
-        MATCH (df:DatabaseField {run_id: $run_id, project_id: $project_id})
-        WHERE df.table_name = de.name
-        MERGE (de)-[:HAS_FIELD]->(df)
-        """
-        db.cypher_query(query, {'run_id': run_id, 'project_id': project_id})
-
-
-
-if __name__ == "__main__":
-    metadata = CodeComprehensionMetadata(
-        project_id=1,
-        technology="tsql",
-        repo_name="psm_0repo",
-        repo_url="",
-        branch="main",
-        entry_point_dir="tsql_source",
-        encoding_type="utf-8"
-    )
-    obj = TSqlCodeParser()
-    file_path = r'C:\Users\2000134437\Downloads\\\\\\Views\.sql'
-    output = obj.parse_codebase(1, 1, metadata, file_path=file_path) # P_QueueMgt_TripsQueue
-
-    save_output = False
-    if save_output:
-        write_function_snippets_to_excel_with_counts(
-            output, file_path,
-            r'C:\Users\2000134437\OneDrive - Hexaware Technologies\Work\Sheets\TSql\test_results'
-        )
-
-    # print('****************************')
-    # for fsnip in output.function_snippets:
-    #     print(f"Function Name: {fsnip.function_name} [{fsnip.start_line_number}:{fsnip.end_line_number}]")
-    #     print("\tFunction Imports:", fsnip.imports)
-    #     print("\tDecision Nodes:", len(fsnip.decision_node_constructs))
-    #     print("\tLoop Entities:", len(fsnip.loop_entity))
-    #     print("\tDB Calls:", len(fsnip.db_calls))
-    #     print("\tCalculations:", len(fsnip.calculation))
-    #     print("\tCallees:", len(fsnip.callees))
-    #     print("\tService Calls:", len(fsnip.service_calls))
-    #     print("\tTransaction Commits:", len(fsnip.transaction_commits))
-    #     print("\tTransaction Rollbacks:", len(fsnip.transaction_rollbacks))
-    #     print("\tIO Calls:", len(fsnip.io_calls))
-    #     print("\tInput Entity:", len(fsnip.inputs))
-    #     print('***************************')
-    # print("Comments:", len(output.comments))
-    # print("Entities:", len(output.entities))
-    # print("Aliases:", len(output.aliases))
-    # print("Entity Metadata:", len(output.entity_metadata))
-    # print("Input Interfaces:", len(output.input_interfaces))
-    # print("Miscellaneous:", len(output.miscellaneous))
-
-    print("end")
+# Example usage:
+# Assume `output` is a dictionary containing `function_snippets` list of objects
+# Assume `excel_path` is the path to save the Excel file
+# write_function_snippets_to_excel_with_counts(output, "/path/to/write/the/fields/function_snippets.xlsx")
