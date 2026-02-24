@@ -1,123 +1,92 @@
-using System;
-using System.Collections.Generic;
-using System.IO;
-using System.Linq;
-using System.Text.RegularExpressions;
-using Antlr4.Runtime;
-using Antlr4.Runtime.Tree;
-using ParserService.Entities.Schemas;
-using ParserService.Grammar.Parsers;
+import os
+import json
+import openpyxl
+from datetime import datetime
 
-namespace TsqlParserProject
-{
-    public class TSqlCodeParser
-    {
-        public static string RemoveSubsections(string fileContent, List<FunctionSnippetSchema> subsections)
-        {
-            foreach (var subsection in subsections)
-            {
-                var lineCount = subsection.Snippet
-                    .Split(new[] { "\r\n", "\r", "\n" }, StringSplitOptions.None)
-                    .Length;
 
-                fileContent = fileContent.Replace(
-                    subsection.Snippet,
-                    string.Concat(Enumerable.Repeat("\n", lineCount))
-                );
-            }
+def write_function_snippets_to_excel_with_counts(output, input_file_path, save_directory):
+    # Extract the base name of the input file (without extension)
+    base_filename = os.path.splitext(os.path.basename(input_file_path))[0]
 
-            return fileContent;
-        }
+    # Generate a timestamp for the filename
+    timestamp = datetime.now().strftime("%d%m%Y_%H%M%S")
 
-        public CodeContext ParseCodebase(
-            int runId,
-            int runFileId,
-            CodeComprehensionMetadata ccMetadata,
-            string filePath)
-        {
-            if (filePath.Contains(".DS_Store"))
-                return null;
+    # Construct the Excel file name
+    excel_filename = f"{base_filename}_Parser_Results_{timestamp}.xlsx"
+    excel_path = os.path.join(save_directory, excel_filename)
+    # Create a new workbook
+    workbook = openpyxl.Workbook()
 
-            var tsqlPreprocessor = new TSqlPreprocessor();
-
-            // Mirror Python relpath logic
-            string relPath = Path.GetRelativePath(Directory.GetCurrentDirectory(), filePath);
-            string actual = relPath.TrimStart('.', '\\');
-
-            string fileContent;
-
-            using (var sr = new StreamReader(filePath))
-            {
-                fileContent = sr.ReadToEnd();
-            }
-
-            fileContent = fileContent.Replace("ï»¿", "");
-            fileContent = fileContent.Replace("\r\n", "\n").Replace("\r", "\n");
-
-            // -------- PREPROCESSING (EXACT ORDER AS PYTHON) --------
-
-            fileContent = tsqlPreprocessor.RemoveUnwantedLines(fileContent);
-            string rawComments = tsqlPreprocessor.ExtractComments(fileContent);
-            string commentsRemovedCode = tsqlPreprocessor.RemoveComments(fileContent);
-            commentsRemovedCode = commentsRemovedCode.Replace("ï»¿", "");
-
-            // -------- ANTLR PIPELINE (MATCH PYTHON STYLE) --------
-
-            var inputStream = new AntlrInputStream(commentsRemovedCode);
-            var lexer = new TSqlLexer(inputStream);
-            var stream = new CommonTokenStream(lexer);
-
-            var parser = new TSqlParser(stream);
-
-            // Python: tree = sa_tsql._cpp_parse(input_stream, "tsql_file")
-            // Closest structural equivalent in C#
-            var tree = parser.tsql_file();
-
-            var visitor = new CustomTSqlParser(
-                ccMetadata,
-                actual,
-                fileContent,
-                inputStream,
-                stream
-            );
-
-            visitor.Visit(tree);
-
-            // -------- TOKEN RETRIEVAL (MATCH PYTHON) --------
-
-            var tokens = stream.GetTokens(0, stream.Index);
-
-            // -------- POST VISITOR PROCESSING --------
-
-            foreach (var snippet in visitor.function_snippets)
-            {
-                snippet.Imports = visitor.imports;
-                snippet.RawComments = rawComments;
-            }
-
-            // -------- MATCH PYTHON LIST EXTRACTION --------
-
-            var functionSnippets = visitor.function_snippets;
-            var comments = rawComments.Split('\n').ToList();
-            var entityMetadata = visitor.entity_metadata;
-            var entities = visitor.entities;
-            var aliases = visitor.aliases;
-
-            var inputInterfaces = new List<InputInterfaceSchema>();
-            var miscellaneous = new List<object>();
-
-            // -------- RETURN EXACT PYTHON STRUCTURE --------
-
-            return new CodeContext
-            {
-                FunctionSnippets = functionSnippets,
-                Comments = comments,
-                EntityMetadata = entityMetadata,
-                Entities = entities,
-                Aliases = aliases,
-                InputInterfaces = inputInterfaces,
-                Miscellaneous = miscellaneous
-            };
-        }
+    # Define the fields and their additional properties
+    fields = {
+        "decision_node_constructs": ["file_name", "name", "start_line_number", "end_line_number"],
+        "loop_entity": ["file_name", "name", "start_line_number", "end_line_number"],
+        "db_calls": ["file_name", "function_name", "start_line_number", "end_line_number", "operation_type", "aliases",
+                     "table_names", "filter_conditions"],
+        "database_entities": ["name", "file_name", "start_line_number", "end_line_number"],
+        "calculation": ["file_name", "name", "start_line_number", "end_line_number", "snippet", "operands", "variable"],
+        "callees": [
+            "callee_file_name", "caller_function", "snippet", "start_line_number", "end_line_number",
+            "callee_function", "condition", "conditional_hierarchy", "is_conditional", "parameters"
+        ],
+        "service_calls": [
+            "file_name", "name", "start_line_number", "end_line_number", "snippet", "target", "parameters"
+        ],
+        "transaction_commits": ["file_name", "name", "start_line_number", "end_line_number", "snippet"],
+        "transaction_rollbacks": ["file_name", "name", "start_line_number", "end_line_number", "snippet"]
     }
-}
+
+    # Write each field's data to separate tabs
+    for field_name, properties in fields.items():
+        sheet = workbook.create_sheet(title=field_name)
+        sheet.append(properties)  # Write header row
+
+        for function_snippet in output.function_snippets:
+            field_objects = getattr(function_snippet, field_name, [])
+            for obj in field_objects:
+                row = []
+                for prop in properties:
+                    # Explicit handling for a property
+                    if prop == 'conditional_hierarchy':
+                        row.append(json.dumps(getattr(obj, prop, {}), indent=4))
+                    else:
+                        row.append(str(getattr(obj, prop, '')))
+                sheet.append(row)
+
+    # Create a summary sheet for counts
+    summary_sheet = workbook.create_sheet(title="Summary")
+    summary_headers = [
+        "file_name", "function_name", "start_line_number", "end_line_number",
+        "decision_node_constructs_count", "loop_entity_count", "db_calls_count",
+        "calculation_count", "callees_count"
+    ]
+    summary_sheet.append(summary_headers)
+
+    for function_snippet in output.function_snippets:
+        file_name = getattr(function_snippet, "file_name", None)
+        function_name = getattr(function_snippet, "function_name", None)
+        start_line_number = getattr(function_snippet, "start_line_number", None)
+        end_line_number = getattr(function_snippet, "end_line_number", None)
+
+        counts = [
+            len(getattr(function_snippet, "decision_node_constructs", [])),
+            len(getattr(function_snippet, "loop_entity", [])),
+            len(getattr(function_snippet, "db_calls", [])),
+            len(getattr(function_snippet, "calculation", [])),
+            len(getattr(function_snippet, "callees", []))
+        ]
+
+        summary_row = [file_name, function_name, start_line_number, end_line_number] + counts
+        summary_sheet.append(summary_row)
+
+    # Remove the default sheet created by openpyxl
+    if "Sheet" in workbook.sheetnames:
+        workbook.remove(workbook["Sheet"])
+
+    # Save the workbook to the specified path
+    workbook.save(excel_path)
+
+# Example usage:
+# Assume `output` is a dictionary containing `function_snippets` list of objects
+# Assume `excel_path` is the path to save the Excel file
+# write_function_snippets_to_excel_with_counts(output, "/path/to/write/the/fields/function_snippets.xlsx")
