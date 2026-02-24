@@ -2,425 +2,159 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using System.Text.RegularExpressions;
-using System.Threading.Tasks;
-using Antlr4.Runtime;
-using Antlr4.Runtime.Tree;
-using ParserService.Entities.Models;
-using ParserService.Entities.Schemas;
+using Newtonsoft.Json;
 using ParserService.Entities.Entities;
-using ParserService.Grammar.Parsers;
-using ParserService.Grammar.Interfaces;
-using ParserService.Grammar.Services.Parsers;
+using ClosedXML.Excel;
 
 namespace TsqlParserProject
 {
-    [ParserTechnology("tsql")]
-    public class TSqlCodeParser : ICodeParser
+    public static class ParserUtils
     {
-        public static string RemoveSubsections(string fileContent, List<FunctionSnippetSchema> subsections)
+        public static void WriteFunctionSnippetsToExcelWithCounts(CodeContext output, string inputFilePath, string saveDirectory)
         {
-            foreach (var subsection in subsections)
+            // Extract the base name of the input file (without extension)
+            string baseFilename = Path.GetFileNameWithoutExtension(inputFilePath);
+
+            // Generate a timestamp for the filename
+            string timestamp = DateTime.Now.ToString("ddMMyyyy_HHmmss");
+
+            // Construct the Excel file name
+            string excelFilename = $"{baseFilename}_Parser_Results_{timestamp}.xlsx";
+            string excelPath = Path.Combine(saveDirectory, excelFilename);
+
+            // Create a new workbook
+            var workbook = new XLWorkbook();
+
+            // Define the fields and their additional properties
+            var fields = new Dictionary<string, List<string>>
             {
-                int lineCount = subsection.Snippet.Split(new[] { "\r\n", "\r", "\n" }, StringSplitOptions.None).Length;
-                fileContent = fileContent.Replace(subsection.Snippet, new string('\n', lineCount));
-            }
-            return fileContent;
-        }
+                { "DecisionNodeConstructs", new List<string> { "FileName", "Name", "StartLineNumber", "EndLineNumber" } },
+                { "LoopEntity", new List<string> { "FileName", "Name", "StartLineNumber", "EndLineNumber" } },
+                { "DbCalls", new List<string> { "FileName", "FunctionName", "StartLineNumber", "EndLineNumber", "OperationType", "Aliases", "TableNames", "FilterConditions" } },
+                { "DatabaseEntities", new List<string> { "Name", "FileName", "StartLineNumber", "EndLineNumber" } },
+                { "Calculation", new List<string> { "FileName", "Name", "StartLineNumber", "EndLineNumber", "Snippet", "Operands", "Variable" } },
+                { "Callees", new List<string> { "CalleeFileName", "CallerFunction", "Snippet", "StartLineNumber", "EndLineNumber", "CalleeFunction", "Condition", "ConditionalHierarchy", "IsConditional", "Parameters" } },
+                { "ServiceCalls", new List<string> { "FileName", "Name", "StartLineNumber", "EndLineNumber", "Snippet", "Target", "Parameters" } },
+                { "TransactionCommits", new List<string> { "FileName", "Name", "StartLineNumber", "EndLineNumber", "Snippet" } },
+                { "TransactionRollbacks", new List<string> { "FileName", "Name", "StartLineNumber", "EndLineNumber", "Snippet" } }
+            };
 
-        public CodeContext ParseCodebase(int runId, int runFileId, CodeComprehensionMetadata ccMetadata, string filePath)
-        {
-            if (filePath.Contains(".DS_Store")) return null;
-
-            var tsqlPreprocessor = new TSqlPreprocessor();
-            string relPath = filePath; 
-            string actual = relPath;
-
-            string fileContent = "";
-            using (var sr = new StreamReader(filePath))
+            // Write each field's data to separate tabs
+            foreach (var fieldEntry in fields)
             {
-                fileContent = sr.ReadToEnd();
-                fileContent = fileContent.Replace("ï»¿", "");
-                fileContent = fileContent.Replace("\r\n", "\n").Replace("\r", "\n");
+                string fieldName = fieldEntry.Key;
+                var properties = fieldEntry.Value;
 
-                var match = Regex.Match(fileContent, @"CREATE TABLE \[dbo\]\.\[(\w+)\] \((.*?)\);", RegexOptions.Singleline);
-                if (match.Success)
+                var sheet = workbook.Worksheets.Add(fieldName);
+
+                // Write header row
+                for (int i = 0; i < properties.Count; i++)
                 {
-                    string snippet = match.Value;
-                    string tableName = match.Groups[1].Value;
-                    string fieldsBlock = match.Groups[2].Value;
-                    var fieldList = new List<string>();
-
-                    var lines = fieldsBlock.Split('\n');
-                    foreach (var line in lines)
-                    {
-                        string trimmed = line.Trim();
-                        if (!string.IsNullOrEmpty(trimmed) && !trimmed.StartsWith("--") && !trimmed.StartsWith("GO"))
-                        {
-                            var matchField = Regex.Match(trimmed, @"\[(\w+)\]\s+([^,\s]+(?:\s*\([^)]*\))?)");
-                            if (matchField.Success) fieldList.Add(matchField.Groups[1].Value);
-                        }
-                    }
-
-                    if (fieldList.Count > 0)
-                    {
-                        CreateNodeDatabaseEntity(tableName, fieldList, fieldsBlock.TrimStart('\n'), ccMetadata.ProjectId.ToString(), runId, filePath, snippet, ccMetadata.Language);
-                        CreateHasFieldRelationships(ccMetadata.ProjectId.ToString(), runId);
-                        return new CodeContext();
-                    }
+                    sheet.Cell(1, i + 1).Value = properties[i];
                 }
-                else
-                {
-                    match = Regex.Match(fileContent, @"CREATE TABLE \[dbo\]\.\[([^\]]+)\]");
-                    if (match.Success)
-                    {
-                        string snippet = fileContent;
-                        string tableName = match.Groups[1].Value;
-                        var fieldList = new List<string>();
 
-                        int start = fileContent.IndexOf('(', fileContent.IndexOf("CREATE TABLE"));
-                        if (start != -1)
+                int rowIndex = 2;
+                foreach (var functionSnippet in output.FunctionSnippets)
+                {
+                    var fieldObjects = GetPropertyValue(functionSnippet, fieldName) as System.Collections.IEnumerable;
+                    if (fieldObjects != null)
+                    {
+                        foreach (var obj in fieldObjects)
                         {
-                            int end = -1;
-                            int constraintPos = fileContent.IndexOf("CONSTRAINT", start);
-                            if (constraintPos != -1) end = constraintPos;
-                            else
+                            for (int colIndex = 0; colIndex < properties.Count; colIndex++)
                             {
-                                int count = 1;
-                                int pos = start;
-                                while (pos < fileContent.Length - 1 && count > 0)
+                                string prop = properties[colIndex];
+                                var value = GetPropertyValue(obj, prop);
+
+                                // Explicit handling for ConditionalHierarchy
+                                if (prop == "ConditionalHierarchy" && value != null)
                                 {
-                                    pos++;
-                                    if (fileContent[pos] == '(') count++;
-                                    else if (fileContent[pos] == ')') count--;
+                                    sheet.Cell(rowIndex, colIndex + 1).Value = JsonConvert.SerializeObject(value, Formatting.Indented);
                                 }
-                                end = pos;
-                            }
-                            string fieldsBlock = fileContent.Substring(start + 1, end - start - 1);
-                            foreach (var line in fieldsBlock.Split('\n'))
-                            {
-                                string trimmed = line.Trim();
-                                if (trimmed.StartsWith("[") && trimmed.Contains("]"))
+                                else
                                 {
-                                    var fieldMatch = Regex.Match(trimmed, @"\[([^\]]+)\]");
-                                    if (fieldMatch.Success) fieldList.Add(fieldMatch.Groups[1].Value);
+                                    sheet.Cell(rowIndex, colIndex + 1).Value = value?.ToString() ?? "";
                                 }
                             }
-                            CreateNodeDatabaseEntity(tableName, fieldList, fieldsBlock.Trim('\n'), ccMetadata.ProjectId.ToString(), runId, filePath, snippet, ccMetadata.Language);
-                            CreateHasFieldRelationships(ccMetadata.ProjectId.ToString(), runId);
-                            return new CodeContext();
+                            rowIndex++;
                         }
                     }
                 }
-
-                var (viewName, fields, tables, viewFieldsBlock) = ParseViewFile(fileContent);
-                if (!string.IsNullOrEmpty(viewName))
-                {
-                    CreateNodeDatabaseEntity(viewName, fields, viewFieldsBlock.Trim('\n'), ccMetadata.ProjectId.ToString(), runId, filePath, fileContent, ccMetadata.Language, tables, "VIEW");
-                    CreateHasFieldRelationships(ccMetadata.ProjectId.ToString(), runId);
-                    return new CodeContext();
-                }
             }
 
-            string filename = Path.GetFileName(filePath);
-
-            fileContent = tsqlPreprocessor.RemoveUnwantedLines(fileContent);
-            string rawComments = tsqlPreprocessor.ExtractComments(fileContent);
-            string commentsRemovedCode = tsqlPreprocessor.RemoveComments(fileContent);
-            commentsRemovedCode = commentsRemovedCode.Replace("ï»¿", "");
-
-            var inputStream = new AntlrInputStream(commentsRemovedCode);
-            var lexer = new TSqlLexer(inputStream);
-            var stream = new CommonTokenStream(lexer);
-
-            var parser = new TSqlParser(stream);
-            var tree = parser.tsql_file();
-
-            var visitor = new CustomTSqlParser(ccMetadata, actual, fileContent, inputStream, stream);
-            visitor.Visit(tree);
-
-            foreach (var snippet in visitor.function_snippets)
+            // Create a summary sheet for counts
+            var summarySheet = workbook.Worksheets.Add("Summary");
+            var summaryHeaders = new List<string>
             {
-                snippet.Imports = visitor.imports;
-                snippet.RawComments = rawComments;
-            }
-
-            return new CodeContext
-            {
-                FunctionSnippets = visitor.function_snippets,
-                Callees = visitor.main_program_callees,
-                ServiceCalls = visitor.main_program_service_calls,
-                DbCalls = visitor.main_program_dbcalls,
-                Calculations = visitor.main_program_calculations,
-                DecisionNodes = visitor.main_program_decision_nodes,
-                TransactionCommits = visitor.main_program_transaction_commits,
-                TransactionRollbacks = visitor.main_program_transaction_rollbacks,
-                LoopEntities = visitor.main_program_loop_entities,
-                DatabaseEntities = visitor.main_program_database_entities,
-                DatabaseFields = visitor.main_program_database_fields
+                "FileName", "FunctionName", "StartLineNumber", "EndLineNumber",
+                "DecisionNodeConstructsCount", "LoopEntityCount", "DbCallsCount",
+                "CalculationCount", "CalleesCount"
             };
-        }
 
-        public (string, List<string>, List<string>, string) ParseViewFile(string content)
-        {
-            content = content.Replace("ï»¿", "");
-            content = Regex.Replace(content, @"/\*.*?\*/", "", RegexOptions.Singleline);
-            content = Regex.Replace(content, @"--.*", "");
-
-            var viewNameMatch = Regex.Match(content, @"CREATE\s+VIEW\s+(?:\[[^\]]+\]\.)?(?:dbo\.)?\[?([^\s\[\]]+)\]?", RegexOptions.IgnoreCase);
-            if (!viewNameMatch.Success) return (null, null, null, null);
-            string viewName = viewNameMatch.Groups[1].Value;
-
-            var selectFromMatch = Regex.Match(content, @"(?s)(?<=SELECT\s)(.*?)(?=\s+FROM\b)", RegexOptions.IgnoreCase);
-            var selectFromMatch1 = Regex.Match(content, @"(?s)(?<=SELECT\s)(.*?)(?=\s+FROM\b)");
-            string fieldsStr = "";
-            var fields = new HashSet<string>();
-            if (selectFromMatch.Success)
+            // Write summary headers
+            for (int i = 0; i < summaryHeaders.Count; i++)
             {
-                fieldsStr = selectFromMatch.Groups[1].Value;
-                foreach (var f in GetViewFields(fieldsStr)) fields.Add(f);
-            }
-            if (selectFromMatch1.Success)
-            {
-                fieldsStr = selectFromMatch1.Groups[1].Value;
-                foreach (var f in GetViewFields(fieldsStr)) fields.Add(f);
+                summarySheet.Cell(1, i + 1).Value = summaryHeaders[i];
             }
 
-            var tables = new HashSet<string>();
-            var tablePattern = new Regex(@"(?:FROM|JOIN)\s+([^\s,]+)", RegexOptions.IgnoreCase);
-            foreach (Match match in tablePattern.Matches(content))
+            int summaryRowIndex = 2;
+            foreach (var functionSnippet in output.FunctionSnippets)
             {
-                string table = match.Groups[1].Value;
-                table = Regex.Split(table, @"\s+AS\s+|\s+", RegexOptions.IgnoreCase)[0];
-                string tableClean = table.Replace("[", "").Replace("]", "");
-                string tableName = tableClean.Split('.').Last();
-                if (!tableName.StartsWith("$")) tables.Add(tableName);
+                string fileName = GetPropertyValue(functionSnippet, "FileName")?.ToString();
+                string functionName = GetPropertyValue(functionSnippet, "FunctionName")?.ToString();
+                var startLineNumber = GetPropertyValue(functionSnippet, "StartLineNumber");
+                var endLineNumber = GetPropertyValue(functionSnippet, "EndLineNumber");
+
+                var decisionNodes = GetPropertyValue(functionSnippet, "DecisionNodeConstructs") as System.Collections.IEnumerable;
+                var loopEntities = GetPropertyValue(functionSnippet, "LoopEntity") as System.Collections.IEnumerable;
+                var dbCalls = GetPropertyValue(functionSnippet, "DbCalls") as System.Collections.IEnumerable;
+                var calculations = GetPropertyValue(functionSnippet, "Calculation") as System.Collections.IEnumerable;
+                var callees = GetPropertyValue(functionSnippet, "Callees") as System.Collections.IEnumerable;
+
+                int decisionCount = decisionNodes?.Cast<object>().Count() ?? 0;
+                int loopCount = loopEntities?.Cast<object>().Count() ?? 0;
+                int dbCallCount = dbCalls?.Cast<object>().Count() ?? 0;
+                int calcCount = calculations?.Cast<object>().Count() ?? 0;
+                int calleeCount = callees?.Cast<object>().Count() ?? 0;
+
+                summarySheet.Cell(summaryRowIndex, 1).Value = fileName;
+                summarySheet.Cell(summaryRowIndex, 2).Value = functionName;
+                summarySheet.Cell(summaryRowIndex, 3).Value = startLineNumber?.ToString() ?? "";
+                summarySheet.Cell(summaryRowIndex, 4).Value = endLineNumber?.ToString() ?? "";
+                summarySheet.Cell(summaryRowIndex, 5).Value = decisionCount;
+                summarySheet.Cell(summaryRowIndex, 6).Value = loopCount;
+                summarySheet.Cell(summaryRowIndex, 7).Value = dbCallCount;
+                summarySheet.Cell(summaryRowIndex, 8).Value = calcCount;
+                summarySheet.Cell(summaryRowIndex, 9).Value = calleeCount;
+
+                summaryRowIndex++;
             }
 
-            return (viewName, fields.ToList(), tables.ToList(), fieldsStr);
-        }
-
-        public HashSet<string> GetViewFields(string fieldsStr)
-        {
-            var fields = new HashSet<string>();
-            string[] sqlReservedKeywords = { "SELECT", "FROM", "WHERE", "INSERT", "UPDATE", "DELETE", "JOIN", "INNER", "LEFT", "RIGHT", "FULL", "GROUP", "ORDER", "BY", "HAVING", "DISTINCT", "AS", "AND", "OR", "NOT", "NULL", "IS", "IN", "BETWEEN", "LIKE", "CREATE", "DROP", "ALTER", "TABLE", "DATABASE", "INDEX", "VIEW", "TRIGGER", "PRIMARY", "KEY", "FOREIGN", "CONSTRAINT", "DEFAULT", "CHECK", "EXISTS", "UNION", "ALL", "ANY", "CASE", "WHEN", "THEN", "ELSE", "END", "LIMIT", "OFFSET", "VALUES", "SET", "TOP", "ASC", "DESC", "TRANSACTION", "COMMIT", "ROLLBACK", "GRANT", "REVOKE", "WITH", "NOLOCK", "ON", "OUTER", "CROSS", "NATURAL", "USING", "INNER JOIN" };
-            
-            var rawFields = SplitFields(fieldsStr);
-            foreach (var f in rawFields)
+            // Remove the default sheet created by ClosedXML (if it exists and is empty)
+            var sheet1 = workbook.Worksheet("Sheet1");
+            if (sheet1 != null)
             {
-                var aliasMatches = Regex.Matches(f, @"AS\s+([\w_]+)", RegexOptions.IgnoreCase);
-                string fieldName = "";
-                if (aliasMatches.Count > 0)
-                {
-                    fieldName = aliasMatches[aliasMatches.Count - 1].Groups[1].Value.Trim().Replace("[", "").Replace("]", "");
-                    if (fieldName.ToLower() == "changed") fieldName = "Chng";
-                    else if (fieldName.ToLower() == "chngdt") fieldName = "ChngDt";
-                    else if (fieldName.ToLower() == "chngby") fieldName = "ChngBy";
-                }
-                else
-                {
-                    fieldName = f.Replace("[", "").Replace("]", "").Split('.').Last().Trim();
-                }
-
-                foreach (var sqlKey in sqlReservedKeywords)
-                {
-                    if (fieldName.ToUpper().Contains(sqlKey + " ") || fieldName.ToUpper().Contains(" " + sqlKey))
-                    {
-                        fieldName = Regex.Replace(fieldName, sqlKey, "", RegexOptions.IgnoreCase);
-                    }
-                }
-                fields.Add(fieldName.Trim());
+                sheet1.Delete();
             }
-            return fields;
+
+            // Save the workbook to the specified path
+            workbook.SaveAs(excelPath);
         }
 
-        public List<string> SplitFields(string s)
+        private static object GetPropertyValue(object obj, string propertyName)
         {
-            var fieldsList = new List<string>();
-            string current = "";
-            int parenCount = 0;
-            int caseCount = 0;
-            bool inQuote = false;
-            for (int i = 0; i < s.Length; i++)
+            if (obj == null) return null;
+            var property = obj.GetType().GetProperty(propertyName);
+            if (property != null)
             {
-                char c = s[i];
-                if (c == '\'')
-                {
-                    inQuote = !inQuote;
-                    current += c;
-                }
-                else if (c == '(' && !inQuote)
-                {
-                    parenCount++;
-                    current += c;
-                }
-                else if (c == ')' && !inQuote)
-                {
-                    parenCount--;
-                    current += c;
-                }
-                else if (i + 4 <= s.Length && s.Substring(i, 4).ToUpper() == "CASE" && !inQuote)
-                {
-                    caseCount++;
-                    current += c;
-                }
-                else if (i + 3 <= s.Length && s.Substring(i, 3).ToUpper() == "END" && caseCount > 0 && !inQuote)
-                {
-                    caseCount--;
-                    current += c;
-                }
-                else if (c == ',' && parenCount == 0 && caseCount == 0 && !inQuote)
-                {
-                    fieldsList.Add(current.Trim());
-                    current = "";
-                }
-                else
-                {
-                    current += c;
-                }
+                return property.GetValue(obj);
             }
-            if (!string.IsNullOrWhiteSpace(current)) fieldsList.Add(current.Trim());
-            return fieldsList;
-        }
-
-        public void DeleteEntitiesIfFound(string name, string projectId, int runId)
-        {
-            string DELETE_QUERY = @"
-                MATCH (e:DatabaseEntity)
-                WHERE toLower(e.name) = toLower($name) 
-                AND e.project_id = $project_id 
-                AND e.run_id = $run_id
-                OPTIONAL MATCH (e)-[:HAS_FIELD]->(f:DatabaseField)
-                DETACH DELETE e, f
-            ";
-            
-            var parameters = new Dictionary<string, object>
+            var field = obj.GetType().GetField(propertyName);
+            if (field != null)
             {
-                { "name", name },
-                { "project_id", projectId },
-                { "run_id", runId }
-            };
-            
-            // Note: Actual database execution to be implemented with Neo4j driver
-            // db.cypher_query(DELETE_QUERY, parameters);
-        }
-
-        public void CreateNodeDatabaseEntity(string tableName, List<string> fieldList, string fields, string projectId, int runId, string filePath, string snippet, string dbTech, List<string> sourceTables = null, string type = "TABLE")
-        {
-            DeleteEntitiesIfFound(tableName, projectId, runId);
-            
-            string query = @"
-                CREATE (d:DatabaseEntity {
-                    key: $key,
-                    analysis_status: $analysis_status,
-                    name: $name,
-                    business_aliases: $business_aliases,
-                    project_id: $project_id,
-                    run_id: $run_id,
-                    file_name: $file_name,
-                    file_path: $file_path,
-                    schema_table: $schema_table,
-                    snippet: $snippet,
-                    structure_schema: $structure_schema,
-                    fields: $fields,
-                    type: $type,
-                    sample_record: $sample_record,
-                    complexity: $complexity,
-                    volume_class: $volume_class,
-                    main_role: $main_role,
-                    relationship_density: $relationship_density,
-                    db_type: $db_type,
-                    description: $description,
-                    db_tech: $db_tech,
-                    hosted_at: $hosted_at,
-                    records_type: $records_type,
-                    category: $category,
-                    source_tables: $source_tables
-                })
-            ";
-            
-            var parameters = new Dictionary<string, object>
-            {
-                { "key", Guid.NewGuid().ToString() },
-                { "analysis_status", "NOT_STARTED" },
-                { "name", tableName },
-                { "business_aliases", new List<string>() },
-                { "project_id", projectId },
-                { "run_id", runId },
-                { "file_name", Path.GetFileNameWithoutExtension(filePath) },
-                { "file_path", filePath },
-                { "schema_table", tableName },
-                { "snippet", snippet },
-                { "structure_schema", fields },
-                { "fields", fieldList },
-                { "type", type },
-                { "sample_record", "NA" },
-                { "complexity", "NA" },
-                { "volume_class", "NA" },
-                { "main_role", "NA" },
-                { "relationship_density", "NA" },
-                { "db_type", "Relational" },
-                { "description", "NA" },
-                { "db_tech", dbTech },
-                { "hosted_at", "NA" },
-                { "records_type", "NA" },
-                { "category", "NA" },
-                { "source_tables", sourceTables ?? new List<string>() }
-            };
-            
-            // Note: Actual database execution to be implemented with Neo4j driver
-            // db.cypher_query(query, parameters);
-            
-            foreach (var dbField in fieldList)
-            {
-                GenerateDatabaseField(dbField, tableName, projectId, runId, dbTech);
+                return field.GetValue(obj);
             }
-        }
-
-        public void GenerateDatabaseField(string dbField, string tableName, string projectId, int runId, string dbTech)
-        {
-            var field = new DatabaseFieldSchema
-            {
-                Name = dbField,
-                TableName = tableName,
-                Description = "",
-                ProjectId = int.Parse(projectId),
-                RunId = runId,
-                DbTech = dbTech
-            };
-            
-            // Note: Actual database save to be implemented
-            // field.save();
-        }
-
-        public void CreateHasFieldRelationships(string projectId, int runId)
-        {
-            string query = @"
-                MATCH (de:DatabaseEntity {run_id: $run_id, project_id: $project_id})
-                MATCH (df:DatabaseField {run_id: $run_id, project_id: $project_id})
-                WHERE df.table_name = de.name
-                MERGE (de)-[:HAS_FIELD]->(df)
-            ";
-            
-            var parameters = new Dictionary<string, object>
-            {
-                { "run_id", runId },
-                { "project_id", projectId }
-            };
-            
-            // Note: Actual database execution to be implemented with Neo4j driver
-            // db.cypher_query(query, parameters);
-        }
-
-        public Task<CodeContext> ParseCodebaseAsync(int runId, int runFileId, string filePath, string tech, int projectId)
-        {
-            var ccMetadata = new CodeComprehensionMetadata
-            {
-                ProjectId = projectId,
-                Language = tech
-            };
-            var result = ParseCodebase(runId, runFileId, ccMetadata, filePath);
-            return Task.FromResult(result);
+            return null;
         }
     }
 }
