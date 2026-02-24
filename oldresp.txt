@@ -1,160 +1,624 @@
-using System;
-using System.Collections.Generic;
-using System.IO;
-using System.Linq;
-using Newtonsoft.Json;
-using ParserService.Entities.Entities;
-using ClosedXML.Excel;
+#!/usr/bin/env python3
+"""
+Neo4j Multi-Node Type Comparison Tool
+Compares multiple node types between two run IDs and generates Excel report
+"""
 
-namespace TsqlParserProject
-{
-    public static class ParserUtils
-    {
-        public static void WriteFunctionSnippetsToExcelWithCounts(CodeContext output, string inputFilePath, string saveDirectory)
-        {
-            // Extract the base name of the input file (without extension)
-            string baseFilename = Path.GetFileNameWithoutExtension(inputFilePath);
+import pandas as pd
+from neo4j import GraphDatabase
+import json
+import sys
+import hashlib
+import uuid
+import re
+from datetime import datetime
 
-            // Generate a timestamp for the filename
-            string timestamp = DateTime.Now.ToString("ddMMyyyy_HHmmss");
+class ParserStandardizer:
+    """Python version of ParserStandardizer for verification"""
+    
+    @staticmethod
+    def standardize_file_path(file_path: str) -> str:
+        if not file_path:
+            return file_path
+        
+        standardized = file_path.replace("\\", "/")
+        
+        if re.match(r'^[A-Za-z]:', standardized):
+            drive = standardized[0].lower()
+            path_parts = standardized.split('/')
+            if len(path_parts) > 2:
+                for part in path_parts:
+                    if '_' in part and len(part) > 10:
+                        standardized = f"/mnt/storage/{part}" + standardized[standardized.find(part) + len(part):]
+                        break
+                else:
+                    standardized = f"/mnt/storage/{drive}" + standardized[2:]
+            else:
+                standardized = f"/mnt/storage/{drive}" + standardized[2:]
+        
+        return standardized
+    
+    @staticmethod
+    def generate_deterministic_key(file_path: str, function_name: str, class_name: str, 
+                                 start_line: int, end_line: int, node_type: str = "") -> str:
+        hash_data = {
+            'file_path': ParserStandardizer.standardize_file_path(file_path),
+            'function_name': function_name or "",
+            'class_name': class_name or "",
+            'start_line': start_line,
+            'end_line': end_line,
+            'node_type': node_type
+        }
+        
+        hash_string = json.dumps(hash_data, sort_keys=True)
+        hash_bytes = hashlib.sha256(hash_string.encode()).digest()
+        return str(uuid.UUID(bytes=hash_bytes[:16]))
+    
+    @staticmethod
+    def generate_deterministic_timestamp(file_path: str, start_line: int, end_line: int) -> str:
+        hash_data = f"{ParserStandardizer.standardize_file_path(file_path)}{start_line}{end_line}"
+        hash_value = hashlib.md5(hash_data.encode()).hexdigest()
+        base_timestamp = 1704067200.0  # 2024-01-01 00:00:00 UTC
+        hash_offset = int(hash_value[:8], 16) % 86400
+        timestamp = base_timestamp + hash_offset
+        return datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S")
+    
+    @staticmethod
+    def get_standardized_project_id(project_id: int = None) -> int:
+        return project_id if project_id is not None else None
+    
+    @staticmethod
+    def generate_deterministic_run_file_id(file_path: str, project_id: int) -> int:
+        hash_data = f"{ParserStandardizer.standardize_file_path(file_path)}{project_id}"
+        hash_value = hashlib.md5(hash_data.encode()).hexdigest()
+        base_id = 93000
+        hash_offset = int(hash_value[:6], 16) % 200
+        return base_id + hash_offset
 
-            // Construct the Excel file name
-            string excelFilename = $"{baseFilename}_Parser_Results_{timestamp}.xlsx";
-            string excelPath = Path.Combine(saveDirectory, excelFilename);
+class Neo4jMultiNodeComparator:
+    def __init__(self, uri, username, password):
+        self.driver = GraphDatabase.driver(uri, auth=(username, password))
+    
+    def close(self):
+        self.driver.close()
+    
+    def get_nodes_by_run_id_and_type(self, run_id, node_type):
+        """Get all nodes for a specific run_id and node type"""
+        query = f"""
+        MATCH (n:{node_type}) 
+        WHERE n.run_id = $run_id 
+        RETURN n, labels(n) as node_labels, id(n) as node_id
+        """
+        
+        with self.driver.session() as session:
+            result = session.run(query, run_id=run_id)
+            nodes = []
+            for record in result:
+                node_data = dict(record['n'])
+                node_data['_labels'] = record['node_labels']
+                node_data['_node_id'] = record['node_id']
+                nodes.append(node_data)
+            return nodes
+    
+    def normalize_node_for_comparison(self, node):
+        """Normalize node data for comparison, excluding run_id"""
+        normalized = {}
+        for key, value in node.items():
+            if key not in ['run_id', '_node_id']:
+                if isinstance(value, (list, dict)):
+                    normalized[key] = json.dumps(value, sort_keys=True)
+                else:
+                    # Don't truncate 'key' property values
+                    if key.lower() == 'key':
+                        normalized[key] = str(value) if value is not None else ''
+                    else:
+                        normalized[key] = str(value) if value is not None else ''
+        return normalized
+    
+    def find_node_matches_and_mismatches(self, nodes1, nodes2, node_type):
+        """Find exact node matches and mismatches based on key properties"""
+        matched_nodes = []
+        mismatched_nodes = []
+        missing_in_run2 = []
+        missing_in_run1 = []
+        
+        # Create lookup dictionaries based on key properties
+        nodes1_lookup = {}
+        nodes2_lookup = {}
+        
+        # Define key properties for matching based on node type
+        key_props = ['file_path', 'function_name', 'class_name', 'start_line_number', 'end_line_number', 'name']
+        
+        for node in nodes1:
+            key = self._create_node_key(node, key_props)
+            nodes1_lookup[key] = node
+        
+        for node in nodes2:
+            key = self._create_node_key(node, key_props)
+            nodes2_lookup[key] = node
+        
+        # Find matches and mismatches
+        for key, node1 in nodes1_lookup.items():
+            if key in nodes2_lookup:
+                node2 = nodes2_lookup[key]
+                # Compare all properties
+                norm1 = self.normalize_node_for_comparison(node1)
+                norm2 = self.normalize_node_for_comparison(node2)
+                
+                if norm1 == norm2:
+                    matched_nodes.append({'node1': node1, 'node2': node2, 'match_key': key})
+                else:
+                    # Find specific property differences
+                    prop_diffs = {}
+                    all_props = set(norm1.keys()) | set(norm2.keys())
+                    for prop in all_props:
+                        val1 = norm1.get(prop, 'MISSING')
+                        val2 = norm2.get(prop, 'MISSING')
+                        if val1 != val2:
+                            prop_diffs[prop] = {'run1_value': val1, 'run2_value': val2}
+                    
+                    mismatched_nodes.append({
+                        'node1': node1, 
+                        'node2': node2, 
+                        'match_key': key,
+                        'property_differences': prop_diffs
+                    })
+            else:
+                missing_in_run2.append(node1)
+        
+        # Find nodes only in run2
+        for key, node2 in nodes2_lookup.items():
+            if key not in nodes1_lookup:
+                missing_in_run1.append(node2)
+        
+        return {
+            'matched_nodes': matched_nodes,
+            'mismatched_nodes': mismatched_nodes,
+            'missing_in_run2': missing_in_run2,
+            'missing_in_run1': missing_in_run1
+        }
+    
+    def _create_node_key(self, node, key_props):
+        """Create a unique key for node matching"""
+        key_parts = []
+        for prop in key_props:
+            value = node.get(prop, '')
+            if value is None:
+                value = ''
+            key_parts.append(str(value))
+        return '|'.join(key_parts)
 
-            // Create a new workbook
-            var workbook = new XLWorkbook();
-
-            // Define the fields and their additional properties
-            var fields = new Dictionary<string, List<string>>
-            {
-                { "DecisionNodeConstructs", new List<string> { "FileName", "Name", "StartLineNumber", "EndLineNumber" } },
-                { "LoopEntity", new List<string> { "FileName", "Name", "StartLineNumber", "EndLineNumber" } },
-                { "DbCalls", new List<string> { "FileName", "FunctionName", "StartLineNumber", "EndLineNumber", "OperationType", "Aliases", "TableNames", "FilterConditions" } },
-                { "DatabaseEntities", new List<string> { "Name", "FileName", "StartLineNumber", "EndLineNumber" } },
-                { "Calculation", new List<string> { "FileName", "Name", "StartLineNumber", "EndLineNumber", "Snippet", "Operands", "Variable" } },
-                { "Callees", new List<string> { "CalleeFileName", "CallerFunction", "Snippet", "StartLineNumber", "EndLineNumber", "CalleeFunction", "Condition", "ConditionalHierarchy", "IsConditional", "Parameters" } },
-                { "ServiceCalls", new List<string> { "FileName", "Name", "StartLineNumber", "EndLineNumber", "Snippet", "Target", "Parameters" } },
-                { "TransactionCommits", new List<string> { "FileName", "Name", "StartLineNumber", "EndLineNumber", "Snippet" } },
-                { "TransactionRollbacks", new List<string> { "FileName", "Name", "StartLineNumber", "EndLineNumber", "Snippet" } }
-            };
-
-            // Write each field's data to separate tabs
-            foreach (var fieldEntry in fields)
-            {
-                string fieldName = fieldEntry.Key;
-                var properties = fieldEntry.Value;
-
-                var sheet = workbook.Worksheets.Add(fieldName);
-
-                // Write header row
-                for (int i = 0; i < properties.Count; i++)
-                {
-                    sheet.Cell(1, i + 1).Value = properties[i];
+    def compare_node_type(self, run_id1, run_id2, node_type):
+        """Compare nodes of a specific type between two run IDs"""
+        print(f"Comparing {node_type} nodes...")
+        
+        nodes1 = self.get_nodes_by_run_id_and_type(run_id1, node_type)
+        nodes2 = self.get_nodes_by_run_id_and_type(run_id2, node_type)
+        
+        print(f"  Run {run_id1}: {len(nodes1)} {node_type} nodes")
+        print(f"  Run {run_id2}: {len(nodes2)} {node_type} nodes")
+        
+        # Find detailed node matches and mismatches
+        node_analysis = self.find_node_matches_and_mismatches(nodes1, nodes2, node_type)
+        
+        # Get all properties and their values from both runs
+        all_props_run1 = set()
+        all_props_run2 = set()
+        prop_values_run1 = {}
+        prop_values_run2 = {}
+        
+        for node in nodes1:
+            normalized = self.normalize_node_for_comparison(node)
+            all_props_run1.update(normalized.keys())
+            for prop, value in normalized.items():
+                if prop not in prop_values_run1:
+                    prop_values_run1[prop] = set()
+                # Don't truncate 'key' property values
+                if prop.lower() == 'key':
+                    prop_values_run1[prop].add(str(value))
+                else:
+                    prop_values_run1[prop].add(value[:100] if len(str(value)) > 100 else str(value))
+        
+        for node in nodes2:
+            normalized = self.normalize_node_for_comparison(node)
+            all_props_run2.update(normalized.keys())
+            for prop, value in normalized.items():
+                if prop not in prop_values_run2:
+                    prop_values_run2[prop] = set()
+                # Don't truncate 'key' property values
+                if prop.lower() == 'key':
+                    prop_values_run2[prop].add(str(value))
+                else:
+                    prop_values_run2[prop].add(value[:100] if len(str(value)) > 100 else str(value))
+        
+        # Find property differences
+        missing_in_run2 = all_props_run1 - all_props_run2
+        missing_in_run1 = all_props_run2 - all_props_run1
+        common_props = all_props_run1 & all_props_run2
+        
+        # Find value differences in common properties
+        value_differences = {}
+        for prop in common_props:
+            values1 = prop_values_run1.get(prop, set())
+            values2 = prop_values_run2.get(prop, set())
+            if values1 != values2:
+                value_differences[prop] = {
+                    'run1_values': list(values1),
+                    'run2_values': list(values2)
                 }
-
-                int rowIndex = 2;
-                foreach (var functionSnippet in output.FunctionSnippets)
-                {
-                    var fieldObjects = GetPropertyValue(functionSnippet, fieldName) as System.Collections.IEnumerable;
-                    if (fieldObjects != null)
-                    {
-                        foreach (var obj in fieldObjects)
-                        {
-                            for (int colIndex = 0; colIndex < properties.Count; colIndex++)
-                            {
-                                string prop = properties[colIndex];
-                                var value = GetPropertyValue(obj, prop);
-
-                                // Explicit handling for ConditionalHierarchy
-                                if (prop == "ConditionalHierarchy" && value != null)
-                                {
-                                    sheet.Cell(rowIndex, colIndex + 1).Value = JsonConvert.SerializeObject(value, Formatting.Indented);
-                                }
-                                else
-                                {
-                                    sheet.Cell(rowIndex, colIndex + 1).Value = value?.ToString() ?? "";
-                                }
-                            }
-                            rowIndex++;
-                        }
+        
+        return {
+            'node_type': node_type,
+            'count_run1': len(nodes1),
+            'count_run2': len(nodes2),
+            'total_props_run1': len(all_props_run1),
+            'total_props_run2': len(all_props_run2),
+            'missing_in_run2': list(missing_in_run2),
+            'missing_in_run1': list(missing_in_run1),
+            'common_props': list(common_props),
+            'missing_count_run2': len(missing_in_run2),
+            'missing_count_run1': len(missing_in_run1),
+            'prop_values_run1': {k: list(v) for k, v in prop_values_run1.items()},
+            'prop_values_run2': {k: list(v) for k, v in prop_values_run2.items()},
+            'value_differences': value_differences,
+            'node_analysis': node_analysis
+        }
+    
+    def compare_all_node_types(self, run_id1, run_id2, node_types):
+        """Compare all specified node types"""
+        results = []
+        
+        for node_type in node_types:
+            try:
+                result = self.compare_node_type(run_id1, run_id2, node_type)
+                results.append(result)
+            except Exception as e:
+                print(f"Error comparing {node_type}: {str(e)}")
+                results.append({
+                    'node_type': node_type,
+                    'error': str(e),
+                    'count_run1': 0,
+                    'count_run2': 0,
+                    'missing_in_run2': [],
+                    'missing_in_run1': []
+                })
+        
+        return results
+    
+    def generate_excel_report(self, results, dotnet_run_id, python_run_id, output_file):
+        """Generate comprehensive Excel report"""
+        
+        # Generate matched values data from actual node comparison results
+        matched_values_data = []
+        
+        # Generate detailed node mismatch data
+        detailed_mismatch_data = []
+        missing_nodes_data = []
+        count_difference_data = []
+        
+        for result in results:
+            if 'error' not in result and 'node_analysis' in result:
+                node_analysis = result['node_analysis']
+                
+                # Count differences - Extra nodes in each parser
+                if result['count_run1'] != result['count_run2']:
+                    # Extra nodes in DotNet parser (run1)
+                    for extra_node in node_analysis['missing_in_run2']:
+                        count_difference_data.append({
+                            'Node_Type': result['node_type'],
+                            'Extra_In_Parser': 'DotNet Parser',
+                            'Extra_In_Run_ID': f'Run_{dotnet_run_id}',
+                            'File_Path': extra_node.get('file_path', 'N/A'),
+                            'Function_Name': extra_node.get('function_name', 'N/A'),
+                            'Class_Name': extra_node.get('class_name', 'N/A'),
+                            'Start_Line': extra_node.get('start_line_number', 'N/A'),
+                            'End_Line': extra_node.get('end_line_number', 'N/A'),
+                            'Node_Name': extra_node.get('name', 'N/A'),
+                            'Key_Property': extra_node.get('key', 'N/A'),
+                            'Node_ID': extra_node.get('_node_id', 'N/A'),
+                            'All_Properties': ', '.join([f"{k}={str(v)[:50]}" for k, v in extra_node.items() if k not in ['_labels', '_node_id', 'run_id']][:8])
+                        })
+                    
+                    # Extra nodes in Python parser (run2)
+                    for extra_node in node_analysis['missing_in_run1']:
+                        count_difference_data.append({
+                            'Node_Type': result['node_type'],
+                            'Extra_In_Parser': 'Python Parser',
+                            'Extra_In_Run_ID': f'Run_{python_run_id}',
+                            'File_Path': extra_node.get('file_path', 'N/A'),
+                            'Function_Name': extra_node.get('function_name', 'N/A'),
+                            'Class_Name': extra_node.get('class_name', 'N/A'),
+                            'Start_Line': extra_node.get('start_line_number', 'N/A'),
+                            'End_Line': extra_node.get('end_line_number', 'N/A'),
+                            'Node_Name': extra_node.get('name', 'N/A'),
+                            'Key_Property': extra_node.get('key', 'N/A'),
+                            'Node_ID': extra_node.get('_node_id', 'N/A'),
+                            'All_Properties': ', '.join([f"{k}={str(v)[:50]}" for k, v in extra_node.items() if k not in ['_labels', '_node_id', 'run_id']][:8])
+                        })
+        
+        for result in results:
+            if 'error' not in result and 'node_analysis' in result:
+                node_analysis = result['node_analysis']
+                
+                # Mismatched nodes with property differences
+                for mismatch in node_analysis['mismatched_nodes']:
+                    node1 = mismatch['node1']
+                    node2 = mismatch['node2']
+                    prop_diffs = mismatch['property_differences']
+                    
+                    base_info = {
+                        'Node_Type': result['node_type'],
+                        'File_Path': node1.get('file_path', 'N/A'),
+                        'Function_Name': node1.get('function_name', 'N/A'),
+                        'Class_Name': node1.get('class_name', 'N/A'),
+                        'Start_Line': node1.get('start_line_number', 'N/A'),
+                        'End_Line': node1.get('end_line_number', 'N/A'),
+                        'Node_Name': node1.get('name', 'N/A')
                     }
-                }
-            }
+                    
+                    for prop, diff in prop_diffs.items():
+                        detailed_mismatch_data.append({
+                            **base_info,
+                            'Property_Name': prop,
+                            'DotNet_Value': diff['run1_value'],
+                            'Python_Value': diff['run2_value'],
+                            'Issue_Type': 'Property Value Mismatch'
+                        })
+                
+                # Missing nodes in run2 (Python parser)
+                for missing_node in node_analysis['missing_in_run2']:
+                    missing_nodes_data.append({
+                        'Node_Type': result['node_type'],
+                        'Missing_In': 'Python Parser',
+                        'File_Path': missing_node.get('file_path', 'N/A'),
+                        'Function_Name': missing_node.get('function_name', 'N/A'),
+                        'Class_Name': missing_node.get('class_name', 'N/A'),
+                        'Start_Line': missing_node.get('start_line_number', 'N/A'),
+                        'End_Line': missing_node.get('end_line_number', 'N/A'),
+                        'Node_Name': missing_node.get('name', 'N/A'),
+                        'Key_Property': missing_node.get('key', 'N/A'),
+                        'All_Properties': ', '.join([f"{k}={v}" for k, v in missing_node.items() if k not in ['_labels', '_node_id', 'run_id']][:10])
+                    })
+                
+                # Missing nodes in run1 (DotNet parser)
+                for missing_node in node_analysis['missing_in_run1']:
+                    missing_nodes_data.append({
+                        'Node_Type': result['node_type'],
+                        'Missing_In': 'DotNet Parser',
+                        'File_Path': missing_node.get('file_path', 'N/A'),
+                        'Function_Name': missing_node.get('function_name', 'N/A'),
+                        'Class_Name': missing_node.get('class_name', 'N/A'),
+                        'Start_Line': missing_node.get('start_line_number', 'N/A'),
+                        'End_Line': missing_node.get('end_line_number', 'N/A'),
+                        'Node_Name': missing_node.get('name', 'N/A'),
+                        'Key_Property': missing_node.get('key', 'N/A'),
+                        'All_Properties': ', '.join([f"{k}={v}" for k, v in missing_node.items() if k not in ['_labels', '_node_id', 'run_id']][:10])
+                    })
+        
+        for result in results:
+            if 'error' not in result:
+                # For common properties, show ALL parser values (especially for 'key' property)
+                for prop in result['common_props']:
+                    dotnet_values_list = result['prop_values_run1'].get(prop, ['N/A'])
+                    python_values_list = result['prop_values_run2'].get(prop, ['N/A'])
+                    
+                    # For 'key' property, show all values; for others, limit to first 5
+                    if prop.lower() == 'key':
+                        dotnet_values = ', '.join(dotnet_values_list)
+                        python_values = ', '.join(python_values_list)
+                    else:
+                        dotnet_values = ', '.join(dotnet_values_list[:5])
+                        python_values = ', '.join(python_values_list[:5])
+                    
+                    matched_values_data.append({
+                        'Node_Type': result['node_type'],
+                        'Property_Name': prop,
+                        'DotNet_Parser_Values': dotnet_values,
+                        'Python_Parser_Values': python_values,
+                        'Values_Match': 'Yes' if set(dotnet_values_list) == set(python_values_list) else 'No',
+                        'DotNet_Count': len(dotnet_values_list),
+                        'Python_Count': len(python_values_list),
+                        'DotNet_Run_ID': dotnet_run_id,
+                        'Python_Run_ID': python_run_id
+                    })
+        
+        # Missing properties details
+        missing_props_data = []
+        value_diff_data = []
+        
+        for result in results:
+            if 'error' not in result:
+                # Properties missing in Python parser
+                for prop in result['missing_in_run2']:
+                    sample_values = ', '.join(result['prop_values_run1'].get(prop, ['N/A'])[:3])
+                    missing_props_data.append({
+                        'Node_Type': result['node_type'],
+                        'Property_Name': prop,
+                        'Missing_In_Parser': 'Python Parser',
+                        'Missing_In_Run_ID': f'Run_{python_run_id}',
+                        'Present_In_Parser': '.NET Parser',
+                        'Present_In_Run_ID': f'Run_{dotnet_run_id}',
+                        'Values_DotNet': sample_values,
+                        'Impact': 'Property exists in .NET parser but missing in Python parser - needs implementation'
+                    })
+                
+                # Properties missing in .NET parser
+                for prop in result['missing_in_run1']:
+                    sample_values = ', '.join(result['prop_values_run2'].get(prop, ['N/A'])[:3])
+                    missing_props_data.append({
+                        'Node_Type': result['node_type'],
+                        'Property_Name': prop,
+                        'Missing_In_Parser': '.NET Parser',
+                        'Missing_In_Run_ID': f'Run_{dotnet_run_id}',
+                        'Present_In_Parser': 'Python Parser',
+                        'Present_In_Run_ID': f'Run_{python_run_id}',
+                        'Values_Python': sample_values,
+                        'Impact': 'Property exists in Python parser but missing in .NET parser'
+                    })
+                
+                # Properties with different values
+                for prop, diff_data in result.get('value_differences', {}).items():
+                    dotnet_values = ', '.join(diff_data['run1_values'][:3])
+                    python_values = ', '.join(diff_data['run2_values'][:3])
+                    value_diff_data.append({
+                        'Node_Type': result['node_type'],
+                        'Property_Name': prop,
+                        'DotNet_Values': dotnet_values,
+                        'Python_Values': python_values,
+                        'Issue': 'Different values between parsers',
+                        'Action_Required': 'Review and align values'
+                    })
+        
+        # Write to Excel
+        with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
+            # Matched Values Verification sheet
+            matched_df = pd.DataFrame(matched_values_data)
+            matched_df.to_excel(writer, sheet_name='Matched_Values', index=False)
+            
+            # Add dedicated key analysis sheet
+            key_analysis_data = []
+            for result in results:
+                if 'error' not in result and 'key' in result['prop_values_run1']:
+                    dotnet_keys = result['prop_values_run1']['key']
+                    python_keys = result['prop_values_run2'].get('key', [])
+                    
+                    key_analysis_data.append({
+                        'Node_Type': result['node_type'],
+                        'DotNet_Key_Count': len(dotnet_keys),
+                        'Python_Key_Count': len(python_keys),
+                        'DotNet_Keys': ', '.join(dotnet_keys),
+                        'Python_Keys': ', '.join(python_keys),
+                        'Keys_Match': 'Yes' if set(dotnet_keys) == set(python_keys) else 'No'
+                    })
+            
+            if key_analysis_data:
+                key_df = pd.DataFrame(key_analysis_data)
+                key_df.to_excel(writer, sheet_name='Key_Analysis', index=False)
+            
+            # Add header information sheet4827
+            header_data = [{
+                'Comparison_Type': '.NET Parser vs Python Parser',
+                'DotNet_Parser_Run_ID': f'Run ID 1: {dotnet_run_id}',
+                'Python_Parser_Run_ID': f'Run ID 2: {python_run_id}',
+                'Technology_Stack': '',
+                'Generated_Date': pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'Note': 'Both parsers should generate identical values for same input'
+            }]
+            header_df = pd.DataFrame(header_data)
+            header_df.to_excel(writer, sheet_name='Comparison_Info', index=False)
+            
+            # Missing properties sheet
+            if missing_props_data:
+                missing_df = pd.DataFrame(missing_props_data)
+                missing_df.to_excel(writer, sheet_name='Missing_Properties', index=False)
+            
+            # Value differences sheet
+            if value_diff_data:
+                value_diff_df = pd.DataFrame(value_diff_data)
+                value_diff_df.to_excel(writer, sheet_name='Value_Differences', index=False)
+            
+            # Summary sheet
+            summary_data = []
+            for result in results:
+                if 'error' not in result:
+                    summary_data.append({
+                        'Node_Type': result['node_type'],
+                        'DotNet_Count': result['count_run1'],
+                        'Python_Count': result['count_run2'],
+                        'Count_Match': 'Yes' if result['count_run1'] == result['count_run2'] else 'No',
+                        'Missing_Props_In_Python': result['missing_count_run2'],
+                        'Missing_Props_In_DotNet': result['missing_count_run1'],
+                        'Total_Issues': result['missing_count_run1'] + result['missing_count_run2']
+                    })
+                else:
+                    summary_data.append({
+                        'Node_Type': result['node_type'],
+                        'Error': result.get('error', 'Unknown error')
+                    })
+            
+            summary_df = pd.DataFrame(summary_data)
+            summary_df.to_excel(writer, sheet_name='Summary', index=False)
+            
+            # Detailed Node Mismatches sheet
+            if detailed_mismatch_data:
+                mismatch_df = pd.DataFrame(detailed_mismatch_data)
+                mismatch_df.to_excel(writer, sheet_name='Node_Mismatches', index=False)
+            
+            # Missing Nodes sheet
+            if missing_nodes_data:
+                missing_nodes_df = pd.DataFrame(missing_nodes_data)
+                missing_nodes_df.to_excel(writer, sheet_name='Missing_Nodes', index=False)
+            
+            # Count Differences sheet
+            if count_difference_data:
+                count_diff_df = pd.DataFrame(count_difference_data)
+                count_diff_df.to_excel(writer, sheet_name='Count_Differences', index=False)
+        
+        print(f"\nExcel report generated: {output_file}")
+        print("\nSheets created:")
+        print("- Matched_Values: Parser standardization verification with Python vs .NET values")
+        print("- Comparison_Info: General comparison information")
+        print("- Missing_Properties: Properties missing in either parser")
+        print("- Value_Differences: Properties with different values")
+        print("- Node_Mismatches: Detailed node-level property mismatches with exact locations")
+        print("- Missing_Nodes: Individual nodes missing in either parser with full details")
+        print("- Count_Differences: Extra nodes in each parser explaining count mismatches")
+        print("- Summary: High-level comparison summary")
 
-            // Create a summary sheet for counts
-            var summarySheet = workbook.Worksheets.Add("Summary");
-            var summaryHeaders = new List<string>
-            {
-                "FileName", "FunctionName", "StartLineNumber", "EndLineNumber",
-                "DecisionNodeConstructsCount", "LoopEntityCount", "DbCallsCount",
-                "CalculationCount", "CalleesCount"
-            };
+def main():
+    print("🔍 .NET vs Python Parser Comparison Tool")
+    print("=" * 50)
+    
+    # Get user inputs with clear labels
+    print("\n🟦 Enter Run IDs for comparison:")
+    dotnet_run_id = int(input("Enter .NET Parser Run ID (Run ID 1): "))
+    python_run_id = int(input("Enter Python Parser Run ID (Run ID 2): "))
+    
+    print("\nAvailable node types:")
+    print("Snippet, CalculationNode, Callee, DbCall, DecisionNode, DatabaseEntityNode,")
+    print("ServiceCall, IOCall, TransactionCommit, TransactionRollback, LoopEntityNode,")
+    print("FileEntity, Variable, AliasNode, InputInterface, InputEntity, ReportInterface, ReportCall")
+    
+    node_types_input = input("\nEnter node types (comma-separated): ").strip()
+    node_types = [nt.strip() for nt in node_types_input.split(',') if nt.strip()]
+    
+    if not node_types:
+        print("No node types specified. Exiting.")
+        return 1
+    
+    # Neo4j connection
+    neo4j_uri = "bolt://rapidx-neo4j-dev.southindia.cloudapp.azure.com:7687"
+    username = "neo4j"
+    password = "Rapidxneo4jdev"
+    output_file = f"DotNet_vs_Python_Parser_Comparison.xlsx"
+    
+    print(f"\n🔄 Comparing {len(node_types)} node types:")
+    print(f"  🟦 .NET Parser (Run ID 1): {dotnet_run_id}")
+    print(f"  🔴 Python Parser (Run ID 2): {python_run_id}")
+    
+    # Perform comparison
+    comparator = None
+    try:
+        comparator = Neo4jMultiNodeComparator(neo4j_uri, username, password)
+        results = comparator.compare_all_node_types(dotnet_run_id, python_run_id, node_types)
+        comparator.generate_excel_report(results, dotnet_run_id, python_run_id, output_file)
+        
+        # Print summary
+        total_differences = sum(1 for r in results if 'error' not in r and (r['missing_count_run1'] > 0 or r['missing_count_run2'] > 0))
+        print(f"\n📋 Comparison completed!")
+        print(f"📊 Node types compared: {len(node_types)}")
+        print(f"❌ Node types with differences: {total_differences}")
+        print(f"📄 Report saved as: {output_file}")
+        
+    except Exception as e:
+        print(f"❌ Error: {str(e)}")
+        return 1
+    
+    finally:
+        if comparator:
+            comparator.close()
+    
+    return 0
 
-            // Write summary headers
-            for (int i = 0; i < summaryHeaders.Count; i++)
-            {
-                summarySheet.Cell(1, i + 1).Value = summaryHeaders[i];
-            }
-
-            int summaryRowIndex = 2;
-            foreach (var functionSnippet in output.FunctionSnippets)
-            {
-                string fileName = GetPropertyValue(functionSnippet, "FileName")?.ToString();
-                string functionName = GetPropertyValue(functionSnippet, "FunctionName")?.ToString();
-                var startLineNumber = GetPropertyValue(functionSnippet, "StartLineNumber");
-                var endLineNumber = GetPropertyValue(functionSnippet, "EndLineNumber");
-
-                var decisionNodes = GetPropertyValue(functionSnippet, "DecisionNodeConstructs") as System.Collections.IEnumerable;
-                var loopEntities = GetPropertyValue(functionSnippet, "LoopEntity") as System.Collections.IEnumerable;
-                var dbCalls = GetPropertyValue(functionSnippet, "DbCalls") as System.Collections.IEnumerable;
-                var calculations = GetPropertyValue(functionSnippet, "Calculation") as System.Collections.IEnumerable;
-                var callees = GetPropertyValue(functionSnippet, "Callees") as System.Collections.IEnumerable;
-
-                int decisionCount = decisionNodes?.Cast<object>().Count() ?? 0;
-                int loopCount = loopEntities?.Cast<object>().Count() ?? 0;
-                int dbCallCount = dbCalls?.Cast<object>().Count() ?? 0;
-                int calcCount = calculations?.Cast<object>().Count() ?? 0;
-                int calleeCount = callees?.Cast<object>().Count() ?? 0;
-
-                summarySheet.Cell(summaryRowIndex, 1).Value = fileName;
-                summarySheet.Cell(summaryRowIndex, 2).Value = functionName;
-                summarySheet.Cell(summaryRowIndex, 3).Value = startLineNumber?.ToString() ?? "";
-                summarySheet.Cell(summaryRowIndex, 4).Value = endLineNumber?.ToString() ?? "";
-                summarySheet.Cell(summaryRowIndex, 5).Value = decisionCount;
-                summarySheet.Cell(summaryRowIndex, 6).Value = loopCount;
-                summarySheet.Cell(summaryRowIndex, 7).Value = dbCallCount;
-                summarySheet.Cell(summaryRowIndex, 8).Value = calcCount;
-                summarySheet.Cell(summaryRowIndex, 9).Value = calleeCount;
-
-                summaryRowIndex++;
-            }
-
-            // Remove the default sheet created by ClosedXML (if it exists and is empty)
-            var sheet1 = workbook.Worksheet("Sheet1");
-            if (sheet1 != null)
-            {
-                sheet1.Delete();
-            }
-
-            // Save the workbook to the specified path
-            workbook.SaveAs(excelPath);
-        }
-
-        private static object GetPropertyValue(object obj, string propertyName)
-        {
-            if (obj == null) return null;
-            var property = obj.GetType().GetProperty(propertyName);
-            if (property != null)
-            {
-                return property.GetValue(obj);
-            }
-            var field = obj.GetType().GetField(propertyName);
-            if (field != null)
-            {
-                return field.GetValue(obj);
-            }
-            return null;
-        }
-    }
-}
+if __name__ == "__main__":
+    sys.exit(main())
