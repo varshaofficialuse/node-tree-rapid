@@ -1,944 +1,935 @@
-using System;
-using System.IO;
-using System.Linq;
-using System.Collections.Generic;
-using System.Text.RegularExpressions;
-using Antlr4.Runtime;
-using Antlr4.Runtime.Tree;
-using Neo4j.Driver;
-
-public class CustomTSqlParser : TSqlParserVisitor<object>
-{
-    public const string MAIN_SNIPPET = "MAIN_SNIPPET";
-
-    public static readonly string[] TargetFunctions =
-    {
-        "sp_OACreate", "sp_OADestroy", "sp_OAGetErrorInfo",
-        "sp_OAMethod", "sp_OASetProperty", "sp_OAStop", "sp_OAGetProperty"
-    };
-
-    public enum CalleeConstructType
-    {
-        EXECUTE,
-        SCALAR_FUNCTION
-    }
-
-    public enum ServiceCallConstructType
-    {
-        EXECUTE,
-        ROWSET_FUNCTION
-    }
-
-    public enum LoopEntityType
-    {
-        WHILE
-    }
-
-    private CodeComprehensionMetadata ProjectMetadata;
-    private string ProjectId;
-    private string Path;
-    private string FileContent;
-    private AntlrInputStream InputStream;
-    private CommonTokenStream TokenStream;
-
-    private string FileName;
-    private string FolderName;
-
-    private FunctionSnippetSchema CurrentFunction;
-
-    private int CurrentIfDepth = 0;
-    private int CurrentCaseDepth = 0;
-    private int CurrentLoopDepth = 0;
-
-    public List<FunctionSnippetSchema> FunctionSnippets = new();
-    private Stack<FunctionSnippetSchema> FunctionSnippetStack = new();
-
-    // MAIN PROGRAM LEVEL
-    public List<DecisionNodeSchema> MainProgramDecisionNodes = new();
-    private HashSet<string> ColumnName = new();
-    private Dictionary<string, string> TableAlias = new();
-    private HashSet<(string, string)> UniqueFields = new();
-
-    public List<FunctionCallee> MainProgramCallees = new();
-    public List<ServiceCallDataEntity> MainProgramServiceCalls = new();
-    public List<DbCallDataEntity> MainProgramDbCalls = new();
-    public List<CalculationEntity> MainProgramCalculations = new();
-    public List<TransactionCommitEntity> MainProgramTransactionCommits = new();
-    public List<TransactionRollbackEntity> MainProgramTransactionRollbacks = new();
-    public List<IOCallEntity> MainProgramIOCalls = new();
-    public List<LoopEntityNodeSchema> MainProgramLoopEntities = new();
-    public List<DatabaseEntitySchema> MainProgramDatabaseEntities = new();
-    public List<InputEntitySchema> MainProgramInputEntities = new();
-    public List<DatabaseFieldSchema> MainProgramDatabaseFields = new();
-
-    // Program level constructs
-    public List<Entity> Entities = new();
-    public List<object> EntityMetadata = new();
-    public List<string> Imports = new();
-    public List<AliasNodeSchema> Aliases = new();
-
-    // Execution Orders
-    private int ExecutionOrder = 0;
-    private int CalleeExecutionOrder = 0;
-    private int SnippetExecutionOrder = 0;
-
-    private List<object> ReturnControlConstructs = new();
-
-    private int CurrentDbCallDepth = 0;
-    private Stack<DbCallDataEntity> DbCallStack = new();
-    private int DbCallExecutionOrder = 0;
-
-    private ConstantVariableExtractor Cve = new();
-
-    private HashSet<int> CommentTokens;
-
-    public CustomTSqlParser(
-        CodeComprehensionMetadata projectMetadata,
-        string filePath,
-        string fileContent,
-        AntlrInputStream inputStream,
-        CommonTokenStream tokenStream
-    )
-    {
-        ProjectMetadata = projectMetadata;
-        ProjectId = projectMetadata.ProjectId;
-        Path = filePath;
-        FileContent = fileContent;
-        InputStream = inputStream;
-        TokenStream = tokenStream;
-
-        FileName = System.IO.Path.GetFileName(filePath);
-        FolderName = System.IO.Path.GetFileName(System.IO.Path.GetDirectoryName(filePath));
-
-        CommentTokens = new HashSet<int>
-        {
-            TSqlLexer.COMMENT,
-            TSqlLexer.LINE_COMMENT
-        };
-    }     private string GetOriginalTextFromContext(ParserRuleContext ctx)
-    {
-        int startIdx = ctx.Start.StartIndex;
-        int stopIdx = ctx.Stop.StopIndex;
-
-        return InputStream.GetText(new Interval(startIdx, stopIdx));
-    }
-
-    private string GetSnippetTextFromContext(ParserRuleContext ctx)
-    {
-        int startIdx = ctx.Start.TokenIndex;
-        int stopIdx = ctx.Stop.TokenIndex;
-
-        var tokens = TokenStream.GetTokens(startIdx, stopIdx);
-        return string.Concat(tokens
-            .Where(t => !CommentTokens.Contains(t.Type))
-            .Select(t => t.Text));
-    }
-
-    private string GetCurrentContextName(ParserRuleContext ctx)
-    {
-        while (ctx != null)
-        {
-            if (ctx is TSqlParser.Create_or_alter_functionContext funcCtx)
-                return funcCtx.funcName.procedure().GetText().Trim('[', ']');
-
-            if (ctx is TSqlParser.Create_or_alter_procedureContext procCtx)
-                return procCtx.procName.procedure().GetText().Trim('[', ']');
-
-            if (ctx is TSqlParser.Create_or_alter_dml_triggerContext dmlCtx)
-                return dmlCtx.simple_name().name.GetText().Trim('[', ']');
-
-            if (ctx is TSqlParser.Create_or_alter_ddl_triggerContext ddlCtx)
-                return ddlCtx.simple_name().name.GetText().Trim('[', ']');
-
-            ctx = ctx.Parent;
-        }
-
-        return MAIN_SNIPPET;
-    }
-
-    private List<VariableEntity> CreateVariableEntityList(IEnumerable<VariableEntity> variables)
-    {
-        var variableList = new List<VariableEntity>();
-
-        foreach (var variable in variables)
-        {
-            variableList.Add(new VariableEntity
-            {
-                Term = variable.Term,
-                Type = variable.Type,
-                UsageContext = variable.UsageContext,
-                Meaning = variable.Meaning,
-                FilePath = variable.FilePath
-            });
-        }
-
-        return variableList;
-    }
-
-    private (HashSet<string>, HashSet<string>, List<string>) ExtractTableSource(
-        TSqlParser.Table_sourceContext tableSource)
-    {
-        var tables = new HashSet<string>();
-        var aliases = new HashSet<string>();
-        var filterConditions = new List<string>();
-
-        if (tableSource != null)
-        {
-            var tsi = tableSource.table_source_item();
-
-            if (tsi?.as_table_alias() != null)
-                aliases.Add(GetOriginalTextFromContext(tsi.as_table_alias()));
-
-            if (tsi?.full_table_name() != null)
-                tables.Add(GetOriginalTextFromContext(tsi.full_table_name()));
-
-            if (tableSource.join_part() != null)
-            {
-                foreach (var join in tableSource.join_part())
-                {
-                    if (join.join_on() != null)
-                    {
-                        var joinOn = join.join_on();
-
-                        if (joinOn.search_condition() != null)
-                            filterConditions.Add(GetOriginalTextFromContext(joinOn.search_condition()));
-
-                        var result = ExtractTableSource(joinOn.table_source());
-                        tables.UnionWith(result.Item1);
-                        aliases.UnionWith(result.Item2);
-                        filterConditions.AddRange(result.Item3);
-                    }
-                }
-            }
-        }
-
-        return (tables, aliases, filterConditions);
-    }
-
-    private void CreateExtractedCalculationSnippet(
-        string snippet,
-        string functionName,
-        int funcStartLine)
-    {
-        var extractData = Cve.ExtractMathematicalCalculations(snippet);
-        var extractDataStartLine = Cve.ExtractMathematicalCalculationsStartline(snippet);
-
-        string resultantData = "";
-        string expressionData = "";
-
-        for (int cnt = 0; cnt < extractData.Count; cnt++)
-        {
-            try
-            {
-                var lineDict = extractData[cnt];
-
-                if (lineDict["match_group"].Contains("="))
-                {
-                    var matchData = lineDict["match_group"].Split('=');
-                    resultantData = matchData[0];
-                    expressionData = matchData[1];
-                }
-                else
-                {
-                    expressionData = lineDict["match_group"];
-                }
-
-                var strMatchedData = string.Join(" ", expressionData);
-                var variablesDetails = Cve.ExtractConstantsVariables(strMatchedData, Path);
-                var variableEntities = CreateVariableEntityList(variablesDetails);
-
-                bool keyword = expressionData.Contains("SELECT");
-
-                if (!keyword)
-                {
-                    var operands = GetOperands(expressionData.Trim());
-                    var lineRange = FindTargetLines(
-                        expressionData.Trim(),
-                        extractDataStartLine[cnt]["start"]
-                    );
-
-                    var calculationEntity = new CalculationEntity
-                    {
-                        Name = functionName,
-                        Tech = ProjectMetadata.Technology,
-                        FileName = FileName,
-                        FilePath = Path,
-                        StartLineNumber = lineRange.Item1,
-                        EndLineNumber = lineRange.Item2,
-                        ProgramId = FileName,
-                        Type = "",
-                        Snippet = expressionData.Trim(),
-                        Resultant = resultantData,
-                        Operands = operands,
-                        Variable = variableEntities
-                    };
-
-                    if (CurrentFunction != null)
-                        CurrentFunction.Calculation.Add(calculationEntity);
-                    else
-                        MainProgramCalculations.Add(calculationEntity);
-                }
-            }
-            catch
-            {
-                // Strict parity: swallow exception exactly as Python logger error behavior
-            }
-        }
-    }      private FunctionSnippetSchema CreateFunctionSnippet(ParserRuleContext ctx)
-    {
-        ExecutionOrder = 0;
-        CalleeExecutionOrder = 0;
-        CurrentIfDepth = 0;
-        CurrentCaseDepth = 0;
-        SnippetExecutionOrder += 1;
-
-        int startLineNumber = ctx.Start.Line;
-        int endLineNumber = ctx.Stop.Line;
-
-        string functionName = GetCurrentContextName(ctx);
-        string className = FileName;
-
-        if (ctx is TSqlParser.Create_or_alter_functionContext funcCtx)
-            className = funcCtx.funcName.GetText();
-
-        if (ctx is TSqlParser.Create_or_alter_procedureContext procCtx)
-            className = procCtx.procName.GetText();
-
-        if (ctx is TSqlParser.Create_or_alter_dml_triggerContext dmlCtx)
-            className = dmlCtx.simple_name().GetText();
-
-        if (ctx is TSqlParser.Create_or_alter_ddl_triggerContext ddlCtx)
-            className = ddlCtx.simple_name().GetText();
-
-        string snippetText = GetOriginalTextFromContext(ctx);
-
-        var variablesDetails = Cve.ExtractConstantsVariables(snippetText, Path);
-        var variableEntities = CreateVariableEntityList(variablesDetails);
-
-        var functionSnippet = new FunctionSnippetSchema
-        {
-            FilePath = Path,
-            FileName = FileName,
-            FunctionName = functionName,
-            ClassName = className,
-            Snippet = snippetText,
-            StartLineNumber = startLineNumber,
-            EndLineNumber = endLineNumber,
-            Callees = new List<FunctionCallee>(),
-            Annotations = new List<object>(),
-            ReturnType = "NA",
-            DecisionNodeConstructs = new List<DecisionNodeSchema>(),
-            DbCalls = new List<DbCallDataEntity>(),
-            ServiceCalls = new List<ServiceCallDataEntity>(),
-            Calculation = new List<CalculationEntity>(),
-            ExecutionOrder = ExecutionOrder,
-            SnippetExecutionOrder = SnippetExecutionOrder,
-            Inputs = new List<InputInterfaceSchema>(),
-            Variable = variableEntities
-        };
-
-        FunctionSnippets.Add(functionSnippet);
-
-        return functionSnippet;
-    }
-
-    private void VisitFunctionSnippet(ParserRuleContext ctx)
-    {
-        var functionSnippet = CreateFunctionSnippet(ctx);
-        int functionStartLine = ctx.Start.StartIndex;
-
-        CurrentFunction = functionSnippet;
-        FunctionSnippetStack.Push(functionSnippet);
-
-        CreateExtractedCalculationSnippet(
-            CurrentFunction.Snippet,
-            CurrentFunction.FunctionName,
-            functionStartLine
-        );
-
-        VisitChildren(ctx);
-
-        CurrentFunction = FunctionSnippetStack.Count > 0
-            ? FunctionSnippetStack.Pop()
-            : null;
-    }
-
-    private DecisionNodeSchema CreateRuleSnippet(
-        ParserRuleContext ctx,
-        RuleConstructType constructType)
-    {
-        int startLineNumber = ctx.Start.Line;
-        int endLineNumber = ctx.Stop.Line;
-
-        Regex conditionalKeywords;
-
-        if (constructType == RuleConstructType.SWITCH_CONSTRUCT)
-            conditionalKeywords = new Regex(@"\b(WHEN|ELSE)\b", RegexOptions.IgnoreCase);
-        else
-            conditionalKeywords = new Regex(@"\b((?<!END-)IF|ELSE|(?<!END-)DECIDE)\b", RegexOptions.IgnoreCase);
-
-        string snippetText = GetOriginalTextFromContext(ctx);
-
-        var matches = conditionalKeywords.Matches(snippetText);
-        int numConditions = matches.Count;
-
-        string cleanedText = snippetText.Replace("\r", " ");
-
-        string hostingFunctionName = GetCurrentContextName(ctx);
-
-        var variablesDetails = Cve.ExtractConstantsVariables(cleanedText, Path);
-
-        string numericExtractionText = snippetText;
-
-        if (ctx is TSqlParser.If_statementContext ifCtx &&
-            ifCtx.search_condition() != null)
-        {
-            numericExtractionText = GetOriginalTextFromContext(ifCtx.search_condition());
-        }
-
-        variablesDetails.AddRange(
-            Cve.ExtractNumericConstants(
-                numericExtractionText.Replace("\r", " "),
-                Path
-            )
-        );
-
-        var variableEntities = CreateVariableEntityList(variablesDetails);
-
-        var decisionNode = new DecisionNodeSchema
-        {
-            Name = hostingFunctionName,
-            ShortSummary = "",
-            StartLineNumber = startLineNumber,
-            EndLineNumber = endLineNumber,
-            Snippet = snippetText,
-            NumberOfConditionals = numConditions,
-            Complexity = Complexity.CategorizeComplexity(numConditions),
-            ConstructType = constructType,
-            ExecutionOrder = ExecutionOrder,
-            Variable = variableEntities
-        };
-
-        return decisionNode;
-    }
-
-    private DbCallDataEntity CreateDbCall(
-        ParserRuleContext ctx,
-        string query,
-        List<string> filterConditions,
-        HashSet<string> aliases,
-        HashSet<string> tables,
-        string operationType)
-    {
-        ExecutionOrder += 1;
-
-        string fullText = GetOriginalTextFromContext(ctx);
-        string cleanedText = fullText.Replace("\r", " ");
-
-        int startLineNumber = ctx.Start.Line;
-        int endLineNumber = ctx.Stop.Line;
-
-        var variablesDetails = Cve.ExtractConstantsVariables(cleanedText, Path);
-        var variableEntities = CreateVariableEntityList(variablesDetails);
-
-        string hostingFunctionName = GetCurrentContextName(ctx);
-
-        var dbCallEntity = new DbCallDataEntity
-        {
-            Name = hostingFunctionName,
-            FilePath = Path,
-            FileName = FileName,
-            Tech = ProjectMetadata.Technology,
-            ProgramId = FileName,
-            StartLineNumber = startLineNumber,
-            EndLineNumber = endLineNumber,
-            Snippet = cleanedText,
-            OperationType = operationType,
-            ExecutionOrder = ExecutionOrder,
-            Variable = variableEntities,
-            Query = query,
-            FilterConditions = filterConditions,
-            Aliases = aliases,
-            TableNames = tables
-                .Select(t => t.Split('.').Last().Trim('[', ']').ToLower())
-                .ToList()
-        };
-
-        if (CurrentFunction != null)
-            CurrentFunction.DbCalls.Add(dbCallEntity);
-        else
-            MainProgramDbCalls.Add(dbCallEntity);
-
-        if (DbCallStack.Count == 0)
-        {
-            DbCallExecutionOrder += 1;
-            dbCallEntity.Level = DbCallLevel.PARENT;
-            dbCallEntity.DbCallExecutionOrder = DbCallExecutionOrder.ToString();
-            dbCallEntity.ChildCount = 0;
-        }
-        else
-        {
-            var parent = DbCallStack.Peek();
-            parent.ChildCount += 1;
-
-            dbCallEntity.Level = DbCallLevel.CHILD;
-            dbCallEntity.DbCallExecutionOrder =
-                parent.DbCallExecutionOrder + "." + parent.ChildCount;
-            dbCallEntity.ChildCount = 0;
-        }
-
-        return dbCallEntity;
-    }
-
-    private Dictionary<string, object> GetCalleeConditionalHierarchy(ParserRuleContext ctx)
-    {
-        var hierarchy = new Dictionary<string, object>();
-        var currentLevel = hierarchy;
-        bool isElse = false;
-
-        while (ctx != null)
-        {
-            var parentCtx = ctx.Parent;
-
-            if (parentCtx == null)
-                break;
-
-            if (parentCtx is TSqlParser.If_statementContext ifCtx)
-            {
-                if (ifCtx.ELSE() != null)
-                {
-                    var sym = ifCtx.ELSE().Symbol;
-                    if (sym.StopIndex < ctx.Stop.StartIndex)
-                        isElse = true;
-                }
-
-                if (ifCtx.search_condition() != null)
-                {
-                    string conditionString =
-                        GetOriginalTextFromContext(ifCtx.search_condition());
-
-                    conditionString =
-                        Regex.Replace(conditionString, @"\n\d{4}\s*$", "");
-
-                    currentLevel["condition"] = conditionString;
-                    currentLevel["start_line_number"] = ifCtx.Start.Line;
-                    currentLevel["end_line_number"] = ifCtx.Stop.Line;
-                    currentLevel["siblings"] = new List<string>();
-                    currentLevel["is_else"] = isElse;
-                    currentLevel["parent"] = new Dictionary<string, object>();
-
-                    currentLevel = (Dictionary<string, object>)currentLevel["parent"];
-                }
-
-                isElse = false;
-            }
-
-            ctx = parentCtx;
-        }
-
-        return hierarchy;
-    }     private ServiceCallDataEntity CreateServiceCall(
-        ParserRuleContext ctx,
-        string serviceName,
-        List<string> parameters)
-    {
-        ExecutionOrder += 1;
-
-        int startLineNumber = ctx.Start.Line;
-        int endLineNumber = ctx.Stop.Line;
-
-        string snippetText = GetOriginalTextFromContext(ctx);
-        string cleanedText = snippetText.Replace("\r", " ");
-
-        var variablesDetails = Cve.ExtractConstantsVariables(cleanedText, Path);
-        var variableEntities = CreateVariableEntityList(variablesDetails);
-
-        string hostingFunctionName = GetCurrentContextName(ctx);
-
-        var serviceCall = new ServiceCallDataEntity
-        {
-            Name = hostingFunctionName,
-            FilePath = Path,
-            FileName = FileName,
-            StartLineNumber = startLineNumber,
-            EndLineNumber = endLineNumber,
-            Snippet = cleanedText,
-            ExecutionOrder = ExecutionOrder,
-            Variable = variableEntities,
-            ServiceName = serviceName,
-            Parameters = parameters
-        };
-
-        if (CurrentFunction != null)
-            CurrentFunction.ServiceCalls.Add(serviceCall);
-
-        return serviceCall;
-    }
-
-    private FunctionCallee CreateCallee(
-        ParserRuleContext ctx,
-        string calleeName)
-    {
-        CalleeExecutionOrder += 1;
-
-        int startLineNumber = ctx.Start.Line;
-        int endLineNumber = ctx.Stop.Line;
-
-        string snippetText = GetOriginalTextFromContext(ctx);
-
-        var callee = new FunctionCallee
-        {
-            Name = calleeName,
-            FilePath = Path,
-            FileName = FileName,
-            StartLineNumber = startLineNumber,
-            EndLineNumber = endLineNumber,
-            Snippet = snippetText,
-            ExecutionOrder = CalleeExecutionOrder
-        };
-
-        if (CurrentFunction != null)
-            CurrentFunction.Callees.Add(callee);
-
-        return callee;
-    }
-
-    private void HandleBeginTransaction(ParserRuleContext ctx)
-    {
-        ExecutionOrder += 1;
-        DbCallStack.Push(new DbCallDataEntity());
-    }
-
-    private void HandleCommit(ParserRuleContext ctx)
-    {
-        if (DbCallStack.Count > 0)
-            DbCallStack.Pop();
-    }
-
-    private void HandleRollback(ParserRuleContext ctx)
-    {
-        if (DbCallStack.Count > 0)
-            DbCallStack.Pop();
-    }
-
-    // ============================
-    // VISITOR OVERRIDES
-    // ============================
-
-    public override object VisitCreate_or_alter_procedure(
-        TSqlParser.Create_or_alter_procedureContext context)
-    {
-        VisitFunctionSnippet(context);
-        return null;
-    }
-
-    public override object VisitCreate_or_alter_function(
-        TSqlParser.Create_or_alter_functionContext context)
-    {
-        VisitFunctionSnippet(context);
-        return null;
-    }
-
-    public override object VisitIf_statement(
-        TSqlParser.If_statementContext context)
-    {
-        ExecutionOrder += 1;
-
-        var decisionNode = CreateRuleSnippet(
-            context,
-            RuleConstructType.IF_CONSTRUCT);
-
-        if (CurrentFunction != null)
-            CurrentFunction.DecisionNodeConstructs.Add(decisionNode);
-
-        VisitChildren(context);
-
-        return null;
-    }
-
-    public override object VisitSelect_statement(
-        TSqlParser.Select_statementContext context)
-    {
-        string query = GetOriginalTextFromContext(context);
-        var tables = ExtractTables(query);
-        var aliases = ExtractAliases(query);
-        var filters = ExtractFilterConditions(query);
-
-        var dbCall = CreateDbCall(
-            context,
-            query,
-            filters,
-            aliases,
-            tables,
-            "SELECT");
-
-        DbCallStack.Push(dbCall);
-        VisitChildren(context);
-        DbCallStack.Pop();
-
-        return null;
-    }
-
-    public override object VisitInsert_statement(
-        TSqlParser.Insert_statementContext context)
-    {
-        string query = GetOriginalTextFromContext(context);
-        var tables = ExtractTables(query);
-
-        var dbCall = CreateDbCall(
-            context,
-            query,
-            new List<string>(),
-            new HashSet<string>(),
-            tables,
-            "INSERT");
-
-        VisitChildren(context);
-
-        return null;
-    }
-
-    public override object VisitUpdate_statement(
-        TSqlParser.Update_statementContext context)
-    {
-        string query = GetOriginalTextFromContext(context);
-        var tables = ExtractTables(query);
-
-        var dbCall = CreateDbCall(
-            context,
-            query,
-            new List<string>(),
-            new HashSet<string>(),
-            tables,
-            "UPDATE");
-
-        VisitChildren(context);
-
-        return null;
-    }
-
-    public override object VisitDelete_statement(
-        TSqlParser.Delete_statementContext context)
-    {
-        string query = GetOriginalTextFromContext(context);
-        var tables = ExtractTables(query);
-
-        var dbCall = CreateDbCall(
-            context,
-            query,
-            new List<string>(),
-            new HashSet<string>(),
-            tables,
-            "DELETE");
-
-        VisitChildren(context);
-
-        return null;
-    }     // ============================
-    // PART 5 — PYTHON STRICT PARITY
-    // ============================
-
-    public override object VisitCreate_or_alter_ddl_trigger(
-        TSqlParser.Create_or_alter_ddl_triggerContext context)
-    {
-        VisitFunctionSnippet(context);
-        return null;
-    }
-
-    public override object VisitCreate_or_alter_dml_trigger(
-        TSqlParser.Create_or_alter_dml_triggerContext context)
-    {
-        VisitFunctionSnippet(context);
-        return null;
-    }
-
-    public override object VisitCase_expression(
-        TSqlParser.Case_expressionContext context)
-    {
-        if (CurrentCaseDepth == 0)
-        {
-            ExecutionOrder += 1;
-
-            var decisionNode = CreateRuleSnippet(
-                context,
-                RuleConstructType.SWITCH_CONSTRUCT);
-
-            if (CurrentFunction != null)
-                CurrentFunction.DecisionNodeConstructs.Add(decisionNode);
-            else
-                MainProgramDecisionNodes.Add(decisionNode);
-        }
-
-        CurrentCaseDepth += 1;
-        VisitChildren(context);
-        CurrentCaseDepth -= 1;
-
-        return null;
-    }
-
-    public override object VisitSql_clauses(
-        TSqlParser.Sql_clausesContext context)
-    {
-        TableAlias.Clear();
-        return VisitChildren(context);
-    }
-
-    public override object VisitExecute_statement(
-        TSqlParser.Execute_statementContext context)
-    {
-        string targetFunctionName = null;
-
-        if (context.execute_body()?.func_proc_name_server_database_schema() != null)
-        {
-            targetFunctionName =
-                ParseFuncProcNameServerDatabaseSchema(
-                    context.execute_body().func_proc_name_server_database_schema());
-        }
-
-        if (TargetFunctions.Contains(targetFunctionName))
-            CreateServiceCall(context, targetFunctionName);
-        else
-            CreateCallee(context, CalleeConstructType.EXECUTE);
-
-        return VisitChildren(context);
-    }
-
-    public override object VisitRowset_function(
-        TSqlParser.Rowset_functionContext context)
-    {
-        string snippetText = GetOriginalTextFromContext(context);
-
-        if (snippetText.ToUpper().Contains("OPENROWSET"))
-            CreateServiceCall(context, "OPENROWSET");
-
-        return VisitChildren(context);
-    }
-
-    public override object VisitWhile_statement(
-        TSqlParser.While_statementContext context)
-    {
-        ExecutionOrder += 1;
-
-        // Python double increment preserved intentionally
-        ExecutionOrder += 1;
-
-        string fullText = GetOriginalTextFromContext(context);
-        string cleanedText = fullText.Replace("\r", " ");
-
-        int startLineNumber = context.Start.Line;
-        int endLineNumber = context.Stop.Line;
-
-        string hostingFunctionName = GetCurrentContextName(context);
-
-        var loopEntity = new LoopEntityNodeSchema
-        {
-            Name = hostingFunctionName,
-            Tech = ProjectMetadata.Technology,
-            FileName = FileName,
-            FilePath = Path,
-            StartLineNumber = startLineNumber,
-            EndLineNumber = endLineNumber,
-            ProgramId = FileName.Split('.')[0],
-            Type = LoopEntityType.WHILE.ToString(),
-            Snippet = cleanedText,
-            ExecutionOrder = ExecutionOrder,
-            ModuleName = FolderName
-        };
-
-        if (CurrentFunction != null)
-            CurrentFunction.LoopEntity.Add(loopEntity);
-        else
-            MainProgramLoopEntities.Add(loopEntity);
-
-        return VisitChildren(context);
-    }
-
-    public override object VisitTransaction_statement(
-        TSqlParser.Transaction_statementContext context)
-    {
-        if (context.COMMIT() != null)
-            CreateTransactionCommit(context);
-        else if (context.ROLLBACK() != null)
-            CreateTransactionRollback(context);
-
-        return VisitChildren(context);
-    }
-
-    public override object VisitSCALAR_FUNCTION(
-        TSqlParser.SCALAR_FUNCTIONContext context)
-    {
-        CreateCallee(context, CalleeConstructType.SCALAR_FUNCTION);
-        return VisitChildren(context);
-    }
-
-    // ----------------------------
-    // Operand extraction (exact regex)
-    // ----------------------------
-
-    private List<string> GetOperands(string data)
-    {
-        var operands = new List<string>();
-
-        var matches = Regex.Matches(data, @"[+\-*/]");
-
-        foreach (Match match in matches)
-            operands.Add(match.Value);
-
-        return operands;
-    }
-
-    // ----------------------------
-    // Target line finder (strict parity)
-    // ----------------------------
-
-    private (int, int) FindTargetLines(string targetData, int startLine)
-    {
-        try
-        {
-            var targetDataLine = targetData.Split('\n');
-
-            if (targetDataLine.Length > 1)
-            {
-                int endLine = startLine + targetDataLine.Length - 1;
-                return (startLine, endLine);
-            }
-
-            if (targetDataLine.Length == 1)
-                return (startLine, startLine);
-
-            return (0, 0);
-        }
-        catch
-        {
-            return (0, 0);
-        }
-    }
-
-    // ----------------------------
-    // Entity Exists (Cypher exact parity)
-    // ----------------------------
-
-    private bool EntityExists(string name)
-    {
-        string query = @"
-            MATCH (e:DatabaseEntity)
-            WHERE toLower(e.name) = toLower($name)
-              AND e.project_id = $project_id
-            RETURN COUNT(e) > 0 AS exists
-        ";
-
-        var result = Neo4j.Driver.GraphDatabase.Driver(
-                ProjectMetadata.Neo4jUri,
-                AuthTokens.Basic(
-                    ProjectMetadata.Neo4jUser,
-                    ProjectMetadata.Neo4jPassword))
-            .Session()
-            .Run(query, new
-            {
-                name = name,
-                project_id = ProjectId
-            })
-            .Single();
-
-        return result["exists"].As<bool>();
-    }
+## Python & Cloud Backend Interview Master Cheatsheet
+
+This cheatsheet covers essential topics for a Python backend developer with 4-5 years of experience, focusing on theoretical, conceptual, and scenario-based questions.
+
+---
+
+### Section 1: Python Fundamentals & Concurrency
+
+#### 1.1 How to handle I/O tasks in Python?
+*   **Brief Detail:** I/O (Input/Output) tasks involve operations like reading/writing files, network requests, or database calls. These are typically slow compared to CPU operations.
+*   **Methods:**
+    1.  **Synchronous (Blocking):** The program waits for the I/O operation to complete before moving to the next line of code. Simple but inefficient for concurrent operations.
+    2.  **Asynchronous (Non-blocking):** Uses an event loop to switch between tasks while waiting for I/O, allowing other tasks to run concurrently.
+    3.  **Multithreading:** Uses multiple threads to execute I/O-bound tasks concurrently. Limited by GIL for CPU-bound tasks.
+    4.  **Multiprocessing:** Uses multiple processes, each with its own Python interpreter and memory space, to bypass the GIL and utilize multiple CPU cores.
+*   **Scenario:** "You have a Python script that downloads data from 100 different APIs. Currently, it takes too long. How would you optimize its I/O handling?"
+*   **Explanation:** I would use **asynchronous programming with `asyncio` and an HTTP client like `httpx`**. Since API calls are I/O-bound, `asyncio` allows the program to initiate multiple requests and switch between them while waiting for responses, significantly reducing the total execution time compared to synchronous or even multithreaded approaches (due to GIL overhead).
+
+#### 1.2 Async Cycle in Python (`asyncio`)
+*   **Brief Detail:** `asyncio` is Python's library for writing concurrent code using the `async`/`await` syntax. It uses a single-threaded **event loop** to manage and schedule coroutines.
+*   **Components:**
+    *   **Event Loop:** The central orchestrator that runs tasks, handles I/O events, and schedules when coroutines resume.
+    *   **Coroutines (`async def`):** Functions that can be paused and resumed. They are not functions that run in parallel, but rather functions that cooperate.
+    *   **`await`:** A keyword used inside an `async def` function to pause its execution until an awaitable (another coroutine, a Future, or a Task) completes. This yields control back to the event loop.
+    *   **Tasks:** Wrappers around coroutines that schedule them to run in the event loop.
+*   **Example:**
+    ```python
+    import asyncio
+
+    async def fetch_data(delay):
+        print(f"Starting fetch for {delay}s")
+        await asyncio.sleep(delay) # Simulate I/O
+        print(f"Finished fetch for {delay}s")
+        return f"Data after {delay}s"
+
+    async def main():
+        # Run multiple coroutines concurrently
+        results = await asyncio.gather(
+            fetch_data(2),
+            fetch_data(1),
+            fetch_data(3)
+        )
+        print(f"All results: {results}")
+
+    # asyncio.run(main()) # To run in a script
+    ```
+*   **Scenario:** "You are building a FastAPI application that needs to make several external API calls to fulfill a single user request. How do you ensure these calls don't block each other and the overall response time is fast?"
+*   **Explanation:** I would leverage FastAPI's native `async`/`await` support. Each external API call would be an `awaitable` coroutine. By using `asyncio.gather()` to run these coroutines concurrently, the event loop can switch between waiting for each API response, ensuring that the total time is closer to the longest API call rather than the sum of all calls. This prevents blocking and keeps the API responsive.
+
+#### 1.3 Multithreading in Python
+*   **Brief Detail:** Allows multiple parts of a program (threads) to run concurrently within the same process, sharing the same memory space. Primarily useful for **I/O-bound tasks** in Python due to the GIL.
+*   **Example:** Downloading multiple files simultaneously.
+*   **Scenario:** "You need to perform several non-CPU intensive, independent I/O operations (e.g., logging to multiple external systems) within a synchronous web application. Would you use multithreading or multiprocessing?"
+*   **Explanation:** I would use **multithreading**. Since the tasks are I/O-bound and don't require heavy CPU computation, multithreading can effectively manage the waiting times. The GIL won't be a significant bottleneck because threads will mostly be waiting for I/O operations to complete, allowing other threads to run. This is more lightweight than multiprocessing, which involves higher overhead for process creation and inter-process communication.
+
+#### 1.4 GIL (Global Interpreter Lock) in Python
+*   **Brief Detail:** A mutex (or a lock) that protects access to Python objects, preventing multiple native threads from executing Python bytecodes simultaneously. This means that even on multi-core processors, only one thread can execute Python bytecode at any given time.
+*   **Impact:**
+    *   **CPU-bound tasks:** Limits true parallelism. Multithreading won't make CPU-bound tasks faster; in fact, it can add overhead.
+    *   **I/O-bound tasks:** Less impact, as the GIL is released during I/O operations, allowing other threads to run while one thread is waiting for I/O.
+*   **Scenario:** "You've written a Python script that performs complex mathematical calculations on large datasets and you've tried to speed it up using multithreading, but it's not performing as expected. What's likely happening and what's your next step?"
+*   **Explanation:** The issue is almost certainly the **Global Interpreter Lock (GIL)**. Since mathematical calculations are CPU-bound, the GIL prevents multiple threads from truly running in parallel, negating the benefits of multithreading. My next step would be to switch to **multiprocessing**. By using separate processes, each with its own Python interpreter, the GIL is bypassed, allowing true parallel execution across multiple CPU cores and significantly speeding up the CPU-bound computations.
+
+#### 1.5 Multiprocessing in Python
+*   **Brief Detail:** Allows a program to spawn multiple independent processes, each with its own Python interpreter and memory space. This bypasses the GIL, enabling true parallelism for **CPU-bound tasks** on multi-core systems.
+*   **Example:** Running a data analysis job that processes different chunks of data on separate CPU cores.
+*   **Scenario:** "You need to run a batch job that involves heavy data transformation and analysis on several large files simultaneously. How would you design this to maximize CPU utilization?"
+*   **Explanation:** I would use **multiprocessing**. Each file or chunk of data would be assigned to a separate process. Since data transformation and analysis are CPU-bound operations, multiprocessing would allow each process to run on a different CPU core, bypassing the GIL and achieving true parallel execution. This would significantly reduce the overall processing time compared to multithreading or synchronous execution.
+
+#### 1.6 Performance Optimization (Python Specific)
+*   **Brief Detail:** Techniques to make Python code run faster and use fewer resources.
+*   **Key Strategies:**
+    *   **Algorithmic Optimization:** Choose efficient algorithms (e.g., $O(n)$ instead of $O(n^2)$).
+    *   **Data Structures:** Use appropriate data structures (e.g., `set` for fast lookups, `list` for ordered sequences).
+    *   **Built-in Functions:** Prefer Python's built-in functions and C-implemented modules (e.g., `sum()`, `map()`, `filter()`) as they are highly optimized.
+    *   **List Comprehensions/Generator Expressions:** Often faster and more memory-efficient than explicit `for` loops.
+    *   **Caching:** Use `functools.lru\_cache` for memoization or external caches like Redis.
+    *   **Profiling:** Use `cProfile` or `py-spy` to identify bottlenecks.
+    *   **Asynchronous Programming:** For I/O-bound tasks.
+    *   **Multiprocessing:** For CPU-bound tasks.
+    *   **JIT Compilers:** Tools like PyPy or Numba for specific numerical tasks.
+*   **Scenario:** "Your Python API endpoint is performing a lot of string manipulations and list operations, and profiling shows these are bottlenecks. What specific Python-level optimizations would you consider?"
+*   **Explanation:** I would first look at using **list comprehensions** and **generator expressions** instead of explicit loops for list operations, as they are often more optimized. For string manipulations, I'd ensure I'm using efficient methods like `str.join()` for concatenation rather than repeated `+` operations. If there are frequently computed results, I'd consider `functools.lru\_cache` for memoization. Finally, I'd re-profile to confirm the impact of these changes.
+
+#### 1.7 Exception Handling in Python
+*   **Brief Detail:** A mechanism to gracefully manage errors and unexpected events during program execution, preventing crashes and providing a better user experience.
+*   **Keywords:** `try`, `except`, `else`, `finally`.
+    *   `try`: Code that might raise an exception.
+    *   `except`: Code to run if a specific exception occurs.
+    *   `else`: Code to run if no exception occurs in the `try` block.
+    *   `finally`: Code that always runs, regardless of whether an exception occurred or not (e.g., for cleanup).
+*   **Example:**
+    ```python
+    try:
+        result = 10 / 0
+    except ZeroDivisionError:
+        print("Cannot divide by zero!")
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+    else:
+        print("Division successful.")
+    finally:
+        print("Execution complete.")
+    ```
+*   **Scenario:** "You have a function that reads from a file, processes its content, and then writes to another file. How do you ensure that resources are properly closed and potential errors (like file not found or permission issues) are handled gracefully?"
+*   **Explanation:** I would use a `try...except...finally` block, combined with `with open(...)` for file handling. The `with` statement ensures files are automatically closed. The `except` blocks would catch specific errors like `FileNotFoundError` or `PermissionError`, providing user-friendly messages or logging. The `finally` block would be used for any other critical cleanup that must happen regardless of success or failure.
+
+#### 1.8 File Handling
+*   **Brief Detail:** Operations involving reading from or writing to files on the file system.
+*   **Best Practice:** Use the `with` statement to ensure files are properly closed, even if errors occur.
+*   **Modes:** `r` (read), `w` (write, overwrites), `a` (append), `x` (create new file), `b` (binary), `t` (text, default).
+*   **Example:**
+    ```python
+    # Writing to a file
+    with open("output.txt", "w") as f:
+        f.write("Hello, world!\n")
+
+    # Reading from a file
+    with open("output.txt", "r") as f:
+        content = f.read()
+        print(content)
+    ```
+*   **Scenario:** "You need to process a large CSV file (several GBs) line by line without loading the entire file into memory. How would you approach this in Python?"
+*   **Explanation:** I would use the `with open(...)` statement to open the file in read mode and then iterate over the file object directly. This reads the file line by line, making it memory-efficient for large files. I would also use the `csv` module for robust parsing of CSV data, ensuring proper handling of delimiters and quoted fields.
+
+---
+
+### Section 2: Database & Data Management
+
+#### 2.1 ACID Properties
+*   **Brief Detail:** A set of properties guaranteeing that database transactions are processed reliably. Essential for data integrity.
+*   **Properties:**
+    *   **Atomicity:** A transaction is treated as a single, indivisible unit. Either all of its operations are completed, or none are. (All or nothing).
+    *   **Consistency:** A transaction brings the database from one valid state to another, maintaining all defined rules and constraints.
+    *   **Isolation:** Concurrent transactions execute in isolation, meaning the outcome is the same as if they had executed sequentially.
+    *   **Durability:** Once a transaction is committed, its changes are permanent and survive system failures (e.g., power loss).
+*   **Scenario:** "Explain how ACID properties are critical in a financial transaction system where money is transferred between two accounts."
+*   **Explanation:** In a financial transfer, Atomicity ensures that either money is successfully debited from one account AND credited to another, or neither happens. If only one part succeeds, the transaction is rolled back. Consistency ensures that the total balance before and after the transfer remains correct. Isolation prevents a third party from seeing an intermediate state (e.g., money debited but not yet credited). Durability guarantees that once the transfer is confirmed, it won't be lost even if the server crashes.
+
+#### 2.2 Connection Pooling
+*   **Brief Detail:** A technique used to manage and reuse database connections. Instead of opening a new connection for every request, a pool maintains a set of open connections that can be borrowed and returned.
+*   **Benefits:** Reduces overhead (connection establishment is expensive), improves performance, and prevents resource exhaustion.
+*   **Example:** Libraries like `SQLAlchemy` or `asyncpg` (for async Python) implement connection pooling.
+*   **Scenario:** "Your FastAPI application frequently interacts with a PostgreSQL database. During peak load, you notice a significant slowdown and occasional database connection errors. What's a common cause and how would you address it?"
+*   **Explanation:** A common cause is the overhead of establishing new database connections for every request, or exhausting the maximum number of connections allowed by the database. I would implement **connection pooling**. By configuring a pool (e.g., using `SQLAlchemy`'s `create\_engine` with `pool\_size` and `max\_overflow` parameters), the application reuses existing connections, drastically reducing connection overhead and preventing the database from being overwhelmed by too many new connection requests.
+
+#### 2.3 DB Migrations
+*   **Brief Detail:** A system for tracking and applying changes to a database schema in a version-controlled manner. It allows developers to evolve the database schema over time in a structured and repeatable way.
+*   **Tools:** `Alembic` (for SQLAlchemy), `Django Migrations`, `Flyway`, `Liquibase`.
+*   **Workflow:**
+    1.  Define schema changes in Python models (e.g., add a column).
+    2.  Generate a migration script (e.g., `alembic revision --autogenerate`). This script contains SQL to apply the changes.
+    3.  Apply the migration to the database (e.g., `alembic upgrade head`).
+*   **Scenario:** "Your application is deployed across multiple environments (dev, staging, production), and you need to add a new column to a critical table. How do you ensure this change is applied consistently and safely across all environments without data loss?"
+*   **Explanation:** I would use a **database migration tool like Alembic**. First, I'd define the schema change in the SQLAlchemy model. Then, I'd use Alembic to `autogenerate` a migration script. I would review this script to ensure it correctly adds the column without affecting existing data. This script would then be version-controlled with Git. During deployment, the CI/CD pipeline would run `alembic upgrade head` in each environment, ensuring the schema change is applied incrementally, consistently, and safely.
+
+#### 2.4 ORM (Object-Relational Mapping) in Python
+*   **Brief Detail:** A programming technique that maps objects in an application to tables in a relational database. It allows developers to interact with the database using an object-oriented paradigm (Python classes and objects) instead of writing raw SQL.
+*   **Benefits:** Reduces boilerplate SQL, improves code readability, prevents SQL injection, and makes database interactions more Pythonic.
+*   **Popular ORMs:** `SQLAlchemy`, `Django ORM`, `PeeWee`, `Tortoise ORM` (async-first).
+*   **Example (SQLAlchemy):**
+    ```python
+    from sqlalchemy import create_engine, Column, Integer, String
+    from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.ext.declarative import declarative_base
+
+    Base = declarative_base()
+
+    class User(Base):
+        __tablename__ = "users"
+        id = Column(Integer, primary_key=True)
+        name = Column(String)
+        email = Column(String)
+
+    # Usage:
+    # engine = create_engine("sqlite:///./test.db")
+    # Base.metadata.create_all(engine)
+    # Session = sessionmaker(bind=engine)
+    # session = Session()
+    # new_user = User(name="Alice", email="alice@example.com")
+    # session.add(new_user)
+    # session.commit()
+    ```
+*   **Scenario:** "Your team is developing a new microservice and wants to quickly build out data models and interact with a PostgreSQL database without writing raw SQL. What tool would you recommend and why?"
+*   **Explanation:** I would recommend using an **ORM like SQLAlchemy (or Tortoise ORM if it's an async FastAPI service)**. SQLAlchemy allows us to define database tables as Python classes, making database interactions intuitive and Pythonic. It handles SQL generation, connection pooling, and provides a powerful query builder, significantly speeding up development and reducing the risk of SQL injection compared to raw SQL.
+
+#### 2.5 Async DB Calls
+*   **Brief Detail:** Performing database operations asynchronously, meaning the application doesn't block while waiting for the database to respond. Essential for high-performance asynchronous web frameworks like FastAPI.
+*   **How it works:** Requires an asynchronous database driver (e.g., `asyncpg` for PostgreSQL, `aiomysql` for MySQL, `motor` for MongoDB) and an async-compatible ORM or query builder (e.g., `SQLAlchemy` with `asyncio` support, `Tortoise ORM`).
+*   **Example (FastAPI with `asyncpg` via `SQLAlchemy`):**
+    ```python
+    # In a FastAPI dependency
+    from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+    from sqlalchemy.orm import sessionmaker
+
+    DATABASE_URL = "postgresql+asyncpg://user:password@host/dbname"
+    engine = create_async_engine(DATABASE_URL)
+    AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+    async def get_async_db():
+        async with AsyncSessionLocal() as session:
+            yield session
+
+    # In a FastAPI path operation
+    # @app.get("/users")
+    # async def read_users(db: AsyncSession = Depends(get_async_db)):
+    #     result = await db.execute(select(User))
+    #     users = result.scalars().all()
+    #     return users
+    ```
+*   **Scenario:** "Your FastAPI service is making synchronous database calls, and you're noticing that even with connection pooling, the API's response time is bottlenecked by database queries. How can you further improve this?"
+*   **Explanation:** The bottleneck is likely due to the synchronous nature of the database calls, which block the event loop. I would refactor the database interactions to use **asynchronous database drivers and an async-compatible ORM/session manager**. For example, with PostgreSQL, I'd switch to `asyncpg` and use `SQLAlchemy`'s `AsyncSession`. This allows the event loop to switch to other tasks while waiting for the database I/O, preventing blocking and significantly improving the overall concurrency and responsiveness of the FastAPI application.
+
+---
+
+### Section 3: API Design & Development (FastAPI Focus)
+
+#### 3.1 RESTful APIs
+*   **Brief Detail:** An architectural style for designing networked applications. It relies on a stateless client-server communication model and uses standard HTTP methods (`GET`, `POST`, `PUT`, `DELETE`, `PATCH`) to perform operations on resources.
+*   **Key Principles:**
+    *   **Stateless:** Each request from client to server must contain all the information needed to understand the request.
+    *   **Client-Server:** Separation of concerns.
+    *   **Cacheable:** Responses can be cached to improve performance.
+    *   **Layered System:** Intermediaries can be placed between client and server.
+    *   **Uniform Interface:** Standardized methods and resource identification.
+*   **Example:**
+    *   `GET /users` - Retrieve all users.
+    *   `GET /users/{id}` - Retrieve a specific user.
+    *   `POST /users` - Create a new user.
+    *   `PUT /users/{id}` - Update an existing user.
+*   **Scenario:** "You are designing an API for a new e-commerce platform. How would you structure the endpoints for managing product inventory, ensuring it's RESTful?"
+*   **Explanation:** I would define resources clearly. For products, the base endpoint would be `/products`. To manage inventory, I might have a sub-resource like `/products/{product\_id}/inventory`.
+    *   `GET /products/{product\_id}/inventory` to get current stock.
+    *   `PUT /products/{product\_id}/inventory` to update stock (e.g., set new quantity).
+    *   `PATCH /products/{product\_id}/inventory` to adjust stock (e.g., increment/decrement).
+    This adheres to REST principles by using nouns for resources and HTTP verbs for actions, maintaining a clear, predictable interface.
+
+#### 3.2 Request-Response Cycle in FastAPI
+*   **Brief Detail:** The flow of data and execution from when a client sends an HTTP request to a FastAPI application until it receives an HTTP response.
+*   **Steps:**
+    1.  **Client Request:** HTTP request (e.g., `GET /items/1?q=test`) arrives at the server.
+    2.  **ASGI Server:** Uvicorn (or similar) receives the request.
+    3.  **FastAPI Application:** The request is passed to the FastAPI app.
+    4.  **Middleware:** Global middleware (e.g., CORS, logging) can process the request before it reaches the route.
+    5.  **Routing:** FastAPI matches the request URL and method to a specific path operation function.
+    6.  **Dependency Injection:** FastAPI resolves and injects dependencies (e.g., database session, current user, query parameters, path parameters, request body) into the path operation function.
+    7.  **Pydantic Validation:** Request body data is automatically validated against the Pydantic model defined for the path operation.
+    8.  **Path Operation Execution:** Your Python code in the path operation function runs.
+    9.  **Response Generation:** The return value of your path operation is converted into an HTTP response (e.g., JSON, HTML).
+    10. **Middleware (again):** Response passes through middleware for post-processing.
+    11. **Client Response:** The HTTP response is sent back to the client.
+*   **Scenario:** "A user reports that their request to your FastAPI endpoint is failing with a 422 Unprocessable Entity error, even though they believe their JSON payload is correct. Walk through how you would debug this using your understanding of FastAPI's request-response cycle."
+*   **Explanation:** The 422 error immediately points to a **Pydantic validation failure**. My debugging steps would be:
+    1.  **Check Request Body Model:** Review the Pydantic model defined for the endpoint's request body to ensure it matches the expected structure and data types.
+    2.  **Inspect Incoming Payload:** Log the raw incoming JSON payload to see exactly what the client is sending versus what the model expects.
+    3.  **FastAPI's Error Details:** FastAPI's 422 responses often include detailed error messages from Pydantic, indicating which field failed validation and why. I'd look for these details.
+    4.  **Dependency Issues:** Less likely for 422, but I'd ensure any dependencies providing data for validation are working correctly.
+    This systematic approach, focusing on the validation step in the request-response cycle, would quickly pinpoint the discrepancy.
+
+#### 3.3 Pydantic (how it works, loads vs dumps)
+*   **Brief Detail:** A Python library for data validation and settings management using Python type hints. It enforces data schemas at runtime, providing clear and helpful error messages.
+*   **How it works:**
+    1.  You define a class that inherits from `pydantic.BaseModel`.
+    2.  You use standard Python type hints (`str`, `int`, `List\[str]`, `Optional\[int]`) to define the fields and their types.
+    3.  When you instantiate this model with data, Pydantic automatically validates the data against the defined types. If validation fails, it raises a `ValidationError`.
+    4.  It also provides methods to convert models to/from dictionaries and JSON.
+*   **`loads` vs `dumps` (in context of JSON and Pydantic):**
+    *   `json.dumps()`: Converts a Python object (like a Pydantic model instance or a dictionary) into a JSON formatted string.
+    *   `json.loads()`: Parses a JSON formatted string and converts it into a Python object (like a dictionary).
+    *   Pydantic models have their own `model\_dump\_json()` (or `json()`) and `parse\_raw()` (or `model\_validate\_json()`) methods that handle this specifically for models.
+*   **Example:**
+    ```python
+    from pydantic import BaseModel, Field
+    from typing import List, Optional
+
+    class Item(BaseModel):
+        name: str = Field(min_length=3, max_length=50)
+        description: Optional[str] = None
+        price: float = Field(gt=0)
+        tags: List[str] = []
+
+    # Valid data
+    item_data = {"name": "Laptop", "price": 1200.50, "tags": ["electronics"]}
+    item = Item(**item_data)
+    print(item.model_dump_json()) # Converts to JSON string
+
+    # Invalid data (price <= 0)
+    try:
+        Item(name="Book", price=0)
+    except Exception as e:
+        print(e)
+    ```
+*   **Scenario:** "You're building an API endpoint that accepts user registration data, including email, password, and optional phone number. How do you ensure the incoming data is always valid and structured correctly before processing it?"
+*   **Explanation:** I would define a **Pydantic `BaseModel`** for the user registration data. This model would specify `email: EmailStr` (for email validation), `password: str = Field(min\_length=8)` (for password length), and `phone: Optional\[str] = None`. FastAPI automatically uses this Pydantic model to validate the incoming JSON request body. If the data doesn't conform to the schema (e.g., invalid email format, password too short), Pydantic will raise a `ValidationError`, and FastAPI will return a `422 Unprocessable Entity` response with clear error details, preventing invalid data from reaching my business logic.
+
+#### 3.4 Dependency Injection (DI) and how it works
+*   **Brief Detail:** A design pattern where components (dependencies) are provided to an object or function rather than the object/function creating them itself. This promotes loose coupling, testability, and reusability.
+*   **How it works (FastAPI):** FastAPI has a powerful DI system. You define functions (dependencies) that can return values or yield resources. FastAPI then automatically calls these dependency functions and passes their results as arguments to your path operation functions.
+*   **Benefits:**
+    *   **Reusability:** A dependency can be used in multiple path operations.
+    *   **Testability:** Easy to mock dependencies during testing.
+    *   **Clean Code:** Path operations focus on business logic, not resource management.
+    *   **Resource Management:** Dependencies can manage resources (like database sessions) with `yield`.
+*   **Example (FastAPI):**
+    ```python
+    # from fastapi import Depends, FastAPI
+    # from sqlalchemy.orm import Session
+    # from database import get_db # A dependency that yields a DB session
+
+    # app = FastAPI()
+
+    # @app.get("/items/")
+    # def read_items(db: Session = Depends(get_db)):
+    #     # db session is injected here, no need to create it inside the function
+    #     items = db.query(Item).all()
+    #     return items
+    ```
+*   **Scenario:** "Your FastAPI application has multiple endpoints that need to interact with a database. You want to ensure that each request gets its own database session, and that the session is properly closed after the request, regardless of success or failure. How would you achieve this efficiently and robustly?"
+*   **Explanation:** I would use **FastAPI's Dependency Injection system** to manage database sessions. I'd create a dependency function (e.g., `get\_db`) that `yields` a database session. FastAPI would then:
+    1.  Call `get\_db` before the path operation, providing a fresh session.
+    2.  Inject this session into the path operation function.
+    3.  Execute the path operation.
+    4.  After the path operation returns (or an exception occurs), FastAPI will execute the code after the `yield` in `get\_db` to close the session. This ensures proper resource management, testability, and clean separation of concerns.
+
+#### 3.5 Routing
+*   **Brief Detail:** The process of mapping incoming HTTP requests (based on URL path and HTTP method) to specific functions or handlers in your application code.
+*   **FastAPI:** Uses decorators (`@app.get()`, `@app.post()`, etc.) to define routes.
+*   **Example (FastAPI):**
+    ```python
+    # from fastapi import FastAPI
+    # app = FastAPI()
+
+    # @app.get("/hello")
+    # async def say_hello():
+    #     return {"message": "Hello"}
+
+    # @app.post("/items/{item_id}")
+    # async def create_item(item_id: int, item: Item):
+    #     return {"item_id": item_id, "item": item}
+    ```
+*   **Scenario:** "You need to organize your FastAPI application with many endpoints into logical groups, such as `/users`, `/products`, and `/orders`. How do you structure your routing to keep the codebase modular and maintainable?"
+*   **Explanation:** I would use **FastAPI's `APIRouter`**. I'd create separate `APIRouter` instances for each logical group (e.g., `users\_router.py`, `products\_router.py`). Each router would define its own set of path operations. Then, in the main `app.py`, I would `include\_router` for each, optionally with a `prefix` (e.g., `/users`, `/products`). This keeps the routing definitions organized, prevents the main app file from becoming bloated, and improves modularity.
+
+#### 3.6 CORS (Cross-Origin Resource Sharing)
+*   **Brief Detail:** A security mechanism implemented by web browsers that restricts web pages from making requests to a different domain than the one that served the web page. It prevents malicious scripts from making unauthorized requests.
+*   **How it works:** The browser sends an `OPTIONS` preflight request to the server to check if the actual request is allowed. The server responds with `Access-Control-Allow-Origin` and other headers to indicate allowed origins, methods, and headers.
+*   **FastAPI:** Provides `CORSMiddleware` to easily configure CORS headers.
+*   **Example (FastAPI):**
+    ```python
+    # from fastapi import FastAPI
+    # from fastapi.middleware.cors import CORSMiddleware
+
+    # app = FastAPI()
+
+    # origins = [
+    #     "http://localhost:3000", # Your frontend app
+    #     "https://your-frontend-domain.com",
+    # ]
+
+    # app.add_middleware(
+    #     CORSMiddleware,
+    #     allow_origins=origins,
+    #     allow_credentials=True,
+    #     allow_methods=["*"],
+    #     allow_headers=["*"],
+    # )
+    ```
+*   **Scenario:** "Your frontend application, hosted on `app.example.com`, is trying to make API calls to your backend, hosted on `api.example.com`, but these calls are being blocked by the browser. What is the most likely cause and how do you resolve it?"
+*   **Explanation:** The most likely cause is a **CORS (Cross-Origin Resource Sharing)** policy violation. The browser is preventing the frontend from making requests to a different origin (domain). To resolve this, I would configure **CORS middleware in the FastAPI backend**. I would explicitly add `app.example.com` to the `allow\_origins` list in the `CORSMiddleware` configuration. This tells the browser that requests from `app.example.com` are permitted, allowing the API calls to succeed.
+
+#### 3.7 Pagination
+*   **Brief Detail:** The process of dividing a large set of data into smaller, discrete pages. This improves performance by reducing the amount of data transferred over the network and processed by the client/server.
+*   **Common Methods:**
+    *   **Offset-based:** Uses `offset` (number of records to skip) and `limit` (number of records to return). (e.g., `?offset=10\&limit=10`)
+    *   **Cursor-based:** Uses a unique identifier (cursor) from the last item of the previous page to fetch the next set of items. More efficient for large datasets and avoids issues with data changes during pagination.
+*   **Example (FastAPI with `offset`/`limit`):**
+    ```python
+    # from fastapi import FastAPI, Query
+    # from typing import List
+
+    # app = FastAPI()
+
+    # @app.get("/items/", response_model=List[str])
+    # async def read_items(
+    #     skip: int = Query(0, ge=0),
+    #     limit: int = Query(10, le=100)
+    # ):
+    #     # Logic to fetch items from DB with skip and limit
+    #     all_items = [f"Item {i}" for i in range(100)]
+    #     return all_items[skip : skip + limit]
+    ```
+*   **Scenario:** "Your API endpoint for fetching a list of users is returning thousands of records, causing slow response times and high memory usage on both the server and client. How would you optimize this endpoint?"
+*   **Explanation:** I would implement **pagination** for the endpoint. I would modify the API to accept `skip` (or `offset`) and `limit` (or `page\_size`) query parameters. The backend would then fetch only a subset of users from the database based on these parameters. This significantly reduces the data payload, improves network transfer speed, lowers memory consumption on both ends, and makes the API more scalable and user-friendly.
+
+#### 3.8 Rate Limiting
+*   **Brief Detail:** A technique to control the number of requests a client can make to an API within a given time window. It prevents abuse, protects against DDoS attacks, and ensures fair usage of resources.
+*   **Implementation:** Often uses a cache (like Redis) to store request counts per client (identified by IP, API key, or user ID).
+*   **Example (Conceptual):** Allow 100 requests per minute per IP address.
+*   **Scenario:** "You notice that a specific API endpoint, which performs a computationally expensive operation, is being hit excessively by a few users, impacting the performance for everyone else. How do you mitigate this?"
+*   **Explanation:** I would implement **rate limiting** on that specific endpoint. I would configure it to allow a certain number of requests (e.g., 5 requests) per user (identified by an API key or authenticated user ID) within a specific time window (e.g., 1 minute). This would typically involve using a caching mechanism like **Redis** to store and track request counts. If a user exceeds the limit, the API would return a `429 Too Many Requests` status code, protecting the service from abuse and ensuring fair access for all users.
+
+#### 3.9 Serialization
+*   **Brief Detail:** The process of converting an object (e.g., a Python object) into a format that can be easily stored (e.g., in a file, database) or transmitted (e.g., over a network). Deserialization is the reverse process.
+*   **Common Formats:** JSON, XML, Protocol Buffers, YAML.
+*   **Python Tools:** `json` module, `pickle` module, Pydantic (for structured data).
+*   **Example (JSON):**
+    ```python
+    import json
+
+    data = {"name": "Alice", "age": 30}
+    json_string = json.dumps(data) # Serialize to JSON string
+    print(json_string)
+
+    python_dict = json.loads(json_string) # Deserialize from JSON string
+    print(python_dict)
+    ```
+*   **Scenario:** "Your FastAPI application needs to send complex Python objects (e.g., a list of user objects fetched from a database) as a JSON response to a client. How does FastAPI handle this, and what's important to consider?"
+*   **Explanation:** FastAPI, by default, handles **serialization** automatically. When you return a Pydantic model instance or a Python dictionary/list from a path operation, FastAPI uses `jsonable\_encoder` (which leverages Pydantic's `model\_dump()` and Python's `json` module) to convert these Python objects into a JSON-formatted string. The key consideration is to ensure that the Python objects are compatible with JSON (e.g., custom classes should be Pydantic models or have a `dict()` method) and that sensitive data is not accidentally serialized and exposed.
+
+---
+
+### Section 4: Security & Authentication
+
+#### 4.1 Authentication (AuthN)
+*   **Brief Detail:** The process of verifying the identity of a user or system. It answers the question: "Who are you?"
+*   **Methods:** Passwords, OAuth, API Keys, Biometrics, Certificates.
+*   **Example:** A user logging in with a username and password.
+*   **Scenario:** "Your API has a `/login` endpoint. Describe the basic steps involved in authenticating a user when they submit their credentials."
+*   **Explanation:** When a user submits their username and password to the `/login` endpoint, the backend would:
+    1.  Receive the credentials.
+    2.  Hash the provided password (never store or compare plain passwords).
+    3.  Query the database to find the user by username and compare the hashed password.
+    4.  If they match, the user is **authenticated**. The server then typically generates an access token (e.g., JWT) and sends it back to the client.
+
+#### 4.2 Authorization (AuthZ)
+*   **Brief Detail:** The process of determining what an authenticated user or system is allowed to do. It answers the question: "What are you allowed to access or do?"
+*   **Methods:** Role-Based Access Control (RBAC), Attribute-Based Access Control (ABAC), Permissions.
+*   **Example:** An administrator can delete users, but a regular user cannot.
+*   **Scenario:** "After a user has successfully logged in, they try to access an endpoint that modifies critical system settings. How do you ensure only authorized users can perform this action?"
+*   **Explanation:** After the user is **authenticated**, their **authorization** needs to be checked. This is typically done by inspecting their role or permissions (e.g., from a JWT or a database lookup). If the user's role (e.g., `admin`) has the necessary permission (e.g., `system:settings:write`), the action is allowed. Otherwise, the API would return a `403 Forbidden` status code, preventing unauthorized access to critical functionality.
+
+#### 4.3 Types of Authentication
+*   **Brief Detail:** Various methods to verify user identity.
+*   **Common Types:**
+    *   **Password-based:** Username/password (often with hashing).
+    *   **Token-based (JWT):** Client sends a token (JWT) with each request after initial login.
+    *   **OAuth 2.0:** Delegation protocol for third-party apps to access resources on behalf of a user.
+    *   **API Key:** Simple token for machine-to-machine authentication.
+    *   **Multi-Factor Authentication (MFA):** Requires two or more verification factors.
+*   **Scenario:** "Your application needs to allow users to log in using their Google accounts. What authentication flow would you implement?"
+*   **Explanation:** I would implement an **OAuth 2.0 flow**. The user would be redirected to Google's login page. After successful authentication and consent, Google would redirect the user back to our application with an authorization code. Our backend would then exchange this code for an access token and potentially an ID token from Google. This allows the user to authenticate via Google without our application ever handling their Google password.
+
+#### 4.4 Cookies Session
+*   **Brief Detail:**
+    *   **Cookies:** Small pieces of data sent from a website and stored on the user's web browser. Used for tracking, personalization, and session management. Sent with every subsequent request to the same domain.
+    *   **Session:** A server-side mechanism to store user-specific data across multiple requests. The server typically stores a session ID in a cookie, and uses this ID to retrieve the corresponding session data from its storage (e.g., memory, database, Redis).
+*   **Difference:** Cookies are client-side storage; Sessions are server-side storage (with a cookie as a pointer).
+*   **Scenario:** "You need to maintain a user's logged-in state across multiple pages of your web application. How would you typically achieve this, and what are the security considerations?"
+*   **Explanation:** I would use **server-side sessions managed via cookies**. Upon successful login, the server would create a unique session ID, store user-specific data (like user ID, roles) in a session store (e.g., Redis), and send this session ID back to the client in an `HttpOnly` and `Secure` cookie. For subsequent requests, the browser automatically sends this cookie. The server then uses the session ID to retrieve the user's state. Security considerations include:
+    *   **`HttpOnly` cookie:** Prevents client-side JavaScript from accessing the cookie.
+    *   **`Secure` cookie:** Ensures the cookie is only sent over HTTPS.
+    *   **Session expiration:** Set a reasonable timeout.
+    *   **Session invalidation:** Invalidate sessions on logout or password change.
+    *   **Session hijacking prevention:** Regenerate session IDs periodically.
+
+#### 4.5 Refresh Token
+*   **Brief Detail:** A long-lived credential used to obtain new, short-lived access tokens without requiring the user to re-authenticate. It enhances security by limiting the exposure of access tokens.
+*   **Workflow:**
+    1.  User logs in, receives both an **Access Token** (short-lived) and a **Refresh Token** (long-lived).
+    2.  Client uses Access Token for API calls.
+    3.  When Access Token expires, client uses Refresh Token to request a new Access Token from an authentication server.
+    4.  Refresh Token is typically stored more securely (e.g., `HttpOnly` cookie, secure storage).
+*   **Scenario:** "Your mobile application uses JWTs for authentication. Users complain about being logged out frequently. How can you improve the user experience while maintaining security?"
+*   **Explanation:** I would implement a **Refresh Token mechanism**. Instead of a single, long-lived access token, the user would receive a short-lived **Access Token** (e.g., 15 minutes) and a long-lived **Refresh Token** (e.g., 7 days) upon login. When the access token expires, the mobile app would silently use the refresh token to obtain a new access token from the authentication server. This allows users to stay logged in for extended periods without frequent re-authentication, while the short-lived access tokens minimize the impact if one is compromised.
+
+---
+
+### Section 5: Architecture & Cloud (Microservices, AWS, Messaging)
+
+#### 5.1 Microservice Architecture (how it works, service interaction)
+*   **Brief Detail:** An architectural style that structures an application as a collection of small, loosely coupled, independently deployable services. Each service typically focuses on a single business capability.
+*   **How it works:**
+    *   **Decomposition:** A large monolithic application is broken down into smaller, manageable services.
+    *   **Independent Deployment:** Each service can be developed, deployed, and scaled independently.
+    *   **Technology Heterogeneity:** Different services can use different programming languages, databases, and technologies.
+    *   **Decentralized Data Management:** Each service owns its data.
+*   **Service Interaction:**
+    *   **Synchronous (REST/HTTP):** Services make direct API calls to each other. Simple but introduces tight coupling and potential for cascading failures.
+    *   **Asynchronous (Message Brokers):** Services communicate by sending messages through a message broker (e.g., RabbitMQ, Kafka, Azure Service Bus). This promotes loose coupling and resilience.
+*   **Scenario:** "Your monolithic e-commerce application is becoming difficult to maintain, scale, and deploy. You're proposing a migration to a microservice architecture. How would you explain the benefits and challenges of this approach to your team?"
+*   **Explanation:** I would explain that **microservices** offer benefits like improved scalability (individual services can be scaled independently), better fault isolation (failure in one service doesn't bring down the whole app), and increased agility for development teams. However, I'd also highlight challenges such as increased operational complexity (managing many services), distributed data management, and the need for robust inter-service communication mechanisms (e.g., API Gateways, message brokers). I'd emphasize that careful planning for service boundaries and communication is crucial.
+
+#### 5.2 AWS IAM, Lambda functions, S3 bucket, CloudWatch
+*   **Brief Detail:** Core AWS services for security, serverless compute, storage, and monitoring.
+*   **AWS IAM (Identity and Access Management):** Manages access to AWS services and resources securely. Defines who can do what.
+    *   *Components:* Users, Groups, Roles, Policies.
+*   **AWS Lambda functions:** A serverless compute service that lets you run code without provisioning or managing servers. You pay only for the compute time you consume.
+    *   *Triggers:* Can be invoked by various AWS services (S3 events, API Gateway, CloudWatch events).
+*   **S3 bucket (Simple Storage Service):** Object storage built to store and retrieve any amount of data from anywhere on the web. Highly scalable, durable, and available.
+    *   *Use cases:* Static website hosting, data backup, data lakes, content distribution.
+*   **CloudWatch:** A monitoring and observability service that provides data and actionable insights for AWS, hybrid, and on-premises applications and infrastructure resources.
+    *   *Features:* Metrics, Logs, Alarms, Events.
+*   **Scenario:** "You need to build a system that automatically processes images uploaded by users to your website. The processing involves resizing and watermarking. How would you design this using AWS services to be scalable, cost-effective, and serverless?"
+*   **Explanation:** I would design a **serverless image processing pipeline** using S3 and Lambda.
+    1.  Users upload images to an **S3 bucket**.
+    2.  The S3 upload event triggers an **AWS Lambda function**.
+    3.  The Lambda function (written in Python, for example) downloads the image from S3, performs resizing and watermarking, and then uploads the processed image to a different S3 bucket.
+    4.  **AWS IAM** policies would control permissions for Lambda to access S3.
+    5.  **CloudWatch** would monitor Lambda executions and log any errors.
+    This approach is scalable (Lambda scales automatically), cost-effective (pay-per-execution), and requires no server management.
+
+#### 5.3 Redis? RabbitMQ or ActiveMQ? Service Bus?
+*   **Brief Detail:** These are different types of messaging and caching technologies, each serving distinct purposes.
+*   **Redis:** An open-source, in-memory data structure store, used as a database, cache, and message broker.
+    *   *Primary Use Cases:* Caching (very fast key-value store), session management, real-time analytics, rate limiting, leaderboards.
+*   **RabbitMQ / ActiveMQ:** Open-source **message brokers** that implement various messaging protocols (like AMQP). They are used for asynchronous communication between services.
+    *   *Primary Use Cases:* Task queues, decoupling services, reliable message delivery, publish/subscribe patterns.
+*   **Azure Service Bus:** A fully managed enterprise integration message broker service on Azure. Supports queues and topics.
+    *   *Primary Use Cases:* Decoupling applications, reliable messaging, complex routing, transaction support, dead-lettering.
+*   **Key Difference:** Redis is primarily a **cache/data store** that *can* do messaging (Pub/Sub). RabbitMQ/ActiveMQ/Service Bus are dedicated **message brokers** for reliable asynchronous communication.
+*   **Scenario:** "Your microservice architecture has two main needs: (1) speeding up frequently accessed data, and (2) reliably processing background tasks like sending emails or generating reports. Which technologies would you choose for each need and why?"
+*   **Explanation:**
+    1.  For **speeding up frequently accessed data**, I would choose **Redis** as a caching layer. Its in-memory nature provides extremely fast read/write access, perfect for storing session data, frequently requested API responses, or configuration settings, reducing the load on the primary database.
+    2.  For **reliably processing background tasks**, I would choose a **message broker like Azure Service Bus (or RabbitMQ)**. When an email needs to be sent or a report generated, the main application would publish a message to a Service Bus queue/topic. A separate worker service would then asynchronously consume these messages and perform the tasks. This decouples the services, ensures reliable delivery (with features like dead-lettering and retries), and prevents the main application from being blocked by long-running operations.
+
+#### 5.4 Batch Processing
+*   **Brief Detail:** Executing a series of jobs or tasks in a non-interactive, sequential, or parallel manner, typically on large volumes of data. Often scheduled to run during off-peak hours.
+*   **Use Cases:** Data transformations, report generation, nightly data synchronization, bulk email sending.
+*   **Example:** A nightly job that calculates monthly sales reports for all customers.
+*   **Scenario:** "Your e-commerce platform needs to generate daily sales reports, update inventory levels based on recent shipments, and send out promotional emails to a large customer segment. These tasks are resource-intensive and don't need to be real-time. How would you implement this?"
+*   **Explanation:** I would implement these as **batch processing jobs**. These jobs would be scheduled to run during off-peak hours (e.g., overnight) using a scheduler like `cron` (on a VM) or AWS EventBridge/Step Functions (serverless). Each task (report generation, inventory update, email sending) would be a separate batch job, potentially running in parallel if independent, or sequentially if dependencies exist. This ensures that resource-intensive operations don't impact the real-time performance of the main application during business hours.
+
+----------------------------------------------------------------------------------------------------------------------------------------
+
+
+
+Decorators Concept and Working
+
+Concept: A decorator in Python is a design pattern that allows you to add new functionality to an existing object without modifying its structure. Decorators are essentially functions that take another function as an argument, extend its behavior, and return the extended function. They are syntactic sugar for wrapping one function with another.
+Working:
+
+1.Function as Argument: A decorator function takes the function to be decorated as an argument.
+2.Inner Wrapper Function: Inside the decorator, an inner function (often called wrapper) is defined. This wrapper function is where the new functionality is 	added (before, after, or around the original function call).
+3.Returning the Wrapper: The decorator returns this wrapper function.
+4.Syntactic Sugar: The @decorator_name syntax above a function definition is equivalent to my_function = decorator_name(my_function).
+Example:
+def my_decorator(func):
+    def wrapper(*args, **kwargs):
+        print("Something is happening before the function is called.")
+        result = func(*args, **kwargs)
+        print("Something is happening after the function is called.")
+        return result
+    return wrapper
+@my_decorator
+def say_hello(name):
+    print(f"Hello, {name}!")
+    return f"Greeting for {name}"
+say_hello("Varsha")
+
+
+1. Python & Asynchronous Programming (High Priority)
+
+Q1: Explain how asyncio works in Python. How does it differ from Multi-threading?
+Answer: Python's asyncio uses a single-threaded event loop to manage I/O-bound tasks. Instead of the OS switching between threads (which has overhead), asyncio allows a task to "yield" control back to the loop while waiting for I/O (like a database or API call).
+Key Point: Multi-threading is better for CPU-bound tasks (but limited by GIL), while asyncio is superior for handling thousands of concurrent I/O connections, which is exactly what FastAPI does.
+
+Q2: You mentioned using FastAPI. Why choose it over Flask or Django for high-performance APIs?
+Answer: FastAPI is built on Starlette and Pydantic, making it one of the fastest Python frameworks available. It natively supports async/await, provides automatic data validation (Pydantic), and generates OpenAPI (Swagger) documentation automatically.
+Conceptual: It uses type hints to reduce bugs and improve developer productivity.
+
+Q3: How do you handle database connection pooling in an asynchronous Python application?
+Answer: Using a pool prevents the overhead of creating a new connection for every request. In an async environment, you should use an async-compatible driver (like asyncpg for PostgreSQL or motor for MongoDB).
+Scenario: If a service suddenly gets 1,000 requests, a pool ensures that only a set number of connections (e.g., 20) are used, queuing the rest to prevent crashing the database.
+
+2. Azure & Messaging (Service Bus / ActiveMQ)
+Q4: What is the difference between a Queue and a Topic in Azure Service Bus?
+Answer:
+Queue: One-to-one communication. A message is sent by a producer and received by exactly one consumer.
+Topic: One-to-many (Pub/Sub). A message is sent to a Topic, and multiple "Subscriptions" can receive a copy of that message based on filters.
+Scenario: Use a Queue for processing an order. Use a Topic to notify the "Shipping," "Email," and "Inventory" services simultaneously when an order is placed.
+
+Q5: How do you handle "Dead-lettering" in a messaging system?
+Answer: A Dead-Letter Queue (DLQ) is where messages go if they cannot be delivered or processed after a certain number of retries.
+Process: I implement a retry policy (e.g., 3 attempts). If it still fails, the message moves to the DLQ. I then set up monitoring or a manual process to inspect the DLQ, fix the root cause, and "re-drive" the messages.
+3. Scenario-Based & Operational (JD Specific)
+
+Q6: Scenario: Your FastAPI service is experiencing high latency during peak hours. How do you investigate?
+Answer:
+Check I/O: Are database queries slow? I'd check if I'm missing indexes or if the connection pool is exhausted.
+Check External APIs: Is a third-party API (like Razorpay) taking too long? I'd ensure I'm using httpx (async ) instead of requests (blocking).
+Profiling: Use tools like Prometheus or Azure Monitor to see if the CPU or Memory is spiking.
+Scaling: If code is optimized, I might suggest horizontal scaling (adding more instances/pods).
+
+Q7: Scenario: You are on-call and receive an alert at 2 AM that the T-SQL parser is failing for a specific client. What is your step-by-step process?
+Answer:
+Acknowledge: Acknowledge the alert so the team knows I'm on it.
+Logs: Check Azure Application Insights or ELK logs to find the specific error message and stack trace.
+Isolate: Determine if it's a code bug (new T-SQL syntax) or an infrastructure issue (Neo4j/PostgreSQL down).
+Fix/Workaround: If it's a minor bug, apply a hotfix. If it's major, I might roll back the last deployment or notify stakeholders if a fix will take longer.
+
+4. Handling "Gaps" (PowerShell & Entra ID)
+Q8: "We prefer PowerShell for scripting in this role. How will you adapt?"
+Answer: "While my primary expertise is in Python, I have a strong foundation in scripting logic, variables, and automation. I've already started looking into PowerShell's object-oriented nature, and given my experience with .NET/C#, the transition will be smooth as both leverage the .NET framework."
+
+Q9: "What is your understanding of Azure Entra ID (formerly Azure AD)?"
+Answer: "It is Azure's identity and access management service. It handles authentication (logging in) and authorization (what you can do). I understand concepts like Service Principals (for app-to-app auth) and Managed Identities, which allow Azure resources to talk to each other securely without storing passwords in code."
+
+
+Tips for the Meeting:
+Relate to RapidX: When they ask about complex logic, talk about your ANTLR4 T-SQL parser work. It shows you can handle very difficult technical logic.
+Emphasize "Async": Since the JD mentions "I/O-heavy operations," keep mentioning how you use FastAPI and Asyncio to keep services responsive.
+Be Honest but Eager: If they ask a deep Terraform question, say: "I haven't used Terraform in production yet, but I understand the concept of Infrastructure as Code and am eager to apply my scripting skills to it."
+
+1. Handling I/O Tasks in Python
+In Python, I/O tasks (reading/writing to a database, calling an API, or reading a file) are handled in three main ways:
+Synchronous (Blocking): The program stops and waits for the I/O to finish. This is simple but slow for many concurrent requests.
+Asynchronous (Non-blocking): Using asyncio, the program can "pause" a task and work on another one while waiting for the I/O. This is the 				     standard for modern APIs like FastAPI.
+Threading: Using the threading module to run I/O tasks in parallel.
+
+2. Async Lifecycle in Python
+The "Async Cycle" is managed by the Event Loop.
+The Loop: A continuous loop that checks for tasks that are ready to run.
+Coroutines: Functions defined with async def. They don't run immediately; they return a coroutine object.
+Await: When you await a task, you tell the loop: "I'm waiting for this I/O; go run other tasks." When the I/O is done, the loop resumes your function.
+Task Management: You can run multiple tasks concurrently using asyncio.gather().
+
+3. Multithreading vs. Multiprocessing
+Multithreading-Shares memory within one process, I/O-bound tasks (API calls, DB), Limited by the GIL
+Multiprocessing- Separate memory for each process, CPU-bound tasks (Data processing, Math), High memory overhead
+
+4. The GIL (Global Interpreter Lock)
+What it is: A mutex that allows only one thread to execute Python bytecode at a time.
+Why it exists: To make memory management (reference counting) thread-safe.
+Impact: Even if you have 8 CPU cores, multithreading in Python won't make CPU-heavy code faster. To use all cores for math/logic, you must use Multiprocessing.
+
+5. Performance Optimization
+As a senior developer, you should mention these strategies:
+Code Level: Use built-in functions (written in C), avoid global variables, and use list comprehensions instead of for loops where possible.
+Asynchronous I/O: Use asyncio to handle multiple requests without waiting.
+Caching: Use Redis or lru_cache for frequently accessed data.
+Profiling: Use tools like cProfile or py-spy to find "bottlenecks" (slow parts of the code).
+Database: Optimize queries and ensure proper indexing.
+
+6. Connection Pooling
+Problem: Opening and closing a database connection for every request is very "expensive" (slow).
+Solution: A "pool" keeps a set of connections open and reuses them.
+In Python: Frameworks like SQLAlchemy or FastAPI (using asyncpg or Tortoise) handle this automatically. You define a min_size and max_size for the pool.
+
+7. DB Migrations
+Concept: Version control for your database schema. It allows you to update tables (add columns, change types) without losing data.
+Tools:
+Alembic: The standard for SQLAlchemy.
+Django Migrations: Built-in for Django.
+Workflow: You change your Python model $\rightarrow$ Run revision (generates SQL) $\rightarrow$ Run upgrade (applies to DB).
+
+8. ORM (Object-Relational Mapping)
+What it is: A technique that lets you interact with a database using Python objects instead of writing raw SQL.
+Popular ORMs:
+SQLAlchemy: Most flexible and powerful.
+Django ORM: Very easy to use, built into Django.
+Tortoise ORM: An async-first ORM often used with FastAPI.
+Pros: Prevents SQL injection, easier to read, database-agnostic (you can switch from PostgreSQL to MySQL easily).
+Cons: Can be slower than raw SQL for very complex queries.
+
+
+
+Interview Tip:
+If the client asks: "How did you use these in your project?"
+Answer: "In the RapidX project, I used FastAPI's asynchronous capabilities to handle I/O-heavy T-SQL parsing. I implemented connection pooling with PostgreSQL to ensure the service stayed responsive under load, and used Alembic for managing schema migrations as the project evolved.
+stateless - no info save on server (eg.jwt)
+statefull - info saved on server
+hateos: hyper media at the engine of application state(where we define the urls to get the data ,url to post the data etc)
+cashing - to manage the traffic
+
+
+def pyramid():
+    res=''
+    for i in range(1,8):
+        lst=[]
+        for j in range(i,8):
+            lst.append(f"({i},{j})")
+        print((i-1)*"  "+res.join(lst))
+    return
+pyramid()
+
+
+Decortor
+It is use to add the features to the existing method. Decorator is the function which takes another function as an argument and returns a new fuction without changing the original structure of the function.
+
+def deco(func):
+	def wrap(*args,**kwargs):
+		return func(*args,**kwargs)
+	return wrap()
+@deco
+def hello(name):
+	return f"Hello {name}"
+
+hello(name)
+
+
+OOP
+use to reuse,maintane and manage the complex  code of real world entity;It has 4 pillers
+Incapsulation-binding data and functions together.It prevents the directs access of data and  functions of the object by making them private using prefix '_ _'(no access outside the class), public(entire program can access), protected using prefix '_' (only the child class  can access)
+
+Abstraction: only show the essential information and hide the complex logic. It focus only on 'WHAT' object does rather than 'HOW' it does. by importing abstractclass,abstractmethod from ABC. if use decorator @abstractmethod to any function ,it is mandatory to implement in the child class.
+
+
+Inheritance : the child class aquires all the properties of the parent class.(single,multiple,multilevel)
+
+Polymorphism: same methods behaves differently.
+method overriding: same method define in the child class as like parent but it has its own behaviour. same method name along with same parameters in child but different behaviour
+method overloading: not supported in the Python but the same behaviour can be achieve by using **kwargs, multiple methods with the same name but different parameters
+operator overloading : '+' returns sum incase of int type args and  returns concatenation when string type args
+
+
+
+RestFull API
+restfull API uses a stateless protocal(no client information stored on server) that is the HTTP methods. There are 5 HTTP methods GET,POST, PUT, PATCH,DELETE. restfull APIs usefull for chaching,uniform interface .HTTP methods used the different status codes
+200-OK GET
+201 -created,POST
+203 - No content, DELETE
+301 - temperory URL redirect
+302 - Permenent URL redirect
+400 - Bad Request(wrong payload or request body)
+401- Aunautherized request
+403 - forbidden i.e permission denied(URL access)
+404 - page not fount
+405 - method not allowed
+409 - conflict request
+500 - internal server error
+522 - unprocessable Entity
+
+
+
+---------------------------------------------Section 1------------------------------
+
+
+**********************UV Package Manager SetUP********************************
+
+pip install uv
+pip show uv
+python -m uv init
+
+
+-------------------------------
+$scripts = [System.IO.Path]::Combine([Environment]::GetFolderPath("ApplicationData"), "Python", "Scripts")
+New-Item -ItemType Directory -Path $scripts -Force | Out-Null
+@'
+@echo off
+python -m uv %*
+'@ | Set-Content -Path (Join-Path $scripts "uv.bat") -Encoding ASCII
+$env:PATH += ";$scripts"
+
+----------------------------------
+# powershell
+setx PATH "$($env:PATH);$scripts"
+# close and reopen the terminal for the change to take effect
+
+
+cd langchain-course-main
+call .venv\Scripts\activate.bat
+python -c "import sys; print(sys.executable)"
+python -m pip --version
+"C:\Program Files\Python312\python.exe" -m venv .venv
+call .venv\Scripts\activate.bat
+python -c "import sys; print(sys.executable)"
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install --upgrade uv
+dir .venv\Scripts\uv* /b
+
+*******************************************************************************
+
+uv add langchain
+uv add langchain-openai
+uv add python-dotenv black isort
+uv add langchain-ollama
+
+
+create .env file
+OPENAI_API_KEY=goto openai platform signup and create secret key and paste it here
+
+LLM WORKFLOW
+user query--->promp template(format query into structural prompt)--->language model(generate response)---->output parser(parse llm output into structural data)---->external api tool call(call external service)--->final llm call(process API response)--->final output
+
+
+componenet		input type  					output type
+
+prompt			dictionary					prompt value
+ChatModel		a string,list of chat msg or promt value	ChatMessage
+LLM			a string,list of chat msg or promt value	string
+OutputParser		the output of llm or chatmodel			depends on the parser
+Retriever		a string					list of document
+Tool			a string or dictionary depending on the tool	depends on the tool
+
+
+download ollama for widows(ollama.com) and install the application on local machine
+ollama pull gemma3:270m  (gpt_oss this is also powerfull model but heavy)
+ollama run gemma3:270m
+
+open https://smith.langchain.com/ do sign up
+LANGSMITH_TRACING=true
+LANGSMITH_API_KEY=key here
+LANGSMITH_PROJECT= our project name
+run our project and refresh the page https://smith.langchain.com you can see your project on UI as well as you can see by clicking on project --> starttime end time , status, total tokens ,latency, input ,output, feedback ,metadata everything
+
+
+Q1 What happens when you call chain.invoke(input={"information": information})?
+ans. it executes the entire chain. formats the prompts with the input and sends to LLM
+q2.In the PromptTemplate constructor, what is the purpose of input_variables=["information"]?
+ans.which specifies which variable into the template_string need to be filled with actual values
+q3.What would happen if you changed the code to response = chain.invoke({"info": information}) (using "info" instead of "information")?
+ans.It cause an error because  key doesn't matches to the input field
+q4.What is the advantage of using LCEL syntax | compared to calling each component separately?
+ans.it creates reusable , composable pipeline with automatic data flow and error handling
+q5.What does the pipe operator | represent in the code chain = summary_prompt_template | llm?
+ans.LACEL chaining syntax that connect components in a pipeline
+langchain version 0.3.3
+--------------------------------------------------------------------------section 2 ----------------------------------------------------
+Chain -->developer decides the control flow( what action to be taken for the prompt is hard coded)
+Agent--->LLM defined control flow(what action to be taken is dynamically decided by the LLM. which have access of toolkit along with LLM. toolkit may be db, piece of code,API call, etc)
+-------------------------------------------------------------------------section 3 -------------------------------------------------
+ReAct Agent architecture= query--->LLM thinking ----->some action with toolkit-----> return some observations to the LLM----->LLM finish the proccess----> return Answer---> this process is continuing in loop until the task get complete.
+revoluation of react agent = langchain react agent(react prompt)----->tool calling agent(function calling)---->langGraph react agent(function calling)------->Langchain create_agent()(langGraph react agent)ie [v1.0]
+uv init
+uv add langchain langchain-openai langchain-tavily python-dotenv black isort
+tavily--> helps to connect with the agent gives search capability to the agents as well as it has rest API(search,extrac,crawl,map,usage) and other usage eg web search
+go to the tavily.ai platform create API-KEY and paste it to .env
+AgentExecutor--->resoning agent going to tell us what to run
+tool--> allows LLM to interact with other API(its schema is name,description,args) create tool using @tool decorator
+versbose=True--->with the help of these we can see the executing process and  more logs
+LLM-> which run the tools in the loop to achieve the result
+asyncio--> asyncio is the alternative of threading or multiprocessing
+the functions define with the async def caleed as coroutines. They are the special functions they can be paused or resumed
+calling a corountine doesn't execute immediately , it return the coroutine object. to actually run a coroutine you must 'await' it, which schedules it for execution withing an event loop.While a coroutine is waiting(I/O) the event loop can run othe coroutine.
+Minimal terminology of AI : have 3 concepts
+**1.Agent: which represent the package around to call the LLM which have particular role or purpose in the solution
+2.Handoffs: this is the term to interaction between the agents.So hadoff is the term to use of amount of different context, this is an interaction
+3. Guadreails: is the terminology to checks and controls the input around making show that an agent
+to create an agent we must follows 3 steps**
+1 create an instance of agent
+2 use 'with trace()' to track the agent
+**3 call 'runner.run()' to run the agent
+GOOD VIBES**
+prompt well-ask for short answers and latest APIs for today's date
+vibe but verify-ask to LLM the same question
+set up the vibe - ask to breakdown youe request into independently testable steps
+vibe and validate- ask an LLM then get another LLM to check
+vibes with variety- ask for 3 solutions to the same problem,pick the best
+**check conceptual and technical diff between agent as tool and handoff? what is the tripwire? tripwire_triggored? what is kickoff()?
+goto serper.dev/login to get  cheapest AI
+Memory - more prescriptive**
+Short-Term Memory: Temporarily stores recent interactions and outcomes using RAG, enabling agents to access relevant information during the current executions.
+Long-Term Memory: Preserves valuable insights and learnings, building knowledge over time.
+Entity Memory: Information about people, places and concepts encountered during tasks, facilitating deeper understanding and relationship mapping. Uses RAG for storing entity information.
+Contextual Memory: Maintains the context of interactions by combining all the above.
+**User Memory: Stores user-specific information and preferences, enhancing personalization and user experience (this is up to us to manage and include in prompts).
+Giving coding skill to an agent:**
+its hard and its complex , but you can have an agent in crew that has the ability to write  code , execute it in a docker container  and investigate the result.
+except it is not.
+Agent(allow_code_execution=True,code_execution_mode='safe')
+these are often described as coder agents.
+
+guardrails?
+guardrails themselves an agents.gurdrails lis nothing but like a check. eg it will check the result if result have some property or not ,if not it will throw an exception. It can be use either with the first input/ beginning (first LLM) or else with the output/end (last LLM)
+create agentic pipeline using crewai project with dynamic input,structured output, callback function
+prefer docs.crewai.com/concepts/task
+rag,cag,tag?
+types of rag?
+strandagents?
+n8n?jax?huggingface?
+Andrej tarapathy you tube channel
+pageindex? vs vectorDB
+_state:reperesentation of the current snapshot of the application.Immutable
+Nodes: they are the python functions that represent agent logic.They receives the current state as an input , do something and return an updated state.Nodes do the work.
+Edges: are python functions that determine which node to execute next based on the state, They can be conditional or fixed. edges Choose what to do the next
+Agents workflows are represented as graphs, state represent the current snapshot of the app
+five steps to the first graph
+1 define the state class
+2 start t6he graph builder
+3 create a Node
+4 Create Edges
+5 Compile the graph
+for each field in your state ,you can specify a special function called reducer. when you return a new state, langGraph uses the reducer to combine this field with existing state. This enables langGraph to run multiple nodes concurrently and combine state without overwriting
+
+Going Deeper-->LangSmith,Tools-out of the box,Tools-custom,checkpointing
+The Super Step: A super-step can be considered a single iteration over the graph nodes. Nodes that run in parallel are part of the same super-step, while nodes that run sequentially belong to separate super-steps
+	the graph describes one super step; one interaction between agents and tool to achieve an outcome. Every user interaction is fresh 'graph.invoke(state)' call.The reducer handles updating state during a super-step but not between super-steps.
+Defining Graph---checkpoint----> superstep---checkpoint----> superstep---checkpoint----> superstep
+
+smith.langchain.com
+```````````````````````````````````````````````````````````````````````
+AutoGenn-is the evnt driven framework for scalable multiagent AI system.
+
+studio: low-code/no code app
+Magnetic One CLI: A console-based assistant
+AutoGen AgentChat: Conversational single and multiagent application
+Autogen Core: event driven framework for scalable multi agent AI system
+ It has models,messages,agents,teams
+
+-------------------------------------------------------------------------
+MCP
+what is MCP?-->a protocol, a standard. a simple way to integrate tools ,resources, prompts. A USB-C port for AI apllications.
+reasons to be exited---> makes it frictionless to integrate.it is taking off! exploding ecosystem.HTML was just a standard too.
+Reasons  not to be exited--> it just a standard, not a tools themselves.langchain already has a big tools ecosystem.You can already make any function into a tool
+
+MCP CORE CONCEPTS
+The Three Components:
+1. HOST--> is an LLM app like claude or our agent architexture
+2. MCP Client--> lives inside host and connects 1:1 to MCP server
+3. MCP SERVER--> provides tools, context and prompts
+examples:
+Fetch is an MCP server that searches web via headless browser. You can configure claude desktop(the host) to run an MCP client that then launches the fetch MCP server on your computer.
+
+architexture
+
+On youre computer there is a host  inside that multiple MCP client which interacts with the multiple server on the same computer they can have remote servers like external API for the individual functionality. They can also have MCP client on your computer and on  remote server which consist the MCP server to communicate.
+MCP server most often run on your machine.download open source MCP server run them locally.
+trhey have two transport mechanism
+1. stdio spawns a process and communicates via standart input /output
+2.SSE uses HTTPS connections with streaming
+
+Why make an MCP Server?
+allow others to incorporate tools and resources
+consistently incorporatye all our MCP servers
+understand the plumbing
+
+reasons not to make an MCP server--> if its only for us, then w could just make tools the '@function_tool' decorator can make any function into a tool
+
+get free brave search API will get 2000  free points
+cloudfare is free platform to deploy mcp servers
+
+
+
+
+
